@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: CC-BY-4.0
 # This Antora playbook is used by the CI to make sure the Antora build works
 site:
-  title: Vulkan Tutorial Antora CI Playbook
+  title: Khronos Vulkan チュートリアル
+  url: https://sashi0034.github.io/Vulkan-Tutorial-Ja
   start_page: tutorial::00_Introduction.adoc
 content:
   sources:
@@ -12,6 +13,12 @@ content:
 ui:
   bundle:
     url: ui-bundle.zip
+  supplemental_files:
+  - path: ui.yml
+    contents: |
+      static_files: [ .nojekyll ]
+  - path: .nojekyll
 runtime:
   log:
     failure_level: warn
+
