@@ -1,0 +1,146 @@
+:pp: {plus}{plus}
+
+= ヘテロジニアスエコシステム: OpenCL on Vulkan
+
+== はじめに
+
+Vulkan はしばしば、主にリアルタイムグラフィックスに焦点を当てた OpenGL の「現代の後継」と見なされます。しかし **HPC**（High-Performance Computing）と **GPGPU**（General-Purpose GPU programming）の世界では、**OpenCL** が 10 年以上にわたる業界標準でした。物理、金融モデリング、科学シミュレーション向けの何百万行ものレガシーコードが OpenCL C で書かれています。
+
+最近まで、Vulkan のみのドライバで OpenCL コードを動かすのは大きな課題でした。しかし **Vulkan 1.4** エコシステムと `clspv`・`clvk` のようなツールのおかげで、そのギャップはついに埋められました。
+
+== より広いエコシステム: pocl と ANGLE
+
+本章は `clvk` に焦点を当てますが、同じ `clspv` コンパイラ経由で OpenCL を Vulkan 上に載せる、活発に開発されている他の 2 実装についても知っておく価値があります。どちらも本章全体で述べる `clspv` カーネル互換性の制約（ループ境界はコンパイル時定数であることなど）を共有するため、ここでの内容は直接転用できます。
+
+=== pocl — Portable Computing Language
+
+https://portablecl.org/[pocl]（MIT ライセンス）は、主要なコンパイラ基盤が `clspv` ではなく **LLVM/Clang** である完全な OpenCL 3.0 ランタイムです。その Vulkan ドライバは二次的なバックエンドで、カーネルコンパイルには _確かに_ `clspv` を呼びますが、pocl の見出し上の強みは **CPU と Intel Level Zero GPU パス** であり、どちらも pocl 7.0 リリース（2025 年 1 月）時点で Khronos 適合の OpenCL 3.0 認証を達成しています。
+
+.pocl の強み
+[%autowidth]
+|===
+|強み |詳細
+
+|CPU を第一級デバイスとして
+|pocl の CPU パス（x86-64、ARM64、RISC-V）は CTS 合格率が約 100% の本番適合であり、`clvk` のような Vulkan 専用ランタイムでは提供できません。これにより、単一の pocl インストールでサーバ CPU からディスクリート GPU まで、システムの全デバイスを 1 つの ICD の下で扱えます。
+
+|1 ランタイムからマルチターゲット
+|同じ pocl バイナリが CPU、Intel GPU（Level Zero）、NVIDIA（libCUDA）、Vulkan へ同時にディスパッチできます。移植可能なフォールバックパスが必要な HPC ワークロードに価値があります。
+
+|SYCL バックエンド
+|pocl は DPC++/SYCL アプリケーションの OpenCL バックエンドとして機能でき、現代のヘテロジニアス C++ コードへの到達範囲を広げます。
+
+|SPIR-V と LLVM ビットコードを受け入れ
+|OpenCL C ソースに加え、事前コンパイルされた SPIR-V 1.4/1.5 と LLVM ビットコードをプログラム入力として受け入れ、より柔軟なツールチェーン統合を可能にします。
+
+|実験的 Built-in Kernels（DBK）
+|pocl 7.x は GEMM、JPEG、ONNX 推論向けのベンダー中立ビルトインカーネルを追加します——生のコンピュートシェーダより上のディスパッチ抽象から恩恵を受けるワークロードです。
+|===
+
+.pocl の弱み（特に Vulkan パス）
+[%autowidth]
+|===
+|弱み |詳細
+
+|Vulkan ドライバがメンテされていない
+|pocl 自身のドキュメントは Vulkan バックエンドを「INCOMPLETE、アクティブなメンテナなし。Pull Request 歓迎」とラベル付けしています。`clvk` は活発にメンテされ Khronos 適合です。pocl の Vulkan ドライバは「成熟度が低くテストが限定的」で、公表された CTS 合格率はありません。
+
+|Vulkan 上は OpenCL 1.2 サブセットのみ
+|pocl の CPU と Level Zero パスは OpenCL 3.0 をサポートしますが、Vulkan ドライバは OpenCL 1.2 API の大部分のみを公開します。
+
+|Vulkan 上にイメージ／サンプラサポートなし
+|バッファのみのワークロードはサポートされます。イメージオブジェクトとサンプラは Vulkan パスでは実装されていません。
+
+|ビルドの複雑さ
+|pocl の Vulkan ドライバは `clspv` を別途ビルドする必要があります（独自の LLVM チェックアウト、`CLSPV_DIR` で指定）。一方 `clvk` は `clspv` を CMake サブプロジェクトとして同梱します。
+
+|ディスクリート GPU で `CL_MEM_USE_HOST_PTR` なし
+|コピー回避によく使われるホストポインタエイリアシングは、ディスクリート GPU の Vulkan デバイスでは未サポートです。
+|===
+
+要するに: **移植可能な CPU+GPU ランタイム** と、CPU または Intel での認証適合が必要なら pocl を選んでください。その Vulkan パスは本番向けではなく、GPU コンピュートでは `clvk` の代わりに使うべきではありません。
+
+=== ANGLE — Almost Native Graphics Layer Engine
+
+https://chromium.googlesource.com/angle/angle[ANGLE] は Google のマルチプラットフォーム OpenGL ES / EGL 変換レイヤで、Chrome と Chromium 内で使われています。OpenCL は、同じ Vulkan コンテキスト内でのグラフィックス–コンピュート相互運用を可能にするために追加された、**二次的で明示的に実験的な**機能です。その OpenCL 実装は `src/libOpenCL/` と `src/libANGLE/renderer/vulkan/CL*Vk.cpp` にあります。
+
+実行時、ANGLE の Vulkan バックエンドは `ClspvCompileSource()` を呼び、`clvk` と同じ `clspv` パイプラインで OpenCL C を SPIR-V にコンパイルします。3 段階モデル（ソース → LLVM ビットコード → 実行可能 SPIR-V）をサポートしてバイナリキャッシュを可能にし、`VkShaderModule` 作成前に SPIR-V を検証します。
+
+.ANGLE の強み
+[%autowidth]
+|===
+|強み |詳細
+
+|`cl_khr_external_memory` — ゼロコピーのグラフィックス–コンピュート相互運用
+|ANGLE の Vulkan バックエンドは `cl_khr_external_memory` を実装し、OpenCL バッファが `VkBuffer` や `VkImage` を直接エイリアスできます。メインラインの `clvk` はこの拡張を明示的に**実装していません**。混合レンダリング＋コンピュートパイプライン（例: リードバックなしでレンダリング済みフレームを GPU 上だけでポストプロセス）では、ANGLE が現時点でそのコピーを排除できる唯一の `clspv` ベースランタイムです。
+
+|完全なイメージサポート
+|ANGLE は完全な `enqueueRead/Write/Copy/FillImage`、`enqueueMapImage`、`enqueueCopyImageToBuffer` サーフェスを実装しており、pocl の Vulkan ドライバには全くありません。
+
+|パススルーバックエンド
+|ネイティブベンダー OpenCL ドライバがあるシステムでは、ANGLE は `clspv` オーバーヘッドなしに呼び出しを直接転送しつつ、統一 ICD インターフェースを公開できます——混合ハードウェアの CI 環境に有用です。
+
+|活発な開発
+|Chromium チームの支援と継続的インテグレーション基盤があります。
+|===
+
+.ANGLE の弱み
+[%autowidth]
+|===
+|弱み |詳細
+
+|OpenCL は明示的に実験的
+|README は進行中の作業と述べています。ANGLE の主使命は OpenGL ES 変換であり、OpenCL レイヤは一般用途ランタイムではなく Chromium の内部ニーズに応えるために存在します。
+
+|Khronos 適合提出なし
+|ANGLE の Vulkan パスも他のパスも、`clvk`（適合）や pocl の CPU パス（適合）とは異なり、OpenCL 適合テストへ提出されていません。
+
+|Chromium ビルドシステム
+|ANGLE は Chromium の depot_tools 付きの `gn`/`ninja` を使います。Chromium チェックアウト外でのスタンドアロンビルドは文書化されていますが、そのエコシステムにいない開発者には簡単ではありません。
+
+|スタンドアロン ICD として配布されない
+|`clvk` と pocl はドロップインの `libOpenCL.so` 置換として出荷されます。ANGLE の OpenCL レイヤは主に Chrome 内で消費され、コンピュートランタイムとしての独立採用は稀です。
+
+|同じ `clspv` カーネル制限が適用
+|デフォルトで `double` なし、ループ境界はコンパイル時定数——本章全体で文書化された制約と同一です。
+|===
+
+要するに: OpenCL と Vulkan メモリオブジェクト間のゼロコピー共有を本当に必要とする **混合レンダリング＋コンピュートパイプライン** を構築しているなら ANGLE を検討してください。今日のところ、`clvk` の一般用途の代替ではありません。
+
+=== 一目でわかる比較
+
+[%autowidth]
+|===
+| |`clvk` |pocl（Vulkan パス） |ANGLE（Vulkan パス）
+
+|主目的 |Vulkan GPU 上の OpenCL |移植可能な OpenCL（CPU 優先） |GL ES 変換（CL は二次）
+|コンパイラバックエンド |clspv（同梱） |clspv（別途ビルド必要） |clspv（実行時呼び出し）
+|OpenCL バージョン（Vulkan パス） |3.0 |約 1.2 サブセット |1.x–3.0（進行中）
+|Khronos 適合 |はい |いいえ（Vulkan ドライバ不完全） |いいえ（実験的）
+|イメージサポート |はい |いいえ |はい
+|`cl_khr_external_memory` |いいえ |いいえ |はい
+|スタンドアロン ICD |はい |はい |主に Chromium 内
+|メンテナ状況 |活発 |Vulkan ドライバ未メンテ |活発（Chromium）
+|===
+
+== なぜ OpenCL を Vulkan 上で動かすのか？
+
+なぜ「レガシー」な OpenCL コードを Vulkan のような現代 API 上で動かしたいのか疑問に思うかもしれません。主な理由は 3 つです。
+
+1.  **コード再利用**: 巨大で実戦済みの OpenCL カーネルを GLSL や Slang へ移植するのは誤りやすく時間がかかります。OpenCL-on-Vulkan パイプラインを使えば、既存カーネルを最小限の変更で動かせます。
+2.  **ベンダー横断互換性**: すべてのハードウェアベンダーが（特にモバイルや統合 GPU で）高品質なネイティブ OpenCL ドライバを提供するわけではありません。OpenCL を Vulkan 上にレイヤすることで、Vulkan がある場所ならどこでも OpenCL 実装を提供できます。
+3.  **統一されたツーリング**: アプリケーションがすでにレンダリングに Vulkan を使っているなら、同じ API でコンピュートワークロードを扱えることは、同期、メモリ管理、デプロイを簡素化します。
+
+== OpenCL on Vulkan: 特別ではなく標準
+
+`clvk` のような適合レイヤード実装からの重要な洞察は、OpenCL-on-Vulkan がアプリケーションの視点からは **他のどの OpenCL 実装とも同じように見え、同じように振る舞う** ことです。同じ `clCreateContext`、`clEnqueueNDRangeKernel`、その他の標準 OpenCL 3.0 呼び出しを使います。下にある Vulkan レイヤは実装詳細です。
+
+Vulkan 開発者の視点で興味深いのは、適合 OpenCL 実装を可能にする **高度な Vulkan 機能** です。
+
+*   **橋としての SPIR-V**: OpenCL C カーネルは **SPIR-V**（Standard Portable Intermediate Representation - V）——Vulkan がシェーダに使うのと同じバイナリ形式——へコンパイルされます。これが鍵となる統合点です。Vulkan のシェーダ形式は OpenCL セマンティクスを表現する柔軟性を持ちます。
+*   **可変ポインタと Buffer Device Address**: OpenCL のポインタベースメモリモデルは、フラットアドレス空間を効率的にエミュレートするため、Vulkan の link:https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_variable_pointers.html[`VK_KHR_variable_pointers`]（Vulkan 1.1 でコア）と link:https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_buffer_device_address.html[Buffer Device Address] を必要とします。
+*   **サブグループ拡張**: `cl_khr_sub_groups` 拡張は OpenCL サブグループ演算を Vulkan のサブグループ演算へ直接マッピングし、サポートされる場所ではハードウェア加速されたリダクションとスキャンを可能にします。ワークグループ集合演算（OpenCL C 2.0 機能）は OpenCL 3.0 ではオプションで、すべてのレイヤード実装で使えるとは限りません。
+
+本章では、2 つの主要ツールを探ります。`clspv` を使った **AOT**（Ahead-of-Time）コンパイルと、`clvk` を使った **ランタイムレイヤリング** です。
+
+xref:Advanced_Vulkan_Compute/04_Subgroup_Operations/04_non_uniform_indexing.adoc[前へ: 非ユニフォームインデックス付け] | xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/02_setup_and_installation.adoc[次へ: セットアップとインストール]

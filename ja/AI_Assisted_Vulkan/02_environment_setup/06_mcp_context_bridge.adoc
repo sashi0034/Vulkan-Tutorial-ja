@@ -1,0 +1,67 @@
+:pp: {plus}{plus}
+
+= コンテキストブリッジ: Model Context Protocol（MCP）
+
+== はじめに: 欠けたリンク
+
+IDE と高推論モデルを探ってきました。しかし **Qwen 3-Coder** のような最も洗練された AI でさえ、根本的な欠陥に苦しみます。**知識カットオフ** です。
+
+2025 年に学習されたモデルは、2026 年にリリースされた Vulkan 拡張の詳細を知り得ません。ローカルファイルシステムを「見る」こともできず、特定 GPU の `maxSamplerAnisotropy` リミットが 16 であることなど知りません。ここで **Model Context Protocol（MCP）** が AI 支援開発のコアコンポーネントになります。MCP は、AI がローカル環境の地上真理を安全に「手を伸ばして」照会できるオープン標準です。
+
+== コア概念: 「コンテキストが王」
+
+**協調エンジニアリング** では、「チャット窓」を超え **コンテキストブリッジ** へ移ります。
+
+AI に *「既存の `Renderer` クラス向けにメッシュシェーダをどう実装するか？」* と尋ねる場合を考えてください。汎用 AI は学習データに基づく「最善の推測」スニペットを出すかもしれませんが、そのモデルが Vulkan 1.0 をデフォルトにすると、メッシュシェーダが何かすら知りません。**Model Context Protocol（MCP）** があれば、AI は実際の Vulkan レジストリを照会できます。アシスタントを **mcp-Vulkan** サーバに向けることで、仕様の最新版に「コンテキストを設定」し、Mesh Shaders、Ray Tracing、Descriptor Buffers のような現代機能を知る能力を得ます。Vulkan MCP はサンプル、ガイド項目、man ページ、技術ドキュメントから最新コンテキストを提供し、開発しているエコシステムを AI が完全に理解できるようにします。
+
+== 「真実」パイプライン: mcp-Vulkan 実装
+
+Vulkan エコシステムを AI に橋渡しする最も強力な方法は、オープンソースの **mcp-Vulkan** プロジェクトです。これは最新仕様から Vulkan ドキュメントの検索と特定トピックの取得用ツールを提供する特化 MCP サーバです。
+
+**実世界体験: バージョンドリフトの勝利**
+多くの開発者は、現代機能に必要な `pNext` 構造なしで `vkCreateDescriptorPool` のような非推奨関数を AI が提案するとフラストレーションを感じます。
+**mcp-Vulkan** を使えば、単にアシスタントに伝えられます。*「Vulkan MCP を使いコンテキストを Vulkan 1.3 に設定し、その版でコアになっている拡張を列挙して。」* AI は MCP を呼び出し、内部表現を更新し、1.3 仕様に直接基づく答えを提供します。
+
+=== サーバのビルド
+
+まだサーバをビルドしていない場合は、環境セットアップのはじめににある xref:AI_Assisted_Vulkan/02_environment_setup/01_introduction.adoc#_first_step_building_the_vulkan_mcp_server[最初のステップ: Vulkan MCP サーバの構築] を参照してください。その節でリポジトリのクローンと、`mcp-Vulkan/vulkan/` サブディレクトリ内での `npm install && npm run build` をカバーしています。
+
+=== mcp-Vulkan を Goose に接続する（エージェンティック共通地点）
+
+`mcp-Vulkan` プロジェクトがビルドされたら、Goose の「ツール」として登録しなければなりません。Goose は設定を YAML ファイルに保存し、プラットフォームにより場所が異なります。macOS または Linux では通常 `~/.config/goose/config.yaml`、Windows では `%APPDATA%\goose\config.yaml`（通常 `C:\Users\<YourUser>\AppData\Roaming\goose\config.yaml`）です。
+
+ブリッジを接続するには、`config.yaml` を開き `extensions:` セクションの下に次のエントリを追加します。`/path/to/` をリポジトリをクローンした実際の絶対パスに置き換えてください（`mcp-Vulkan` ディレクトリ内でターミナルに `pwd` と打てば見つかります）。
+
+[source,yaml]
+----
+extensions:
+  vulkan:
+    type: stdio
+    cmd: node
+    args:
+      - /path/to/mcp-Vulkan/vulkan/build/index.js
+----
+
+保存後、Goose セッションを再起動します（`goose session`）。接続を確認するには *「利用可能なツールを列挙して。」* と尋ねます。リストに `search-vulkan-docs` と `get-vulkan-topic` が見えるはずです。
+
+=== mcp-Vulkan を IDE に接続する
+
+Goose は自律エージェントですが、主要開発環境内で **mcp-Vulkan** ブリッジを直接活用することもできます。これによりクラウドベースアシスタント（Claude や GPT など）がエディタを離れずに Vulkan 仕様へアクセスできます。例えば **JetBrains CLion** と **Android Studio** ユーザーは AI Assistant 設定の MCP Servers パネル経由でサーバを追加でき、**Visual Studio** と **VS Code** ユーザーは **Continue** またはネイティブ **Copilot** 拡張でサーバを登録できます。
+
+これらの統合の詳細なステップバイステップ手順は、本セクションのプラットフォーム固有章を参照してください。
+
+== 欠点と段階的な勝利
+
+=== 「セキュリティ対有用性」のバランス
+AI にファイルシステムを読む能力を与えるのは重大な決定です。MCP ツールを初めて有効化すると、IDE またはエージェントはディレクトリアクセスの明示的許可を求めます。セキュリティリスクを緩和するには、常に AI の「スコープ」を特定プロジェクトフォルダに制限してください。ホームディレクトリ全体や機密システムフォルダへのアクセスを AI に与えないでください。
+
+=== 段階的な勝利: 自動化されたシステム設計
+最大の勝利は、新機能向け **自動化されたシステム設計** を実行できることです。MCP 経由でエンジン履歴全体にアクセスできるため、次のように頼めます。*「既存の『Shadow』パスのコーディングスタイルとメモリ管理に合う新しい『Post-Processing』パスを設計して。」* AI はシャドウパス実装を読み、あなたが書いたように感じるポストプロセスシステムを生成します。
+
+== まとめ: 完全なツールベルト
+
+Model Context Protocol は環境パズルの最後のピースです。AI を単純な「チャットボット」から、仕様とローカルコードベースへのアクセスを持つ **グラフィックスエンジニアリングアシスタント** へ変えます。コンテキストブリッジをマスターすることで、AI 強化グラフィックスラボのセットアップが完成します。
+
+次は **セクション 3: モデル選択と特化** へ移り、この強力な環境に住まわせる具体的モデルを選びます。
+
+xref:AI_Assisted_Vulkan/02_environment_setup/05_goose_native_agent.adoc[前へ: Goose とローカル知能] | xref:AI_Assisted_Vulkan/03_model_selection_specialization/01_introduction.adoc[次へ: モデル選択と特化]

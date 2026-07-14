@@ -1,0 +1,197 @@
+:pp: {plus}{plus}
+
+= モバイル開発: プラットフォームの考慮事項
+
+== Android と iOS のプラットフォームに関する考慮事項
+
+モバイル プラットフォーム用の Vulkan アプリケーションを開発するには、Android と iOS の特定の要件と制約を理解する必要があります。このセクションでは、各プラットフォームの主な考慮事項と、それに応じてエンジンを適応させる方法について説明します。
+
+=== Android プラットフォームの考慮事項
+
+Android はバージョン 7.0 (Nougat) から Vulkan をサポートしていますが、サポートのレベルはデバイスによって異なります。 Android 開発における主な考慮事項は次のとおりです。
+
+==== Android での Vulkan のセットアップ
+
+Android で Vulkan を使用するには、次のことを行う必要があります。
+
+* *Vulkan サポートの宣言*: AndroidManifest.xml で、
+アプリケーションは Vulkan を使用します。
+
+[source,xml]
+----
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.vulkanapp">
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x400003" android:required="true" />
+    <uses-feature android:name="android.hardware.vulkan.level" android:version="0" android:required="true" />
+    <!-- For devices that support Vulkan but don't declare it -->
+    <uses-feature android:name="android.hardware.vulkan.compute" android:required="false" />
+    <!-- ... -->
+</manifest>
+----
+
+* *Vulkan の初期化*: Android ネイティブ開発キット (NDK) を使用して、
+Vulkanを初期化します。このプロセスはデスクトップの Vulkan と似ていますが、次のことが必要になります。
+ Android からネイティブ ウィンドウ ハンドルを取得するには:
+
+[source,cpp]
+----
+// Get the native window handle from Android
+ANativeWindow* native_window = ANativeWindow_fromSurface(env, surface);
+
+// Create the Vulkan surface
+VkAndroidSurfaceCreateInfoKHR create_info{};
+create_info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+create_info.window = native_window;
+
+VkSurfaceKHR vulkan_surface;
+vkCreateAndroidSurfaceKHR(instance, &create_info, nullptr, &vulkan_surface);
+----
+
+==== Android ライフサイクル管理
+
+Android アプリケーションには複雑なライフサイクルがあり、適切に処理する必要があります。
+
+1. *アクティビティの一時停止と再開*: アプリケーションが一時停止されている場合 (ユーザーが別のアプリに切り替えた場合など)、Vulkan リソースを解放し、アプリケーションの再開時に再作成する必要があります。
+
+2. *表面の変化*: 表面は、構成の変更 (回転など) により変化する可能性があります。スワップチェーンを再作成して、これらの変更を処理する必要があります。
+
+3. *メモリプレッシャー*: Android はいつでもアプリケーションからメモリを再利用できます。メモリ負荷を適切に処理するようにエンジンを設計します。
+
+==== Android の入力処理
+
+Android の入力処理はデスクトップとは異なります。
+
+1. *タッチ入力*: マウス入力の代わりに、マルチタッチ ジェスチャを含むタッチ イベントを処理する必要があります。
+
+2. *センサー*: Android デバイスには、入力に使用できるさまざまなセンサー (加速度計、ジャイロスコープなど) が備わっています。
+
+==== ベンダー固有の考慮事項
+
+Android デバイスのメーカーによっては、次のような特別な考慮事項がある場合があります。
+
+1. *カスタム Android バージョン*: 多くのメーカーは、カスタマイズされた Android バージョンを使用しています。さまざまなデバイスでアプリケーションをテストして、互換性を確認します。
+
+2. *GPU アーキテクチャ*: ベンダーごとに異なる GPU アーキテクチャ (Adreno、Mali、PowerVR など) が使用されています。それぞれに独自のパフォーマンス特性があります。
+
+3. *代替 App Store*: 一部のデバイスには Google Play サービスが搭載されていない場合があります。必要に応じて、代替アプリ ストアを通じて配布することを検討してください。
+
+4. *SoC の変動*: システムオンチップの変動はパフォーマンスに影響します。ほとんどのモバイル GPU はタイルベースのレンダラーであるため、TBR セクションで説明されている手法を使用して、それに応じてレンダリングパイプラインを最適化します。
+
+[source,cpp]
+----
+// Example of checking for specific device vendors
+bool check_device_vendor(vk::PhysicalDevice physical_device, uint32_t vendor_id) {
+    vk::PhysicalDeviceProperties props = physical_device.getProperties();
+    return props.vendorID == vendor_id;
+}
+
+// Common vendor IDs
+const uint32_t VENDOR_ID_QUALCOMM = 0x5143; // Adreno
+const uint32_t VENDOR_ID_ARM = 0x13B5;      // Mali
+const uint32_t VENDOR_ID_IMAGINATION = 0x1010; // PowerVR
+const uint32_t VENDOR_ID_HUAWEI = 0x19E5;   // Kirin
+
+// You can then apply vendor-specific optimizations if needed
+void configure_for_device(vk::PhysicalDevice physical_device) {
+    if (check_device_vendor(physical_device, VENDOR_ID_HUAWEI)) {
+        // Apply Huawei-specific optimizations if needed
+    }
+    // Handle other vendors as needed
+}
+----
+
+=== iOS プラットフォームの考慮事項
+
+iOS は、Vulkan を Metal にマッピングする変換レイヤーである MoltenVK を通じて Vulkan をサポートします。 iOS 開発における主な考慮事項は次のとおりです。
+
+==== iOS での MoltenVK のセットアップ
+
+iOS で Vulkan を使用するには、次のことが必要です。
+
+* *MoltenVK を含める*: MoltenVK フレームワークを Xcode プロジェクトに追加します。
+
+* *MoltenVK の初期化*: Vulkan を作成する前に MoltenVK を初期化します。
+実例：
+
+[source,cpp]
+----
+// Initialize MoltenVK
+MVKConfiguration config{};
+vkGetMoltenVKConfigurationMVK(nullptr, &config);
+config.debugMode = true;  // Enable debug mode during development
+vkSetMoltenVKConfigurationMVK(nullptr, &config);
+
+// Create Vulkan instance as usual
+// ...
+----
+
+* *金属互換サーフェスの作成*: から Vulkan サーフェスを作成します。
+CAメタルレイヤー:
+
+[source,cpp]
+----
+// Get the Metal layer from your UIView
+CAMetalLayer* metal_layer = (CAMetalLayer*)layer;
+
+// Create the Vulkan surface
+VkMetalSurfaceCreateInfoEXT create_info{};
+create_info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+create_info.pLayer = metal_layer;
+
+VkSurfaceKHR vulkan_surface;
+vkCreateMetalSurfaceEXT(instance, &create_info, nullptr, &vulkan_surface);
+----
+
+==== iOS ライフサイクル管理
+
+iOS アプリケーションには、次のような処理が必要なライフサイクルもあります。
+
+1. *アプリケーションの状態の変更*: 必要に応じて Vulkan リソースを解放および再作成することで、applicationWillResignActive、applicationDid becomeActive などを処理します。
+
+2. *メモリ警告*: システムのメモリが不足している場合、iOS はメモリ警告を送信できます。必須ではないリソースを解放することでこれらに対処します。
+
+==== iOS 入力処理
+
+iOS の入力処理は Android と似ていますが、いくつかの違いがあります。
+
+1. *タッチ入力*: iOS には独自のタッチ イベント システムがあり、エンジンと統合する必要があります。
+
+2. *センサー*: iOS デバイスには、入力に使用できるさまざまなセンサーもあります。
+
+=== クロスプラットフォームの考慮事項
+
+Android と iOS (および場合によってはデスクトップ) の両方で単一のコードベースを維持するには、次のことを考慮してください。
+
+* *抽象化レイヤー*: プラットフォーム固有の抽象化レイヤーを作成します。
+ウィンドウの作成、入力処理、その他のプラットフォーム固有の機能。
+
+* *条件付きコンパイル*: プリプロセッサ ディレクティブを使用して処理します
+プラットフォーム固有のコード:
+
+[source,cpp]
+----
+#ifdef __ANDROID__
+    // Android-specific code
+#elif defined(__APPLE__)
+    // iOS-specific code
+#else
+    // Desktop-specific code
+#endif
+----
+
+* *特徴検出*: Vulkan の特徴検出メカニズムを使用して、
+プラットフォームに基づいて推測するのではなく、デバイスの機能を重視します。
+
+=== モバイル プラットフォーム統合のベスト プラクティス
+
+1. *実デバイスでのテスト*: エミュレータおよびシミュレータは、実デバイスのパフォーマンスや動作を正確に表していない可能性があります。
+
+2. *さまざまな画面サイズとアスペクト比に対応*: モバイル デバイスにはさまざまなサイズとアスペクト比があります。それに応じて UI とレンダリングを設計してください。
+
+3. *バッテリー寿命を考慮する*: モバイル ユーザーはバッテリーの消耗に敏感です。エンジンを最適化して電力消費を最小限に抑えます。
+
+4. *プラットフォーム ガイドラインを尊重する*: アプリケーションがネイティブであると感じられるように、各プラットフォームの設計とユーザー エクスペリエンスのガイドラインに従ってください。
+
+次のセクションでは、テクスチャ形式とメモリ使用量に焦点を当て、モバイル ハードウェアに特化したパフォーマンスの最適化について説明します。
+
+xref:Building_a_Simple_Engine/Mobile_Development/01_introduction.adoc[前へ: はじめに] | xref:Building_a_Simple_Engine/Mobile_Development/03_performance_optimizations.adoc[次へ: モバイルのパフォーマンスの最適化]

@@ -1,0 +1,42 @@
+:pp: {plus}{plus}
+
+= clvk とレイヤリング: Vulkan 上の OpenCL 3.0
+
+== clvk とは？
+
+`clspv`（前のセクションで議論）がカーネルの事前コンパイルに焦点を当てる一方、**clvk** は Vulkan 上に構築された OpenCL 3.0 API の実装です。
+
+つまり **ホストコード**（C{pp} アプリケーションコード）を変更する必要すらありません。標準の `clCreateContext`、`clEnqueueNDRangeKernel`、その他の OpenCL 関数を使え、`clvk` が実行時にそれらのコマンドを Vulkan ディスパッチへ変換します。
+
+== 仕組み
+
+`clvk` は ICD 互換の OpenCL 共有ライブラリです。アプリケーションが ICD Loader 経由で OpenCL 関数を呼ぶと:
+
+1.  **API 変換**: `clvk` が呼び出し（例: `clEnqueueNDRangeKernel`）を Vulkan コマンド（例: `vkCmdDispatch`）へ変換します。
+2.  **カーネルコンパイル**: 内部で `clspv` を使い、OpenCL C ソースコードを Vulkan 互換 SPIR-V へコンパイルします。
+3.  **メモリ管理**: OpenCL バッファとイメージを Vulkan の `VkBuffer` と `VkImage` オブジェクトへマッピングします。
+4.  **キュー管理**: OpenCL のコマンドキューを Vulkan キューへマッピングし、適切な同期（フェンスとセマフォ）を行います。
+
+== なぜ clvk を使うのか？
+
+`clvk` の最大の利点は **書き換えなしの移植性** です。
+
+OpenCL を使う大きなデスクトップ C{pp} アプリケーションがある場合、`clvk` ライブラリにリンクするだけで Android デバイスや Vulkan のみの Linux システムで動かせます。ホストコードもカーネルも一行触る必要はありません。
+
+重要な点として、`clvk` は OpenCL 3.0 を**適合的に**実装します——アプリケーションは Vulkan 上で動いていることを知る必要がありません。ホストコードの視点では、ネイティブ OpenCL ドライバと同一に振る舞います。これが正しい設計です。レイヤード実装はアプリケーションから見えないべきです。
+
+単一コードベースでできるだけ多くのデバイスをターゲットしたいクロスプラットフォーム開発者に最適です。
+
+== パフォーマンス上の考慮
+
+`clvk` は変換レイヤであるため、ネイティブ OpenCL ドライバや直接の Vulkan 実装と比べていくらかのオーバーヘッドがあります。ただし多くのワークロードでは、このオーバーヘッドは驚くほど低いです。
+
+実際の計算はネイティブ Vulkan ドライバで起きるため、主なコストは CPU 側のコマンド変換です。重く長時間動くカーネルでは、このオーバーヘッドはしばしば無視できます。
+
+== 互換性と拡張
+
+`clvk` は OpenCL 3.0 仕様の大部分をサポートします。ただし互換性は Vulkan ドライバがサポートする機能に依存します。ドライバが **Descriptor Indexing**、**Variable Pointers**、**Buffer Device Address** 付きの Vulkan 1.4 をサポートしていれば、`clvk` はほぼすべての OpenCL 機能をサポートできます。
+
+次のセクションでは、両方のツールを単一の自己完結サンプルで動かします。**同じ OpenCL カーネルを Vulkan へ 2 通り**——一度は `clspv` の事前コンパイル、一度は `clvk` の実行時——で実行し、同一結果を生むことを示します。
+
+xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/04_kernel_portability.adoc[前へ: カーネル移植性] | xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/06_a_practical_sample.adoc[次へ: 実践サンプル]

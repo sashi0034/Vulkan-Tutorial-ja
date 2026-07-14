@@ -1,0 +1,87 @@
+:pp: {plus}{plus}
+= ポストプロセスワーピングとレンズ歪み
+
+ワーピングは、レンズの物理的な **糸巻き型歪み（Pin-Cushion Distortion）** を打ち消すため、ヘッドマウントディスプレイ（HMD）の基礎です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムがおそらくやっていること**。
+
+レンズワーピングの基礎数学と Vulkan 実装を教えますが、ほとんどの商用 HMD では、これらの操作はランタイムのコンポジタが内部で扱います。この過程を理解することは、カスタムハードウェア開発や、標準ランタイムパイプラインを超える高度なポストワープ効果の実装に不可欠です。
+
+== レンズの物理: なぜワープするか？
+
+VR レンズは、小さなディスプレイを拡大して視野全体を覆うよう設計されています。この拡大は一様ではなく、**糸巻き型歪み** を導入します。
+
+これを打ち消すため、エンジンは **樽型歪み（Barrel Distortion）** ポストプロセスを適用しなければなりません。シェーダーで角を「押しつぶす」ことで、レンズの物理的な引き伸ばしがそれらを正しい直線位置へ戻します。
+
+ほとんどのランタイムはこの歪みを暗黙に適用しますが、カスタムハードウェアや **色収差補正（Chromatic Aberration Correction）** のような高度な効果向けに、独自実装もできます。
+
+== 歪みの数学モデル
+
+ほとんどのレンズ歪みは、放射状多項式（**Brown-Conrady** モデルなど）でモデル化できます。このモデルは係数 ($k_1, k_2, k_3$) を使い、光学中心からの距離に基づいて $(u, v)$ 座標をずらします。
+
+[source,slang]
+----
+// Applying a simple radial distortion model in Slang
+float2 ApplyDistortion(float2 uv, float2 k)
+{
+    float2 center = float2(0.5, 0.5);
+    float2 d = uv - center;
+    float r2 = dot(d, d);
+
+    // Barrel distortion: shifts pixels towards the center based on distance
+    float2 distortedD = d * (1.0 + k.x * r2 + k.y * r2 * r2);
+
+    return center + distortedD;
+}
+----
+
+C++ 側では、指定初期化子を使い、これらのポストプロセスパス用にソースレンダーをバインドします。
+
+[source,cpp]
+----
+// Binding the source render for post-process warping using designated initializers
+vk::DescriptorImageInfo sourceInfo{
+    .sampler = *linearSampler,
+    .imageView = *sourceView,
+    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+};
+
+vk::WriteDescriptorSet write{
+    .dstSet = *postProcessSet,
+    .dstBinding = 0,
+    .descriptorCount = 1,
+    .descriptorType = vk::DescriptorType::eSampledImage,
+    .pImageInfo = &sourceInfo
+};
+----
+
+== 発展: DLSS とカスタム歪みカーネル
+
+Vulkan により、HMD ポストプロセスの境界を押し広げられます。
+
+*   **DLSS とスーパーレゾリューション**: ランタイムのワープ前に独自の **Deep Learning Super Sampling** パスを実装できる。コンポジタが低解像度ソースからでも高詳細画像を受け取り、標準 OpenXR パイプラインを超える視覚的明瞭さを提供する。
+*   **カスタムポストワープ効果**: Vulkan の **Shader Objects** を使い、局所レンズフレアや光学フィルムグレインなどの効果を最終合成パスへ動的に注入し、ランタイムの「ブラックボックス」コンポジタを迂回できる。
+
+== 色収差: 虹色効果
+
+レンズは波長ごとに異なる角度で光を屈折させ、「色にじみ」を生みます。修正のため、色チャネルごとにわずかに異なるワープを適用します。
+
+[source,slang]
+----
+float4 color;
+// We sample the source image three times with different distortion coefficients
+color.r = sourceRender.SampleLevel(s, ApplyDistortion(uv, k_red), 0).r;
+color.g = sourceRender.SampleLevel(s, ApplyDistortion(uv, k_green), 0).g;
+color.b = sourceRender.SampleLevel(s, ApplyDistortion(uv, k_blue), 0).b;
+color.a = 1.0;
+----
+
+== 1.2 倍レンダリング: オーバーサンプリングの代償
+
+ワーピングは画像を「押しつぶす」ため、縮小される領域と拡大される領域があります。視界中央のぼやけを防ぐには、ディスプレイより **高解像度**（通常 1.2 倍〜1.4 倍）で 3D シーンを描画しなければなりません。
+
+TIP: ポストプロセスワーピングの詳細については、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#distortion[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/13_Warp_and_Blend/02_geometric_correction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/13_Warp_and_Blend/04_incorporating_into_the_engine.adoc[Next]

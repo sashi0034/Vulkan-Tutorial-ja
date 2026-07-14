@@ -1,0 +1,196 @@
+:pp: {plus}{plus}
+
+= ハードコードされた順伝播
+
+推論の仕組みを理解する最善の方法は、まず可能な限り最も単純な版を構築することです。抽象化も柔軟性も複雑なファイル形式のパースもありません。特定のネットワークをハードコードして実行するだけです。
+
+これが出発点です。異なるモデルにはスケールしませんが、動きます。そして何より、推論中に実際に何が起きているかがはっきり見えます。
+
+== ネットワーク: MNIST 数字認識
+
+MNIST——手書き数字認識——向けのシンプルなニューラルネットワークを実装します。ネットワークのアーキテクチャは次のとおりです。
+
+- **入力**: 28×28 グレースケール画像（784 ピクセル）
+- **第 1 dense レイヤ**: 784 入力 → 128 出力、ReLU 活性化
+- **第 2 dense レイヤ**: 128 入力 → 64 出力、ReLU 活性化
+- **出力 dense レイヤ**: 64 入力 → 10 出力（数字 0–9 各 1 つ）
+
+3 レイヤ、すべて全結合（dense）。畳み込みはまだありません——シンプルに保ちます。
+
+== バイナリ重み形式
+
+ONNX や TensorFlow Lite をパースする代わりに、極めて単純なバイナリ形式を使います。Python の学習スクリプトは重みを次のようにエクスポートします。
+
+[source,python]
+----
+# After training in PyTorch/TensorFlow
+with open('mnist_weights.bin', 'wb') as f:
+    # Magic number for validation
+    f.write(struct.pack('I', 0x4D4E5354))  # 'MNST' in hex
+
+    # Version
+    f.write(struct.pack('I', 1))
+
+    # For each layer: count, then floats
+    for weights, bias in [(fc1_w, fc1_b), (fc2_w, fc2_b), (fc3_w, fc3_b)]:
+        f.write(struct.pack('I', weights.size))
+        f.write(weights.numpy().tobytes())
+
+        f.write(struct.pack('I', bias.size))
+        f.write(bias.numpy().tobytes())
+----
+
+これを読む C++ コードは単純です。ファイルを開き、マジックナンバーを検証し、カウントを読み、float 配列を読みます。完全な実装は link:/attachments/ml_inference/weight_loader.hpp[weight_loader.hpp] を参照してください——合計約 50 行です。
+
+重要な洞察: 形式を自分で制御しているので、このファイルに何が入っているか正確に分かります。スキーマ交渉もバージョン互換の問題もありません。生データだけです。
+
+== 1 レイヤをステップごとに
+
+単一の dense レイヤの実行を順を追って見ていきます。これが 3 回繰り返す中核演算です。
+
+xref:ML_Inference/ML_Inference_Pipeline/04_inference_explained.adoc[ML 推論パイプライン節] で述べたように、dense（全結合）レイヤは行列積を行います——学習済み重みを通じてすべての入力をすべての出力に接続します。ニューラルネットワークの基本的な構成要素の 1 つです。
+
+dense レイヤは **output = input × weights + bias** を計算します。
+
+入力はベクトル（N 要素）、重みは行列（M×N）、バイアスはベクトル（M 要素）、出力はベクトル（M 要素）です。行列ベクトル積のあとベクトル加算が続きます。
+
+=== バッファ
+
+4 つの Vulkan バッファが必要です。
+
+[source,cpp]
+----
+vk::raii::Buffer inputBuffer;   // Input vector
+vk::raii::Buffer weightBuffer;  // Weight matrix
+vk::raii::Buffer biasBuffer;    // Bias vector
+vk::raii::Buffer outputBuffer;  // Output vector (result)
+----
+
+各バッファにはデバイスメモリをバインドする必要があります。CPU からアップロードする教育用コードなので、ホスト可視メモリを使います。本番コードでは性能向上のためステージングバッファとデバイスローカルメモリを使います。
+
+=== コンピュートシェーダ
+
+dense レイヤのシェーダは単純です。
+
+[source,glsl]
+----
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer Input { float data[]; } input;
+layout(binding = 1) readonly buffer Weights { float data[]; } weights;
+layout(binding = 2) readonly buffer Bias { float data[]; } bias;
+layout(binding = 3) writeonly buffer Output { float data[]; } output;
+
+layout(push_constant) uniform Params {
+    uint inputSize;
+    uint outputSize;
+} params;
+
+void main() {
+    uint outIdx = gl_GlobalInvocationID.x;
+    if (outIdx >= params.outputSize) return;
+
+    float sum = 0.0;
+    for (uint i = 0; i < params.inputSize; ++i) {
+        sum += input.data[i] * weights.data[outIdx * params.inputSize + i];
+    }
+    sum += bias.data[outIdx];
+
+    output.data[outIdx] = max(0.0, sum);  // ReLU activation
+}
+----
+
+各スレッドが 1 つの出力要素を計算します。入力ベクトル全体を読み、重み行列の対応する行を掛け、バイアスを加え、ReLU 活性化を適用します。ReLU（Rectified Linear Unit、xref:ML_Inference/ML_Inference_Pipeline/03_neural_networks_fundamentals.adoc[ニューラルネットワークの基礎] で扱う）は `max(0, x)` だけです——正の値はそのまま通し、負の値をゼロにし、深いネットワークを強力にする非線形性を導入します。
+
+重要な行は `weights.data[outIdx * params.inputSize + i]` です。重み行列は行優先で格納されます。出力[j] を計算するスレッドは重みの j 行目を読みます。
+
+=== ディスパッチ
+
+このシェーダを実行するには、すべての出力要素をカバーする十分なワークグループをディスパッチします。
+
+[source,cpp]
+----
+uint32_t outputSize = 128;  // First layer: 784 → 128
+uint32_t workgroups = (outputSize + 63) / 64;  // Round up
+cmdBuffer.dispatch(workgroups, 1, 1);
+----
+
+local_size_x = 64 なので、各ワークグループは 64 出力を処理します。128 出力には 2 ワークグループが必要です。
+
+=== 同期
+
+第 1 レイヤの実行後、その出力バッファが第 2 レイヤの入力になります。書き込みが完了してから読み取りが始まるよう、パイプライン barrier が必要です。
+
+Vulkan のコンピュート演算は GPU 上で非同期に実行されます。明示的な同期がなければ、第 2 レイヤのシェーダが第 1 レイヤのシェーダの書き込み完了前に出力バッファを読み始める可能性があり、誤った結果になります。パイプライン barrier（xref:ML_Inference/Vulkan_Compute_for_ML/06_synchronization.adoc[Vulkan コンピュート: 同期] で詳述）は、前の演算が完了するまで待ってから新しい演算を開始するよう GPU に指示します。
+
+[source,cpp]
+----
+vk::MemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead
+};
+
+cmdBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,  // src stage
+    vk::PipelineStageFlagBits::eComputeShader,  // dst stage
+    {},
+    barrier,
+    nullptr,
+    nullptr
+);
+----
+
+これは Vulkan に「すべてのコンピュートシェーダの書き込みが終わるまで待ち、その後続のコンピュートシェーダの読み取りに見えるようにする」と伝えます。
+
+== 完全な順伝播
+
+3 レイヤを連鎖させます。
+
+1. バイナリファイルから重みを CPU メモリに読み込む
+2. Vulkan バッファを作成し、重みをアップロードする
+3. レイヤ 1 をディスパッチ（784 → 128）
+4. barrier
+5. レイヤ 2 をディスパッチ（128 → 64）
+6. barrier
+7. レイヤ 3 をディスパッチ（64 → 10）
+8. GPU から出力をダウンロードする
+
+コードは反復的です——ディスクリプタの設定、プッシュ定数、ディスパッチを 3 回繰り返します。しかしその反復こそが要点です。動くのを見れば、レイヤ間で同じ部分と異なる部分に気づきます。その理解が次に作る抽象化を導きます。
+
+完全な実装は link:/attachments/ml_inference/vulkan_mnist_inference.cpp[vulkan_mnist_inference.cpp] を参照してください。中核の推論ループは約 150 行で、その大半は Vulkan の定型的なコードです。
+
+== これが教えること
+
+このハードコードアプローチはいくつかの洞察を明らかにします。
+
+**推論は逐次的**。各レイヤは前レイヤの出力に依存します。3 レイヤすべてを同時にディスパッチできません——依存チェーンがあります。
+
+**コードの大半はセットアップ**。バッファ作成、ディスクリプタセットの設定、パイプライン構成——これがコードを支配します。実際のコンピュートディスパッチは 1 行です。
+
+**データは GPU 上に存在する**。中間結果（レイヤ出力）は CPU に触れません。1 つのシェーダが書き、次のシェーダが読みます。性能にとって重要です。
+
+**パターンの反復**。各レイヤは同じパターンに従います: ディスクリプタをバインド、プッシュ定数、ディスパッチ、barrier。詳細（どのバッファか、次元は何か）は変わりますが、構造は同一です。
+
+最後の点が鍵です。反復は抽象化できることを意味します。3 レイヤをハードコードする代わりに、Layer インタフェースを定義し、異なるパラメータで 3 回インスタンス化できます。
+
+しかし抽象化を作る前に、もう 1 つ理解する必要があります: 重みは実際どこから来るのか？
+
+== 学習とエクスポート
+
+ハードコードアプローチは `mnist_weights.bin` があることを前提とします。それはどこから来るのでしょうか？
+
+PyTorch または TensorFlow でモデルを学習し、重みをエクスポートします。学習スクリプトは link:/attachments/ml_inference/train_mnist.py[train_mnist.py] にあります。次を行います。
+
+1. ネットワークアーキテクチャを定義（ハードコードした内容と一致）
+2. MNIST データセットで数エポック学習
+3. 学習済み重みをバイナリ形式でエクスポート
+
+CPU では約 5 分で学習でき、約 98% の精度を達成します。デモには十分です。
+
+エクスポートコードは先ほど示した struct.pack スニペットです。特別なことはなく、既知の順序で float をファイルに書くだけです。
+
+次章: パターンを特定し、最初の抽象化を構築します。
+
+xref:ML_Inference/Building_the_Inference_Engine/01_introduction.adoc[前へ: 導入] | xref:ML_Inference/Building_the_Inference_Engine/03_from_hardcoded_to_flexible.adoc[次へ: ハードコードから柔軟性へ]

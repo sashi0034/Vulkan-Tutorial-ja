@@ -1,0 +1,59 @@
+:pp: {plus}{plus}
+= Synchronization 2: GPU/CPU ハンドシェイクを極める
+
+== はじめに
+
+**Synchronization 2** チュートリアルシリーズへようこそ。Vulkan を長く扱っていると、いわゆる「同期の壁」にぶつかったことがあるでしょう。開発マシンでは問題なく動くのに別のマシンではちらつく瞬間や、高性能な GPU が過度に保守的なバリア待ちに時間の半分を費やしていると気づく瞬間です。
+
+同期は Vulkan で最も難しい部分の一つですが、同時に最も強力な部分でもあります。パイプラインを通るデータの流れをハードウェアに正確に伝えるための言語です。このシリーズでは、レガシーな Vulkan 1.0 の同期システム——断片化されたビットマスクやバイナリセマフォ——を超え、現代の標準である **Synchronization 2** と **タイムラインセマフォ** を使いこなします。
+
+=== なぜ新しいシステムなのか？
+
+Vulkan 1.0 の同期は制御の面では画期的でしたが、扱いも理解も非常に難しいものでした（今もそうです）。当初のパイプラインバリアは複数の構造体に分かれ、ステージマスクは十年前のハードウェア向けに設計されたように感じられることが多くありました。実際、設計当時は十年前だったのです。執筆時点で Vulkan は 10 年を迎え、同じ制御レベルを保ちつつ、現代の技術とハードウェアによってより良い方法が使えるようになっています。
+
+拡張として登場し、現在は Vulkan 1.3 のコアとなった Synchronization 2 は、すべてを `vk::DependencyInfo` 構造体に統一することでこの状況を簡素化します。64 ビットマスクにより、タスクシェーダやメッシュシェーダといった現代のハードウェアユニットを精密に指定できる、より明確で直感的な依存関係の定義が可能になります。
+
+これに **タイムラインセマフォ** を組み合わせると、「バイナリ」な信号（オン／オフ）の世界から、単調増加カウンタの世界へ移ります。GPU/CPU の実行全体を一つの統一されたタイムラインとして扱え、複数のフレームインフライトや非同期作業の管理が大幅に簡単になります。
+
+=== 学べること
+
+単なる API 呼び出しの羅列ではありません。エンジン級の同期アーキテクチャを構築します。このシリーズでは次のことを行います。
+
+1.  **依存関係の分解**: GPU が実際にメモリをどう扱うか、なぜ「実行依存」だけではデータ破壊を防げないかを掘り下げます。
+2.  **新しいバリアの習得**: `vk::DependencyInfo` でレガシーバリアを置き換え、コードをよりクリーンで高性能にします。
+3.  **タイムラインの活用**: タイムラインセマフォをエンジンの「マスタークロック」として実装し、フェンスとバイナリセマフォをより堅牢な単調カウンタに置き換えます。
+4.  **並行性のための設計**: メインループを複数フレームインフライト対応に再構築し、メインのグラフィックス作業と重なる非同期コンピュート／転送を実装します。
+5.  **モダン Vulkan の活用**: Vulkan 1.4 の機能——**Host Image Copies** や **ダイナミックレンダリング** におけるタイルローカルリード——に踏み込み、API の最前線に立ちます。
+
+=== 前提知識
+
+このシリーズは、メインの Vulkan チュートリアルで築いた基礎の上に立つ「上級トピック」です。次の内容に慣れていることを前提とします。
+
+*   基本的な Vulkan レンダリングループ（コマンドバッファ、パイプライン、ディスクリプタセット）。
+*   モダンな c{pp}（RAII、スマートポインタ、基本的なテンプレート）。
+*   グラフィックスパイプラインの基本概念（頂点／フラグメントステージ）。
+
+Vulkan が初めての方は、まず xref:00_Introduction.adoc[メインチュートリアル] の完了を強く推奨します。エンジン構築の旅を続けている方には、プロ級レンダラに必要な深い同期知識を提供する本シリーズが、xref:Building_a_Simple_Engine/introduction.adoc[Building a Simple Engine] チュートリアルをよく補完します。
+
+=== ツールについて
+
+このシリーズでは、シェーダ例すべてに **Slang** を使います。Slang の生産性機能と Vulkan SPIR-V を自然にターゲットできる点が、モダンな同期との相性を良くしています。また、手動では追跡しにくい「Write-After-Read」（WAR）や「Read-After-Write」（RAW）ハザードの特定に欠かせない **LunarG Synchronization Validation** レイヤも大いに活用します。
+
+まずは依存関係を分解し、その中身を見ていきましょう。
+
+== このシリーズの章
+
+1.  xref:Synchronization/Anatomy_of_a_Dependency/01_introduction.adoc[依存関係の解剖] - データがパイプラインをどう流れるかの核心を理解する。
+2.  xref:Synchronization/Pipeline_Barriers_Transitions/01_introduction.adoc[パイプラインバリアとイメージレイアウト遷移] - 新しいバリアシステムの習得。
+3.  xref:Synchronization/Timeline_Semaphores/01_introduction.adoc[タイムラインセマフォ: マスタークロック] - 単調増加の世界へ。
+4.  xref:Synchronization/Frame_in_Flight/01_introduction.adoc[フレームインフライトアーキテクチャ] - エンジンの心拍を構築する。
+5.  xref:Synchronization/Async_Compute_Overlap/01_introduction.adoc[非同期コンピュートと実行のオーバーラップ] - GPU 作業の並列化。
+6.  xref:Synchronization/Transfer_Queues_Streaming/01_introduction.adoc[転送キューとアセットストリーミング同期] - スタッターなしでアセットをストリームする。
+7.  xref:Synchronization/Dynamic_Rendering_Sync/01_introduction.adoc[ダイナミックレンダリングにおける同期] - パスレス世界でのモダン同期。
+8.  xref:Synchronization/Host_Image_Copies_Memory_Sync/01_introduction.adoc[Host Image Copies とメモリマップ同期] - CPU から GPU への直接メモリ管理。
+9.  xref:Synchronization/Synchronization_Validation/01_introduction.adoc[同期バリデーションによるデバッグ] - ツールにハザードを見つけさせる。
+10. xref:Synchronization/Profiling_Optimization/01_introduction.adoc[プロファイリング、バッチ化、最適化] - 最後のミリ秒まで絞り出す。
+
+== ナビゲーション
+
+次へ: xref:Synchronization/Anatomy_of_a_Dependency/01_introduction.adoc[依存関係の解剖]

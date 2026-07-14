@@ -1,0 +1,97 @@
+:pp: {plus}{plus}
+= RAII リソース統合
+
+OpenXR から生の `VkImage` ハンドルを得た後、エンジンの Resource Acquisition Is Initialization（**RAII**）フレームワークに統合する必要があります。エンジンは `vk::raii` 名前空間を使い、Vulkan オブジェクトの寿命を自動管理する高水準 C++ ラッパーを提供します。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+外部のランタイム所有リソースを現代的な RAII フレームワークに統合するには、所有権と破棄契約の慎重な扱いが必要です。これは Vulkan を外部システムと連携させる際の一般的なパターンです。
+
+== 所有権契約: 「貸与であって譲渡ではない」
+
+OpenXR から `VkImage` を受け取るとき、XR ランタイムとの法的契約に入ります。ランタイムが生イメージを提供するのは、エンジン固有のニーズを知らないからです——たとえば **マルチビュー** を使うなら `e2DArray` ビューが必要かもしれませんが、単純なエンジンは標準の `e2D` ビューだけを欲しがるかもしれません。
+
+*   **できること**: イメージをカラーアタッチメントとしてバインドし、レイアウトを遷移し、独自のビューを作成する。
+*   **できないこと**: イメージを破棄する、割り当てフラグを変更する、メモリを解放しようとする。
+*   **参照カウント**: ランタイムは各イメージの内部参照カウントを保持し、フレームライフサイクル経由の完了シグナルを待ちます。
+*   **メモリレジデンシ**: ランタイムはメモリが GPU 上に常駐し続けることを保証し、必要な OS レベルの「ピン留め」を処理します。
+
+== 非所有イメージラッパー
+
+`vulkan-hpp` でこれを扱う最も単純な方法は、`VkImage` ハンドルを非所有の `vk::Image` オブジェクトとして扱い、指定初期化子でそれぞれに独自の `vk::raii::ImageView` を作成することです。
+
+[source,cpp]
+----
+// Wrapping the raw handles into our engine's per-frame data using designated initializers
+struct XrFrameBuffer {
+    vk::Image image; // Non-owning handle
+    vk::raii::ImageView imageView = nullptr; // RAII owned by us
+};
+
+std::vector<XrFrameBuffer> framebuffers;
+for (const auto& xrImg : xrImages) {
+    XrFrameBuffer fb;
+    fb.image = vk::Image(xrImg.image);
+
+    vk::ImageViewCreateInfo viewInfo{
+        .image = fb.image,
+        .viewType = vk::ImageViewType::e2D, // or e2DArray for multiview
+        .format = chosenFormat,
+        .subresourceRange = {
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .levelCount = 1,
+            .layerCount = 1
+        }
+    };
+
+    fb.imageView = vk::raii::ImageView(device, viewInfo);
+    framebuffers.push_back(std::move(fb));
+}
+----
+
+== ダイナミックレンダリングとの統合
+
+**ダイナミックレンダリング**（Vulkan 1.3 で導入）を使っているため、これらのイメージをレガシーな `VkFramebuffer` オブジェクトにラップする必要はありません。代わりに、`vk::RenderingAttachmentInfo` で `vk::raii::ImageView` を直接参照できます。
+
+[source,cpp]
+----
+// Rendering directly to the XR image using Dynamic Rendering and designated initializers
+vk::RenderingAttachmentInfo colorAttachment{
+    .imageView = *framebuffers[imageIndex].imageView,
+    .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .loadOp = vk::AttachmentLoadOp::eClear,
+    .storeOp = vk::AttachmentStoreOp::eStore,
+    .clearValue = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f)
+};
+
+vk::RenderingInfo renderingInfo{
+    .renderArea = renderRect,
+    .layerCount = 1,
+    .colorAttachmentCount = 1,
+    .pColorAttachments = &colorAttachment
+};
+
+commandBuffer.beginRendering(renderingInfo);
+----
+
+== 発展: 外部 API との相互運用
+
+OpenXR がイメージハンドルを扱いますが、Vulkan の **External Memory** および **Foreign Queue** 拡張により、空間標準を超えて進めます。
+
+*   **クロス API 共有**: これらのスワップチェーンイメージを、高速ビジョン処理向けの **CUDA** や、360 度再生向けハードウェアビデオデコーダなど、他の API と共有できます。
+*   **カスタム合成**: このレベルの相互運用により、エンジンは XR ランタイムが使うのとまったく同じ物理メモリ上で、複雑な非空間処理を行えます。
+
+== 寿命の扱い: ハイブリッド破棄
+
+エンジンアーキテクチャでは、これらの `XrFrameBuffer` オブジェクトを `XrSwapchain` の存続期間中生き続けさせます。ユーザーがアプリケーションを閉じるか環境を切り替えると、`xrDestroySwapchain` 経由で `XrSwapchain` を破棄します。
+
+これにより **ハイブリッド破棄** フローになります。
+1.  **手動破棄**: `xrDestroySwapchain` が、VRAM を回収してよいことをランタイムにシグナルする。
+2.  **RAII 破棄**: `XrFrameBuffer` 構造体がスコープを抜け、`vk::raii::ImageView` メンバが自動的に `vkDestroyImageView` を呼ぶ。
+3.  **安全性**: 非所有の `vk::Image` ハンドルは Vulkan 呼び出しなしで消え、ランタイムとの契約を果たす。
+
+TIP: 詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#swapchain_images[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/02_external_image_negotiation.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/04_memory_ownership_lifecycle.adoc[次へ]

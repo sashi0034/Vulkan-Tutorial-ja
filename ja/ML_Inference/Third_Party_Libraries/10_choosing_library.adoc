@@ -1,0 +1,502 @@
+:pp: {plus}{plus}
+
+= 適切なライブラリの選択
+
+== 導入
+
+これまで ONNX Runtime、TensorFlow Lite、PyTorch Mobile、DirectML を学びました。GPU リソースの共有、データ転送の最適化、統合パターン、実践的な例も見てきました。次に重要な問いがあります。実際にプロジェクトでどのライブラリを使うべきでしょうか。
+
+この問いには万能な答えがありません。「最良」の ML 推論ライブラリはターゲットプラットフォーム、性能要件、モデル形式、開発リソース、デプロイ上の制約によって決まります。選択を誤ると開発時間の浪費、性能不足、デプロイの失敗につながります。
+
+本章では体系的な決定フレームワークを示します。プラットフォーム、性能、モデルの互換性、統合の複雑さ、エコシステムの成熟度という観点で評価します。一般的なシナリオ向けの決定木と、ユースケース別の推奨マトリクスも用意しました。最後に、Vulkan アプリ向けにライブラリを選ぶための方法論をまとめます。
+
+== 決定フレームワーク
+
+構造化された評価アプローチを使い、チェックリストで選択肢を体系的に絞り込みます。
+
+=== ステップ 1: プラットフォーム要件（選択肢の排除）
+
+まず譲れない制約から始めましょう。サポートが必須のプラットフォームによって、いくつかの選択肢はすぐに排除できます。
+
+*デスクトップのみ（Windows/Linux/macOS）*
+
+最大の柔軟性が得られます。
+
+- ONNX Runtime: 優秀です。すべてのデスクトップ環境に対応し、複数の実行プロバイダ（CPU、OpenCL、DirectML、OpenVINO）を選べます。
+- TensorFlow Lite: 動作はしますが、モバイル向けに比べるとデスクトップ向けの最適化は弱めです。GPU デリゲートの対応状況もプラットフォームによって差があります。
+- PyTorch Mobile: 主にモバイル向けで、デスクトップは二次的な扱いです。
+- DirectML: Windows 専用ですが、Windows 専用アプリなら優秀です。
+
+*モバイルのみ（Android/iOS）*
+
+- TensorFlow Lite: 標準的な選択です。成熟しており最適化が進んでおり、両プラットフォームで優秀な GPU デリゲートを備えています。
+- PyTorch Mobile: 良い代替案です。特に PyTorch で学習した場合には有力です。
+- ONNX Runtime: モバイルでも動作しますが、TFLite に比べると最適化は弱めです。クロスフレームワークが必要な場合に検討する価値があります。
+- DirectML: モバイルでは使えません。
+
+*クロスプラットフォーム（デスクトップ+モバイル）*
+
+- ONNX Runtime: クロスプラットフォームの一貫性が最も高いです。同じ API、同じ形式をどこでも使えます。
+- TensorFlow Lite: どこでも動きますが、デスクトップでの成熟度は低めです。
+- PyTorch Mobile: 可能ですが、プラットフォーム固有のコードが増えます。
+- DirectML: 単独では解決策になりません（Windows 専用のため）。
+
+*組み込み/エッジ*
+
+- TensorFlow Lite: このために設計されています。TFLite Micro によりマイコンにも対応します。
+- ONNX Runtime: 組み込み向けのサポートはありますが、TFLite よりフットプリントが大きくなります。
+- PyTorch Mobile: 多くの組み込み用途には重すぎます。
+- DirectML: 該当しません。
+
+**決定ルール**: 必須のプラットフォームに対応していない選択肢は排除しましょう。制限を回避しようと無理をするのは、かける手間に見合いません。
+
+=== ステップ 2: モデル形式の互換性
+
+モデルの形式は何でしょうか。変換は可能でしょうか。
+
+*ONNX モデル*
+
+- ONNX Runtime: ネイティブに対応しており、変換は不要です。
+- TensorFlow Lite: 変換が必要です（ONNX→TF→TFLite）。可能ですが複雑さが増します。
+- PyTorch Mobile: 変換が必要です（ONNX→PyTorch→TorchScript）。一部の操作で情報が失われることがあります。
+- DirectML: ONNX Runtime 経由で ONNX を直接扱えます。
+
+*TensorFlow/Keras*
+
+- TensorFlow Lite: 直接変換でき、サポートも充実しています。
+- ONNX Runtime: TF→ONNX 変換で、概して問題なく動きます。
+- PyTorch Mobile: TF→ONNX→PyTorch という経路になり、複雑でエラーが起きやすいです。
+- DirectML: TF→ONNX の後、ONNX Runtime 経由で使います。
+
+*PyTorch*
+
+- PyTorch Mobile: TorchScript へ直接エクスポートでき、シームレスです。
+- ONNX Runtime: PyTorch→ONNX のサポートが充実しています。
+- TensorFlow Lite: PyTorch→ONNX→TF→TFLite という経路になり、骨が折れます。
+- DirectML: PyTorch→ONNX の後、ONNX Runtime を使います。
+
+*独自に学習したモデル*
+
+学習パイプラインを自分で制御しているなら、任意の形式でエクスポートできます。他の基準で選び、次を考慮してください。
+
+- ONNX: 最も柔軟で、主要なフレームワークすべてに対応しています。
+- TFLite: TensorFlow で学習しモバイルへデプロイするなら最良です。
+- TorchScript: PyTorch で学習しモバイルへデプロイするなら最良です。
+
+**決定ルール**: 既存の形式からの変換が困難なら、ネイティブサポートを優先しましょう。学習過程を制御できるなら、デプロイ先のニーズに合う形式を選びましょう。
+
+=== ステップ 3: 性能要件
+
+推論速度はどれくらい必要でしょうか。レイテンシの予算はどれくらいでしょうか。
+
+*リアルタイム（60 FPS で 1 フレームあたり 16ms 未満）*
+
+ゲームや AR/VR 向けです。
+
+- ONNX Runtime + OpenCL: NVIDIA のデスクトップで最良です（2〜5 倍の高速化が見込めます）。
+- TensorFlow Lite + GPU: モバイルで最良です。
+- DirectML: Windows で優秀です。AMD/Intel で OpenCL が使えない場合に有効です。
+- PyTorch Mobile: モバイルでは概して TFLite より遅くなります。
+
+*インタラクティブ（100ms 未満）*
+
+- どのライブラリでも構いません。ピーク性能より統合の容易さを優先しましょう。
+- ONNX Runtime: クロスプラットフォームのデフォルトとして良好です。
+
+*バッチ処理（レイテンシよりスループット重視）*
+
+- ONNX Runtime + OpenCL: NVIDIA での大規模バッチ処理に優秀です。
+- TensorFlow Lite: 大規模バッチではあまり最適化されていませんが動作します。
+- DirectML: Windows でのバッチ処理に良好です。
+
+**決定ルール**: リアルタイム用途ではターゲットハードウェアで最良の性能を出すライブラリを選びましょう。リアルタイム性が不要なら統合の容易さを優先しましょう。
+
+=== ステップ 4: 統合の複雑さ
+
+統合にどれだけの開発の手間をかけられるでしょうか。
+
+*最小限（数日）*
+
+- TensorFlow Lite: 最もシンプルな API で、豊富なドキュメントと多数のサンプルがあります。
+- ONNX Runtime: シンプルな API ですが、実行プロバイダの理解が必要です。ドキュメントも充実しています。
+- PyTorch Mobile: PyTorch に慣れていればシンプルです。
+- DirectML: より複雑で、D3D12 の知識が必要です。
+
+*中程度（数週間）*
+
+- ONNX Runtime + GPU リソース共有: 複雑さは中程度ですが、大きな性能向上が得られます。
+- TFLite のカスタムデリゲート: 最適化の余地がありますが、TFLite の内部構造を理解する必要があります。
+- DirectML + Vulkan の相互運用: 複雑ですが、Windows で優秀な性能が得られます。
+
+*大規模（数ヶ月）*
+
+- カスタム Vulkan コンピュート: 最大限の制御と性能ですが、すべてを自分で実装します。
+- ハイブリッド構成: ライブラリとカスタムシェーダの組み合わせです。
+
+**決定ルール**: 現実的に確保できる開発リソースを見極めましょう。完璧を目指して未完成になるより、シンプルでも出荷できるものを優先すべきです。
+
+=== ステップ 5: エコシステムとサポート
+
+成熟度はどうでしょうか。コミュニティはどうでしょうか。
+
+*エコシステム*
+
+- TensorFlow Lite: モバイルでは最も成熟しています。巨大なモデル動物園、ツール群、活発なコミュニティがあります。
+- ONNX Runtime: 成熟しつつ成長中です。良質なモデル動物園、改善が進むツール、業界の後ろ盾があります。
+- PyTorch Mobile: 新しいですが急速に成長しています。モデル動物園は小さめですが、ドキュメントは改善が進んでいます。
+- DirectML: Windows では成熟していますが、Windows のエコシステムに限られます。
+
+*コミュニティ*
+
+- TensorFlow Lite: 最大のコミュニティで、Stack Overflow やチュートリアルも最も充実しています。
+- ONNX Runtime: 成長中のコミュニティで、公式ドキュメントも良質、メンテナの応答も速いです。
+- PyTorch Mobile: 活発で、ドキュメントも良質、PyTorch のエコシステムを活用できます。
+- DirectML: コミュニティは小さめですが、公式ドキュメントは良質で Microsoft のサポートがあります。
+
+*長期的な存続可能性*
+
+- TensorFlow Lite: Google が支え、広くデプロイされており、無難な選択です。
+- ONNX Runtime: Microsoft とコンソーシアムが支え、無難な選択です。
+- PyTorch Mobile: Meta が支え、採用が拡大しており、おそらく無難です。
+- DirectML: Microsoft が支え、Windows 専用ですが、Windows 専用アプリなら安心です。
+
+**決定ルール**: 本番環境では成熟したエコシステムと強い後ろ盾を優先しましょう。実験的な用途では新しいライブラリにも利点があり得ます。
+
+== プラットフォーム別の推奨
+
+=== Windows デスクトップ
+
+*第一候補: ONNX Runtime + DirectML*
+
+DirectML はすべての GPU ベンダーで優秀に動作します。ONNX Runtime の DirectML 実行プロバイダは成熟しており、よく最適化されています。ベンダーロックインなしで良好な性能が得られます。
+
+*代替案: ONNX Runtime + OpenCL（NVIDIA のみ）*
+
+NVIDIA だけをターゲットにするなら、OpenCL 実行プロバイダが DirectML より良い性能を出す可能性があります。
+
+*TFLite を使う場合*: TensorFlow で学習しており、ピーク性能が不要な場合です。統合はよりシンプルですが、デスクトップでの最適化は劣ります。
+
+=== Linux デスクトップ
+
+*第一候補: ONNX Runtime + OpenCL*
+
+多くの Linux 向けゲーム・グラフィックス環境は NVIDIA を使っています。OpenCL 実行プロバイダは優秀です。
+
+*代替案: ONNX Runtime + CPU*
+
+NVIDIA 以外や複数種類の GPU が混在する環境で、どこでも動作し、リアルタイム性が不要な場合です。
+
+*TFLite*: 組み込み Linux（Raspberry Pi、Jetson など）向けにはよく最適化されています。
+
+=== macOS デスクトップ
+
+*第一候補: ONNX Runtime + CoreML*
+
+M1/M2 の Neural Engine を活用でき、性能と電力効率に優れます。
+
+*代替案: ONNX Runtime + CPU*
+
+すべての Mac で動作し、リアルタイム性が不要な場合です。
+
+*TFLite*: iOS も同時にターゲットにしていて、コードの一貫性を重視する場合です。
+
+=== Android モバイル
+
+*第一候補: TensorFlow Lite + GPU デリゲート*
+
+Android の ML における標準です。GPU デリゲートは成熟しており、多様なデバイスに対応し、ドキュメントも豊富です。
+
+*代替案: ONNX Runtime + NNAPI*
+
+クロスフレームワークが必要で、ONNX モデルを使う場合です。NNAPI によるハードウェア加速が使えます。
+
+*PyTorch Mobile*: PyTorch で学習した場合にシームレスにエクスポートできます。TFLite と同程度の性能です。
+
+=== iOS モバイル
+
+*第一候補: TensorFlow Lite + GPU デリゲート*
+
+成熟しており、最適化され、信頼性が高いです。Metal との統合も良好です。
+
+*代替案: ONNX Runtime + CoreML*
+
+Neural Engine（A12 以降）を活用でき、GPU より電力効率が良い可能性があります。
+
+*PyTorch Mobile*: PyTorch で学習した場合です。性能は良好ですが、エコシステムは TFLite より小さいです。
+
+=== 組み込み/エッジ
+
+*第一候補: TensorFlow Lite（または TFLite Micro）*
+
+リソース制約向けに設計されています。フットプリントが小さく、低電力で、組み込み分野で広くサポートされています。
+
+*代替案: ONNX Runtime*
+
+クロスフレームワークが必要で、RAM が 100MB 超、CPU が 1GHz 超程度のリソースがある場合です。
+
+*カスタム Vulkan*: Vulkan は使えるが ML ライブラリが使えない場合、あるいは最小限のレイテンシのためにカスタム実装への投資が可能な場合です。
+
+== 性能比較
+
+一般的な操作についての概算比較です——実際のハードウェアやモデルによって変わります。
+
+=== 画像分類（ResNet-50、224×224）
+
+*デスクトップ（NVIDIA RTX 3080）*
+
+- ONNX Runtime + OpenCL: 約 2ms
+- ONNX Runtime + DirectML: 約 6ms
+- TensorFlow Lite + GPU: 約 8ms
+- ONNX Runtime + CPU: 約 50ms
+
+*モバイル（Snapdragon 888）*
+
+- TensorFlow Lite + GPU: 約 8ms
+- ONNX Runtime + NNAPI: 約 10ms
+- PyTorch Mobile + GPU: 約 12ms
+- TensorFlow Lite + CPU: 約 80ms
+
+*モバイル（iPhone 13 A15）*
+
+- ONNX Runtime + CoreML: 約 5ms
+- TensorFlow Lite + GPU: 約 7ms
+- TensorFlow Lite + CPU: 約 60ms
+
+=== 物体検出（YOLOv5s、640×640）
+
+*デスクトップ RTX 3080*
+
+- ONNX Runtime + OpenCL: 約 5ms
+- ONNX Runtime + DirectML: 約 15ms
+- TensorFlow Lite + GPU: 約 20ms
+
+*モバイル Snapdragon 888*
+
+- TensorFlow Lite + GPU: 約 25ms
+- ONNX Runtime + NNAPI: 約 30ms
+- PyTorch Mobile + GPU: 約 35ms
+
+=== 要点
+
+- OpenCL は NVIDIA デスクトップで最良
+- DirectML は Windows でのクロスベンダー用途に良好
+- TFLite はモバイルで最良
+- CoreML は Apple 環境で優秀
+- CPU 推論は GPU に比べて 10〜20 倍遅い
+
+**決定ルール**: 性能が重要なら、ターゲットのハードウェアと実際のモデルでベンチマークを取りましょう。これらの数値は目安であり、保証ではありません。
+
+== 移行パス
+
+後でライブラリを切り替える可能性があるなら、ロックインを避けるためにあらかじめ理解しておきましょう。
+
+=== TFLite → ONNX Runtime
+
+*難易度*: 中
+
+*手順*: TFLite→TF SavedModel→tf2onnx→検証→ONNX Runtime の API へ更新
+
+*注意点*: TFLite 固有の量子化がそのまま移行できない場合があります。再チューニングを想定しておきましょう。
+
+=== ONNX Runtime → TFLite
+
+*難易度*: 中〜高
+
+*手順*: ONNX→onnx-tf→TFLite、量子化、そして入念な検証
+
+*注意点*: すべての ONNX 操作が TFLite でサポートされているわけではありません。カスタム操作は問題になりやすいです。
+
+=== PyTorch Mobile → ONNX Runtime
+
+*難易度*: 易
+
+*手順*: PyTorch→ONNX エクスポート→ONNX Runtime→API 更新
+
+*注意点*: 動的な形状や制御フローは完全にはエクスポートできない場合があります。
+
+=== カスタム Vulkan → ライブラリ
+
+*難易度*: コードの移行は易しいが性能面は難しい
+
+*手順*: モデルをエクスポートし、カスタム推論をライブラリの呼び出しに置き換える
+
+*注意点*: 性能の低下が見込まれます。特定用途に最適化したカスタム実装は通常より速いものです。
+
+**決定ルール**: 将来切り替える見込みがあるなら ONNX 形式を選びましょう——移行の柔軟性が最大になります。
+
+== 決定木
+
+=== 決定木 1: デスクトップゲームでのリアルタイム推論
+
+[source]
+----
+開始: デスクトップゲーム、リアルタイム ML 推論
+
+Q: NVIDIA GPU のみ？
+├─ Yes → ONNX Runtime + OpenCL
+│         （最良の性能、NVIDIA 専用）
+│
+└─ No → Q: Windows のみ？
+        ├─ Yes → ONNX Runtime + DirectML
+        │         （クロスベンダーで良好な性能）
+        │
+        └─ No → Q: Linux のみ？
+                ├─ Yes → ONNX Runtime + OpenCL（NVIDIA が一般的）
+                │         または CPU（GPU が混在する場合）
+                │
+                └─ No（クロスプラットフォーム）→ ONNX Runtime + プラットフォーム別の最良な実行プロバイダ
+                                         （Windows は DirectML、Linux は OpenCL、macOS は CoreML）
+----
+
+=== 決定木 2: モバイル AR
+
+[source]
+----
+開始: モバイル AR、リアルタイム推論
+
+Q: iOS のみ？
+├─ Yes → Q: A12 以降？
+│        ├─ Yes → ONNX Runtime + CoreML
+│        │         （Neural Engine で最良）
+│        │
+│        └─ No → TensorFlow Lite + GPU
+│                 （幅広いデバイスに対応）
+│
+└─ No → Q: Android のみ？
+        ├─ Yes → TensorFlow Lite + GPU
+        │         （業界標準）
+        │
+        └─ No（クロスプラットフォーム）→ TensorFlow Lite + GPU
+                                  （プラットフォーム間で最も一貫している）
+----
+
+=== 決定木 3: 組み込み向けビジョン
+
+[source]
+----
+開始: 組み込み、コンピュータビジョン
+
+Q: 利用可能なメモリは？
+├─ 1MB 未満 → TensorFlow Lite Micro
+│
+├─ 1～100MB → TensorFlow Lite
+│
+└─ 100MB 超 → Q: クロスフレームワークが必要？
+             ├─ Yes → ONNX Runtime
+             │
+             └─ No → TensorFlow Lite
+----
+
+== 推奨マトリクス
+
+[cols="3,2,2,2,2", options="header"]
+|===
+|ユースケース |第一候補 |代替案 |避けるべき選択 |備考
+
+|デスクトップゲーム（NVIDIA）
+|ONNX Runtime + OpenCL
+|ONNX Runtime + DirectML
+|TensorFlow Lite
+|OpenCL で 2〜3 倍の高速化が見込める
+
+|デスクトップゲーム（AMD/Intel）
+|ONNX Runtime + DirectML
+|ONNX Runtime + CPU
+|OpenCL 中心の構成
+|DirectML はクロスベンダー対応
+
+|モバイルゲーム（Android）
+|TensorFlow Lite + GPU
+|ONNX Runtime + NNAPI
+|PyTorch Mobile
+|TFLite が業界標準
+
+|モバイルゲーム（iOS）
+|TensorFlow Lite + GPU
+|ONNX Runtime + CoreML
+|PyTorch Mobile
+|A12 以降なら CoreML
+
+|クロスプラットフォームアプリ
+|ONNX Runtime
+|TensorFlow Lite
+|プラットフォーム固有のみの構成
+|ONNX の一貫性が強み
+
+|組み込みビジョン
+|TensorFlow Lite
+|ONNX Runtime
+|重量級のライブラリ
+|TFLite は組み込み向けが得意
+
+|バッチ処理
+|ONNX Runtime + OpenCL
+|TensorFlow Lite
+|モバイル向けのみの構成
+|OpenCL は大規模バッチで優秀
+
+|迅速なプロトタイピング
+|TensorFlow Lite
+|ONNX Runtime
+|カスタム実装
+|TFLite の API が最もシンプル
+
+|本番システム
+|ONNX Runtime
+|TensorFlow Lite
+|実験的なライブラリ
+|成熟したエコシステムが重要
+|===
+
+== 最終決定
+
+このフレームワークを通じて 1〜2 の候補に絞り込めたはずです。最終判断のために次を行いましょう。
+
+=== 概念実証
+
+コミットする前にテストしましょう。有力な候補で最小限の概念実証（PoC）を作ります。
+
+1. 代表的なモデルを読み込む
+2. 代表的なデータで推論を行う
+3. ターゲットハードウェアで性能を計測する
+4. 統合の複雑さを評価する
+5. 予期せぬ問題を確認する
+
+ここに数日をかける価値はあります——後から数ヶ月分の後悔を避けられます。
+
+=== ターゲットハードウェアでのベンチマーク
+
+一般に公開されている数値はあくまで目安です。具体的なモデルと具体的なハードウェアで以下を計測しましょう。
+
+- レイテンシ（最小・最大・平均・p95・p99）
+- スループット
+- メモリ使用量（ピークと平均）
+- 消費電力（モバイル・組み込み向け）
+
+要件を満たさない場合は再検討してください。
+
+=== チームの事情を考慮する
+
+チームの専門性も重要です。全員が TensorFlow に慣れているなら、TFLite が 10% 遅くても扱いやすいでしょう。全員が PyTorch に慣れているなら、PyTorch Mobile が最も抵抗の少ない経路です。
+
+開発者の生産性は無視できない要素です。10% 遅いが統合が 50% 簡単になる選択肢の方が、結果的に良い選択になることもあります。
+
+=== 将来の計画
+
+アプリが将来どこへ向かうのかも考えましょう。デスクトップで始めてモバイルへ拡大する予定なら、両方でうまく動くライブラリを選びましょう。シンプルなモデルから複雑なモデルへ発展させる予定なら、その複雑さに対応できることを確認しておきましょう。
+
+まだ起きていない仮定のために過剰に設計する必要はありませんが、後で身動きが取れなくなるような選択も避けるべきです。
+
+== まとめ
+
+Vulkan アプリ向けの ML 推論ライブラリ選択は、多くの要因を考慮した評価です。プラットフォーム、モデル形式、性能、統合の複雑さ、エコシステムのすべてを見る必要があります。
+
+多くのデスクトップ用途では ONNX Runtime が適しています。性能、柔軟性、クロスプラットフォーム対応のバランスが良く、NVIDIA なら OpenCL、Windows なら DirectML、macOS なら CoreML を組み合わせられます。
+
+多くのモバイル用途では TensorFlow Lite が適しています。業界標準であり、優秀な性能と成熟したエコシステムを持ちます。iOS の A12 以降では CoreML を組み合わせた ONNX Runtime、Android でクロスフレームワークが必要なら NNAPI を組み合わせた ONNX Runtime も検討してください。
+
+組み込み向けには TFLite（マイコンなら TFLite Micro）が明確な選択です。リソース制約に対応するために設計されています。
+
+体系的な進め方はこうです。まず譲れない制約で選択肢を排除し、関連する観点で評価し、概念実証を行い、ターゲットハードウェアでベンチマークを取った上でコミットしましょう。
+
+xref:ML_Inference/Third_Party_Libraries/09_practical_examples.adoc[前へ: 実践例] | xref:ML_Inference/Third_Party_Libraries/11_ML_Compilers.adoc[次へ: ML コンパイラ]

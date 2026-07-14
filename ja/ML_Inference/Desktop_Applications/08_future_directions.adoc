@@ -1,0 +1,89 @@
+= 将来の方向性: GAN、DLSS など
+:pp: {plus}{plus}
+:stem: latexmath
+
+堅固な基盤を構築しました。動作する画像分類器、リアルタイムカメラパイプライン、多段 CI 検証スイート、「好奇心」RL エージェント、AI 最適化レイトレーシングまで。しかし ML とグラフィックスの世界では「完成」状態は、次の実験セットへの出発点にすぎません。
+
+デスクトップアプリケーション章の最終セクションは想像力を刺激するためです。Vulkan ML ツールを優れたものから不可欠なものへ変える、次世代の改良をいくつか見ていきます。
+
+== 改良 1: 敵対的生成ネットワーク（GAN）
+
+カメラアプリでは分類のみ。しかし**敵対的生成ネットワーク（GAN）**を使えば**リアルタイムスタイル転送**や**超解像**が可能です。
+
+=== 「敵対的」ゲーム
+GAN は 2 つのニューラルネットワークが「猫と鼠」ゲームをします:
+1.  **Generator（偽造者）**: 本物に見える画像（例: アップスケールフレーム）の作成を試みる。
+2.  **Discriminator（探偵）**: 本物フレームと生成フレームの区別を試みる。
+
+一緒に学習すると Generator は、従来の数学（双線形アップスケールなど）では決して「発明」できない写実的な詳細を、驚くほどうまく作れるようになります。
+
+[latexmath]
+++++
+\min_{G} \max_{D} V(D, G) = \mathbb{E}_{x \sim p_{data}(x)}[\log D(x)] + \mathbb{E}_{z \sim p_{z}(z)}[\log(1 - D(G(z)))]
+++++
+
+=== Vulkan 向け実世界アプリケーション
+*   **スタイル転送**: カメラフィードを Vulkan ゲームのコンセプトアートの「スタイル」でレンダリングできます。link:https://junyanz.github.io/CycleGAN/[**CycleGAN**] のような GAN は、ペア学習データなしで「現実世界」ドメインと「ゲームアート」ドメイン間の変換を学習します。
+*   **超解像**: link:https://arxiv.org/abs/1609.04802[**SRGAN**] のような GAN で低解像度フレームを鮮明な 4K に。帯域幅が限られるモバイル→デスクトップストリーミングに特に有用です。
+
+== 改良 2: デノイジングを超えて——Deep Learning Super Sampling（DLSS）
+
+第 7 章で AI デノイジングを扱いました。業界の進化形が **Deep Learning Super Sampling（DLSS）** と類似技術（link:https://gpuopen.com/fidelityfx-super-resolution-2/[**FSR**]、link:https://www.intel.com/content/www/us/en/developer/articles/technical/xe-super-sampling-technology-overview.html[**XeSS**]）です。
+
+=== 概念
+ノイズ除去だけでなく、ネットワークは低解像度のジッター入力から高解像度フレームを再構成します。**Temporal Feedback**——レイトレーシング章の時間的検証と同様——モーションベクトルで過去フレームを「振り返り」ます。
+
+=== メリット
+Vulkan ゲームを 1080p でレンダリングし 4K 表示でき、性能は 1080p に近く保てます。
+*   **実装経路**: 完全な DLSS はプロプライエタリですが、link:https://gpuopen.com/fidelityfx-super-resolution-2/[**FSR 2.0/3.0**]（従来ヒューリスティック）などオープンソース相当で実験するか、既存の motion vector/depth バッファでシンプルな CNN アップスケーラーを構築してみてください。
+
+== 改良 3: インテリジェントエンジニアリング向け RAG
+
+CI 検証章では AI がレンダーが*壊れているか*を伝えました。**Retrieval-Augmented Generation（RAG）**を使えば、*なぜ*壊れているかも伝えるシステムを構築できます。
+
+=== 仕組み
+1.  **検出**: Semantic Validator が視覚的グリッチ（例: 特定の影アーティファクト）を検出。
+2.  **Vector Retrieval**: バグの「意味的フィンガープリント」を取り、プロジェクトの**Git History**、**Issue Tracker**、**Shader Source Code**を含む**Vector Database**を検索。
+3.  **Context Injection**: LLM に検出エラーと履歴から top 3 の関連コードスニペットを与える。
+4.  **生成**: モデルが自然言語の診断レポートを生成。
+
+**レポート例**:
+> "I detected a shadow flickering artifact. Similar visual patterns were resolved in PR #412 by adding a synchronization barrier to the shadow map pass. The current change in `deferred_renderer.cpp` around line 154 seems to have removed a similar barrier. Recommendation: Verify pipeline barriers in the shadow pass."
+
+=== 実践調査
+link:https://www.langchain.com/[**LangChain**] や link:https://www.llamaindex.ai/[**LlamaIndex**] を調べてください。Vulkan プロジェクトのソース全体をインデックスし、シェーダが CI で失敗する理由をジュニア開発者に説明する「Graphics Mentor」bot を作成できます。
+
+== 改良 4: World Model と Imagination
+
+第 6 章の RL エージェントはランダムクリックや好奇心で探索しました。**World Model**（**DreamerV3** など）でこれを洗練できます。
+
+=== Imagination ベース探索
+World Model は Vulkan アプリの「心的シミュレーション」を学習します。
+*   **Latent Space**: 1080p フレーム全体を想像する（遅い）代わり、アプリ状態の圧縮された数学表現を学習。
+*   **Imagination**: エージェントは頭の中で 1 秒に数千クリックを「シミュレート」し、実 Vulkan アプリケーションへコマンドを送る前に最も興味深い経路を発見。
+*   **メリット**: エージェントが**計画**可能。「ここをクリックするとメニューループにハマりそう」と気づき、カバレッジ最大化の別経路を選べる。
+
+=== 実践調査
+link:https://danijar.com/project/dreamerv3/[**DreamerV3**] 論文や David Ha の link:https://worldmodels.github.io/[**World Models**] プロジェクトを参照。メニューベース Vulkan アプリケーション向けのシンプルな world model 実装は、生成 AI と強化学習の交差点を学ぶ素晴らしい方法です。
+
+== 改良 5: エッジデプロイと量子化
+
+本章で構築したモデル（MobileNetV2、U-Net）は大きい。チュートリアル次セクション**Advanced Topics**で、品質を失わずモバイルや統合グラフィックス向けに縮小する方法を学びます。
+
+1.  **INT8 量子化**: 32-bit float を 8-bit integer へ、4 倍の高速化。
+2.  **Pruning**: 最終画像に寄与しない「ニューロン」の除去。
+3.  **Vulkan 固有 Kernel**: 最大スループット向けの手チューニング Slang シェーダ。
+
+== 前方の道
+
+機械学習は優れたグラフィックスエンジニアリングの代替ではなく、それを強化する超能力です。これら「将来」概念をデスクトップアプリケーションに統合すると、次の未来へ近づきます:
+
+1.  **ソフトウェアは自己検証**: アプリは間違って見えるとき知り、なぜか説明できる。
+2.  **探索は自律的**: テストケースを書かず、エージェントを自由に走らせて発見させる。
+3.  **インタフェースは文脈認識**: アプリはカメラで世界を理解し、適切な情報（RAG）を取得してユーザーを助ける。
+
+これらを構築するツールが手に入りました。次のステップはチュートリアルを追うだけでなく——壊し、拡張し、まだ思いついていないものを作ることです。
+
+Happy coding!
+
+xref:ML_Inference/Desktop_Applications/07_ray_tracing_optimization.adoc[前へ: レイトレーシング最適化] | xref:ML_Inference/Advanced_Topics/01_introduction.adoc[次へ: 高度なトピック]

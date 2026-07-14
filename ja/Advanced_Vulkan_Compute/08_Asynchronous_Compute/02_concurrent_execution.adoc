@@ -1,0 +1,64 @@
+:pp: {plus}{plus}
+= 並行実行と Synchronization 2
+
+グラフィックスとコンピュートの真の並列性を達成するには、Vulkan タイムラインについて話す必要があります。標準の単一キュー構成では、すべてが順次起きます——コンピュートをディスパッチし、完了を待ち、グラフィックス作業を始めます。単純ですが非効率です。複数キューを使うことで、専用 **コンピュートキュー** に仕事を投入し、メインの **グラフィックスキュー** と並べて GPU に実行させられます。
+
+ただし課題は仕事を投入することだけではありません。重要なところで同期を保つことです。コンピュートディスパッチがグラフィックスパスが必要とするテクスチャを生成しているなら、コンピュートが終わるまでグラフィックスの読み取り開始を許してはいけません。しかしグラフィックスにはそれ以外のこと——バッファのクリア、頂点処理、あるいは無関係な他オブジェクトのラスタライズ——を*やらせる*ことができます。
+
+ここで **Synchronization 2**（`VK_KHR_synchronization2`）が輝きます。古い Vulkan 同期は強力でしたが悪名高く複雑で読みにくく、しばしば冗長なパイプラインステージとアクセスタイプのビットマスクに依存していました。Synchronization 2 はこれらをより論理的な構造にまとめ、さらに重要なことに、異なるキューをまたぐ **依存チェーン** をより堅牢に表現する方法を導入します。
+
+== 非同期コンピュート対並行実行
+単一キュー上での作業の「オーバーラップ」と、別ハードウェアクュー上での「非同期」作業を区別することが重要です。
+
+単一キュー上でも GPU は作業をオーバーラップできます——たとえば、前のドローのフラグメントシェーダがまだ終わっている間に新しい頂点シェーダを始められます。これが **並行実行（Concurrent Execution）** です。ただし依然として単一コマンドストリームに従います。
+
+**非同期コンピュート** は別のハードウェアエンジン（ACE）を使い、コンピュートユニット（CU/SM）へ仕事を供給します。つまりコンピュートエンジンはグラフィックスエンジンとはまったく異なるメモリストリームからコマンドを引いています。ここで真の並列性が起き、グラフィックスエンジンが ROP（Raster Output Processor）や固定機能ジオメトリハードウェアなどの他要因でボトルネックでも、GPU が ALU（Arithmetic Logic Unit）を飽和状態に保てます。
+
+== キュー所有権転送: ハンドシェイク
+マルチキュー Vulkan で最も難解だが不可欠な部分の一つが **キュー所有権転送** です。ほとんどの Vulkan リソース（`VkBuffer` や `VkImage` など）はデフォルトで `VK_SHARING_MODE_EXCLUSIVE` の共有モードで作成されます。つまり一度にちょうど 1 つのキューファミリーに所有されます。
+
+リソースをコンピュートキューからグラフィックスキューへ移すには、2 部からなる「ハンドシェイク」を行わなければなりません。
+
+1.  **Release**: 所有権を「解放」する **ソース** キュー上のバリア。
+2.  **Acquire**: 所有権を「取得」する **デスティネーション** キュー上のバリア。
+
+どちらかを省略すると **未定義動作** と潜在的なデータ破壊になります。Synchronization 2 はバリア構造体内に `srcQueueFamilyIndex` と `dstQueueFamilyIndex` を含めることでこれを明示的にします。
+
+[source,cpp]
+----
+// コンピュートキュー上（ソース）
+vk::ImageMemoryBarrier2 releaseBarrier {
+    .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+    .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eNone, // まだデスティネーションステージは気にしない
+    .dstAccessMask = vk::AccessFlagBits2::eNone,      // アクセスマスクも
+    .oldLayout = vk::ImageLayout::eGeneral,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .srcQueueFamilyIndex = computeQueueFamilyIndex,
+    .dstQueueFamilyIndex = graphicsQueueFamilyIndex,
+    .image = *sharedImage // vk::raii::Image からハンドルを取り出す
+};
+// ... (subresourceRange のセットアップ)
+
+// グラフィックスキュー上（デスティネーション）
+vk::ImageMemoryBarrier2 acquireBarrier {
+    .srcStageMask = vk::PipelineStageFlagBits2::eNone, // ここではソースステージは気にしない
+    .srcAccessMask = vk::AccessFlagBits2::eNone,      // アクセスマスクも
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    .oldLayout = vk::ImageLayout::eGeneral,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .srcQueueFamilyIndex = computeQueueFamilyIndex,
+    .dstQueueFamilyIndex = graphicsQueueFamilyIndex,
+    .image = *sharedImage // vk::raii::Image からハンドルを取り出す
+};
+// ... (subresourceRange のセットアップ)
+----
+
+両方のバリアで `oldLayout` と `newLayout` が**正確に一致**しなければならないことに注意してください。これは重要な要件です。「Release」バリアはメモリが**利用可能**（メモリ／L2 キャッシュへ書き出された）であることを保証し、「Acquire」バリアは**可視**（デスティネーションエンジンのリードキャッシュを無効化）であることを保証します。
+
+本当の「魔法」は、キュー間の **セマフォベース同期**（`VkSemaphore` オブジェクトでキュー間の作業を協調）を使うときに起きます。コンピュートワークロードを「シグナル」セマフォ付きで投入し、グラフィックスワークロードを「ウェイト」セマフォ付きで投入します。GPU が内部スケジューリングを処理し、コンピュート結果を必要とする特定のパイプラインステージに達したときだけグラフィックスキューをストールさせます。これにより、グラフィックスパスのジオメトリ重い部分の間、GPU のハードウェアスケジューラがコンピュートユニットを忙しく保て、コンピュート作業のコストを効果的に「隠せ」ます。
+
+ただし、すべてのハードウェアが平等に作られているわけではないことを覚えておいてください。一部のモバイル GPU はコンピュートとグラフィックスで統一ハードウェアを持ち、「並行性」はスケジューラがタスクをインターリーブするだけを意味することがあります。一方ハイエンドデスクトップ GPU は、グラフィックスエンジンと完全に並列に動ける専用コンピュートパイプを持つことが多いです。オーケストレーションが期待する性能向上を本当に届けているかを知る唯一の方法はプロファイリングです。
+
+xref:Advanced_Vulkan_Compute/08_Asynchronous_Compute/01_introduction.adoc[前へ: はじめに] | xref:Advanced_Vulkan_Compute/08_Asynchronous_Compute/03_timeline_semaphores.adoc[次へ: タイムラインセマフォ]

@@ -1,0 +1,195 @@
+:pp: {plus}{plus}
+= Synchronization 2 の利点
+
+== はじめに
+
+Vulkan 1.0 の初期、依存関係の定義は断片的でしばしば苛立たしい作業でした。`VkMemoryBarrier`、`VkBufferMemoryBarrier`、`VkImageMemoryBarrier` といった複数の構造体を扱う必要がありました。数が多いだけでなく機能的にも分かれていたため、同期の論理がコードのあちこちに散らばっていました。
+
+**Synchronization 2**（VK_KHR_synchronization2）は、現在 Vulkan 1.3 のコアとなり、これを根本から変えます。ばらばらだったバリアを一つのまとまった構造体 `vk::DependencyInfo` に統一します。
+
+== 断片化された過去: なぜレガシーは難しかったか
+
+Synchronization 2 の利点を理解するには、置いていくものを見る必要があります。レガシーな Vulkan 1.0 API では、パイプラインバリアは一つの関数呼び出しで、グローバル・バッファ・イメージの三つのバリア配列を取りました。
+
+[,cpp]
+----
+// Legacy Vulkan 1.0 (Still works, but we don't like it)
+vkCmdPipelineBarrier(
+    commandBuffer,
+    srcStageMask,  // Global stage mask for ALL barriers
+    dstStageMask,  // Global stage mask for ALL barriers
+    dependencyFlags,
+    memoryBarrierCount, pMemoryBarriers,
+    bufferMemoryBarrierCount, pBufferMemoryBarriers,
+    imageMemoryBarrierCount, pImageMemoryBarriers
+);
+----
+
+問題に気づきますか？`srcStageMask` と `dstStageMask` は個々のバリア構造体ではなく、*関数* の引数として渡されていました。つまり、同じ呼び出しで二つの異なるイメージ遷移——例えば一方が `Transfer` から `Fragment Shader`、もう一方が `Compute` から `Vertex Shader`——がある場合、それらすべてのステージを一つの広いマスクにまとめなければなりませんでした。
+
+これが「過剰同期」につながりました。関数レベルでステージをマージすると、*すべての* ソースステージが終わるまで *どの* 宛先ステージも開始できないと GPU に伝えてしまうことになります。本来不要なボトルネックを作っていたのです。
+
+image::/images/sync2_problem_over_sync.svg[レガシー同期の渋滞, width=600, align="center"]
+
+== 「意図の連鎖」: vk::DependencyInfo による統一
+
+Synchronization 2 は、ステージマスクをバリア構造体そのものへ移すことでこれを解決します。エンジンでは、すべての同期の要求を収めるコンテナとして `vk::DependencyInfo` を使います。
+
+同期を統一するとき、単なる構文の整理ではありません。依存関係の「意図」全体を一か所にまとめています。`vk::DependencyInfo` では、個々の `vk::ImageMemoryBarrier2` や `vk::BufferMemoryBarrier2` がそれぞれ独自の `srcStageMask` と `dstStageMask` を持ちます。
+
+[,cpp]
+----
+// Synchronization 2 (The Modern Way)
+vk::ImageMemoryBarrier2 imageBarrier{
+    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    // ... layout transitions, image handles ...
+};
+
+vk::DependencyInfo dependencyInfo{
+    .imageMemoryBarrierCount = 1,
+    .pImageMemoryBarriers = &imageBarrier
+};
+
+commandBuffer.pipelineBarrier2(dependencyInfo);
+----
+
+image::/images/sync2_solution_granular.svg[Synchronization 2 の細粒度制御, width=600, align="center"]
+
+これは可読性の大きな勝利です。その `imageBarrier` ブロックを見れば、完全な「ハンドシェイク」が見えます。どの作業が終わり（`src`）、どの作業が待っているか（`dst`）が正確に分かります。依存関係のもう半分を関数引数やグローバル変数の中から探す必要はありません。
+
+== 64 ビットマスクによる細粒度制御
+
+切り替えのもう一つの技術的理由は単純な算術でした。当初の Vulkan 1.0 フラグは 32 ビットビットマスクでした。Vulkan が進化し、レイトレーシング、メッシュシェーディング、ビデオエンコーディングなどが追加されると、ビットが文字どおり足りなくなりました。
+
+`vk::PipelineStageFlagBits2` では 64 ビットマスクへ移行しました。特定のハードウェアユニットを精密に狙う余裕が得られます。
+
+=== 「None」の力
+レガシー Vulkan では、メモリ依存が不要で実行依存だけ必要な場合、しばしば `0` を渡したり、`BOTTOM_OF_PIPE` のような紛らわしいフラグを使ったりしました。Sync 2 には明示的な `vk::PipelineStageFlagBits2::eNone` と `vk::AccessFlagBits2::eNone` があります。
+
+メモリフラッシュを必要としないレイアウト遷移（非常に稀ですが可能）や、あるバリアが特定ステージに影響しないことをはっきりさせたい場合、`eNone` が最良の味方です。コードが自己文書化されます。
+
+== メンタルモデルとしての Sync 2
+
+Synchronization 2 を新しい API ではなく、GPU へのより良い話し方だと考えてください。旧システムでは、ハードウェアに大雑把な命令を叫んでいました。「レンダリングが終わるまで全員止まれ！」
+
+Synchronization 2 では、より繊細な会話になります。「Color Attachment Output よ、このイメージの書き込みが終わったら、フラグメントシェーダに読んで安全だと伝えてくれ。」
+
+この「人間同士」レベルの明確さこそ、エンジン全体をこれらの構造体の周りに築いている理由です。開発者であるあなたへの認知負荷を減らし、GPU の「パイプライン」を作業で満たし続けるためにドライバが必要とする正確な情報を与えます。
+
+== エンジンでのまとめ方
+
+実世界のエンジンでは、同期は単一の遷移だけではありません。パス間のデータフロー全体をオーケストレーションすることです。Synchronization 2 の「勝利」の好例は、`Renderer` クラス、特に反射パスのような複雑な操作にあります。
+
+反射を描くとき、しばしば複数のリソース——例えばカラーバッファとデプスバッファ——を同時に遷移させる必要があります。レガシー API では、両方とも全ステージの和集合を待つ「渋滞」に押し込まれました。Synchronization 2 では、それぞれの固有の要求を保ったままバッチできます。
+
+[,cpp]
+----
+void Renderer::renderReflectionPass(vk::raii::CommandBuffer& cmd) {
+    // Transition reflection color to COLOR_ATTACHMENT_OPTIMAL
+    vk::ImageMemoryBarrier2 toColor{
+        .srcStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .dstStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout     = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .newLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+        .image         = *reflectionColor,
+        .subresourceRange = { vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 }
+    };
+
+    // Transition reflection depth to DEPTH_ATTACHMENT_OPTIMAL
+    vk::ImageMemoryBarrier2 toDepth{
+        .srcStageMask  = vk::PipelineStageFlagBits2::eEarlyFragmentTests,
+        .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        .dstStageMask  = vk::PipelineStageFlagBits2::eEarlyFragmentTests,
+        .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        .oldLayout     = vk::ImageLayout::eUndefined,
+        .newLayout     = vk::ImageLayout::eDepthAttachmentOptimal,
+        .image         = *reflectionDepth,
+        .subresourceRange = { vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1 }
+    };
+
+    // The Win: Batching unique intents into a single call
+    std::array barriers{ toColor, toDepth };
+    vk::DependencyInfo dependencyInfo{
+        .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+        .pImageMemoryBarriers    = barriers.data()
+    };
+
+    // One call, but the driver knows 'toColor' only cares about
+    // ColorAttachmentOutput, while 'toDepth' only cares about EarlyFragmentTests.
+    cmd.pipelineBarrier2(dependencyInfo);
+
+    // Now we can safely begin our reflection rendering
+    // ...
+}
+----
+
+ここでの「勝利」を見るために、同じ `renderReflectionPass` 操作のレガシー版を見てみましょう。ステージマスクを関数レベルで結合せざるを得ませんでした。
+
+[,cpp]
+----
+// Legacy Vulkan 1.0 equivalent - The "Log Jam"
+vk::ImageMemoryBarrier legacyToColor{
+    .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+    .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+    .oldLayout     = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .newLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+    .image         = *reflectionColor,
+    .subresourceRange = { vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 }
+};
+
+vk::ImageMemoryBarrier legacyToDepth{
+    .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+    .dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+    .oldLayout     = vk::ImageLayout::eUndefined,
+    .newLayout     = vk::ImageLayout::eDepthAttachmentOptimal,
+    .image         = *reflectionDepth,
+    .subresourceRange = { vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1 }
+};
+
+std::array legacyBarriers{ legacyToColor, legacyToDepth };
+
+// NOTICE: The stage masks are passed to the function, not the barriers!
+cmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests, // srcStageMask (Union)
+    vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests, // dstStageMask (Union)
+    {}, // dependencyFlags
+    nullptr, nullptr, legacyBarriers
+);
+----
+
+このレガシー版では、`eColorAttachmentOutput` と `eEarlyFragmentTests` の和集合である単一の `srcStageMask` を渡さざるを得ません。つまり GPU は、どちらのイメージの遷移を *開始* する前に、先行する作業のカラー書き込み *と* デプステストの *両方* が終わるのを待たなければなりません。
+
+Synchronization 2 では、デプステストが先に終われば、カラーハードウェアがまだ忙しくてもドライバはすぐに `toDepth` 遷移を開始できます。GPU の「渋滞」が起きにくくなり、ハードウェアの異なる部分がそれぞれのペースで働けます。
+
+このコードは通常、フレーム記録ロジックの中、しばしば `renderReflectionPass` のような専用パス関数内で、`beginRendering` を呼ぶ直前に置かれます。リソースが必要になる場所に同期ロジックを置き、関連する遷移を一つの `vk::DependencyInfo` にまとめることで、読みやすく、かつハードウェアが実行するのに最適な「意図の連鎖」が生まれます。
+
+== 実装: Simple Engine の現代化
+
+`Simple Engine` のレンダラは、これまで述べてきた `pipelineBarrier2` 呼び出しを使うよう概ね現代化されていますが、コードベースにはまだリファクタリング中の「レガシーな島」があります。典型例が `PhysicsSystem`（`physics_system.cpp`）で、コンピュートディスパッチの同期に依然として古いスタイルの `pipelineBarrier` を使っています。
+
+`PhysicsSystem::SimulatePhysicsOnGPU` を見ると、次のような遷移があります。
+
+[,cpp]
+----
+// Legacy synchronization in PhysicsSystem
+vulkanResources.commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {},
+    vk::MemoryBarrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead),
+    nullptr, nullptr
+);
+----
+
+今後の `Simple Engine` の「Synchronization Upgrade」ブランチでは、これらをよりクリーンな `vk::DependencyInfo` と `vk::BufferMemoryBarrier2` に置き換えます。グローバルメモリバリアから離れ、特定の物理バッファを狙えるようになり、複雑なキャッシュ階層を持つアーキテクチャでの性能ペナルティを減らせます。
+
+次の節では、ハードウェアから最後の一滴まで性能を絞り出すために、適切なステージとフラグの選び方を深く掘り下げます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Anatomy_of_a_Dependency/02_execution_vs_memory.adoc[実行依存とメモリ依存] | 次へ: xref:Synchronization/Anatomy_of_a_Dependency/04_refined_pipeline_stages.adoc[洗練されたパイプラインステージ]

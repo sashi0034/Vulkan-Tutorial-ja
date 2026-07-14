@@ -1,0 +1,253 @@
+:pp: {plus}{plus}
+
+= 結合イメージサンプラー
+
+== はじめに
+
+ディスクリプタを初めて見たのは、チュートリアルのユニフォームバッファのパートでした。
+この章では、新しい種類のディスクリプタである _結合イメージサンプラー_ を見ていきます。
+このディスクリプタにより、シェーダは前章で作成したようなサンプラーオブジェクト経由でイメージリソースにアクセスできます。
+
+Vulkan は、異なるディスクリプタタイプを通じてシェーダ内でテクスチャへアクセスする方法に柔軟性を提供している点も注目に値します。このチュートリアルでは _結合イメージサンプラー_ を使いますが、Vulkan はサンプラー（`vk::DescriptorType::eSampler`）とサンプリングされるイメージ（`vk::DescriptorType::eSampledImage`）用の別々のディスクリプタもサポートします。別々のディスクリプタを使うと、同じサンプラーを複数のイメージで再利用したり、同じイメージを異なるサンプリングパラメータでアクセスしたりできます。同一のサンプリング設定を使うテクスチャが多数あるシナリオでは、より効率的になり得ます。ただし、結合イメージサンプラーは多くの場合より便利で、最適化されたキャッシュ利用により一部のハードウェアではより良い性能を提供できます。
+
+まず、そのような結合イメージサンプラーディスクリプタを含むよう、ディスクリプタセットレイアウト、ディスクリプタプール、ディスクリプタセットを変更します。
+その後、色の値を置き換えて `Vertex` にテクスチャ座標を追加し、頂点色を補間するだけでなくテクスチャから色を読むようフラグメントシェーダを変更します。
+
+== ディスクリプタの更新
+
+`createDescriptorSetLayout` 関数へ行き、結合イメージサンプラーディスクリプタ用の `VkDescriptorSetLayoutBinding` を追加します。
+ユニフォームバッファの次のバインディングに置くだけにします。
+
+[,c++]
+----
+std::array<vk::DescriptorSetLayoutBinding, 2> bindings{
+    {{.binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex},
+     {.binding = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment}}};
+
+vk::DescriptorSetLayoutCreateInfo layoutInfo{.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()};
+----
+
+結合イメージサンプラーディスクリプタをフラグメントシェーダで使う意図であることを示すよう、`stageFlags` を設定してください。
+フラグメントの色が決まるのはそこです。
+例えば https://en.wikipedia.org/wiki/Heightmap[ハイトマップ] で頂点グリッドを動的に変形するなど、頂点シェーダでテクスチャサンプリングを使うことも可能です。
+
+結合イメージサンプラーの割り当て用に余裕を作るため、`vk::DescriptorPoolCreateInfo` に型 `vk::DescriptorType::eCombinedImageSampler` の別の `vk::PoolSize` を追加して、より大きなディスクリプタプールも作成する必要があります。
+`createDescriptorPool` 関数へ行き、このディスクリプタ用の `vk::DescriptorPoolSize` を含むよう変更します。
+
+[,c++]
+----
+std::array<vk::DescriptorPoolSize, 2> poolSize{{{.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = MAX_FRAMES_IN_FLIGHT},
+                                                {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = MAX_FRAMES_IN_FLIGHT}}};
+vk::DescriptorPoolCreateInfo          poolInfo{.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+                                               .maxSets       = MAX_FRAMES_IN_FLIGHT,
+                                               .poolSizeCount = static_cast<uint32_t>(poolSize.size()),
+                                               .pPoolSizes    = poolSize.data()};
+----
+
+不十分なディスクリプタプールは、バリデーションレイヤが捕捉しない問題の良い例です。Vulkan 1.1 時点では、プールが十分に大きくない場合、`vk::raii::Device::allocateDescriptorSets` は失敗して `vk::OutOfPoolMemoryError` 例外を投げることがありますが、ドライバが内部で問題を解決しようとする場合もあります。
+これは、（ハードウェア、プールサイズ、割り当てサイズに依存して）ディスクリプタプールの制限を超える割り当てを、ドライバが許す場合があることを意味します。
+他の場合、`vk::raii::Device::allocateDescriptorSets` は失敗して `vk::OutOfPoolMemoryError` 例外を投げます。
+一部のマシンでは割り当てが成功し、他では失敗すると特に苛立たしいことがあります。
+
+Vulkan は割り当ての責任をドライバに移したため、ディスクリプタプール作成時に対応する `descriptorCount` メンバで指定された数だけ、ある種類（`vk::DescriptorType::eCombinedImageSampler` など）のディスクリプタを割り当てることは、もはや厳格な要件ではありません。
+ただし、そうするのがベストプラクティスであることに変わりはなく、将来、https://vulkan.lunarg.com/doc/view/latest/windows/best_practices.html[Best Practice Validation] を有効にすると、`VK_LAYER_KHRONOS_validation` がこの種の問題について警告します。
+
+最後のステップは、実際のイメージとサンプラーリソースをディスクリプタセット内のディスクリプタにバインドすることです。
+`createDescriptorSets` 関数へ行きます。
+
+[,c++]
+----
+for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+{
+    vk::DescriptorBufferInfo bufferInfo{.buffer = uniformBuffers[i], .offset = 0, .range = sizeof(UniformBufferObject)};
+    vk::DescriptorImageInfo  imageInfo{.sampler = textureSampler, .imageView = textureImageView, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+
+    ...
+}
+----
+
+結合イメージサンプラー構造体のリソースは、ユニフォームバッファディスクリプタのバッファリソースが `vk::DescriptorBufferInfo` 構造体で指定されるのと同様に、`vk::DescriptorImageInfo` 構造体で指定する必要があります。
+ここで前章のオブジェクトがまとまります。
+
+[,c++]
+----
+std::array<vk::WriteDescriptorSet, 2> descriptorWrites{{{.dstSet          = descriptorSets[i],
+                                                         .dstBinding      = 0,
+                                                         .dstArrayElement = 0,
+                                                         .descriptorCount = 1,
+                                                         .descriptorType  = vk::DescriptorType::eUniformBuffer,
+                                                         .pBufferInfo     = &bufferInfo},
+                                                        {.dstSet          = descriptorSets[i],
+                                                         .dstBinding      = 1,
+                                                         .dstArrayElement = 0,
+                                                         .descriptorCount = 1,
+                                                         .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+                                                         .pImageInfo      = &imageInfo}}};
+device.updateDescriptorSets(descriptorWrites, {});
+----
+
+ディスクリプタはバッファのときと同様に、このイメージ情報で更新する必要があります。
+今回は `pBufferInfo` ではなく `pImageInfo` 配列を使います。
+ディスクリプタはこれでシェーダから使える準備ができました。
+
+== テクスチャ座標
+
+テクスチャマッピングにまだ足りない重要な要素が 1 つあり、それが各頂点の実際のテクスチャ座標で、しばしば「uv 座標」と呼ばれます。
+テクスチャ座標は、イメージがジオメトリに実際にどうマッピングされるかを決めます。
+
+[,c++]
+----
+struct Vertex
+{
+    glm::vec2 pos;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+    static vk::VertexInputBindingDescription getBindingDescription()
+    {
+        return { 0, sizeof(Vertex), vk::VertexInputRate::eVertex };
+    }
+
+    static std::array<vk::VertexInputAttributeDescription, 3> getAttributeDescriptions()
+    {
+        return {{{.location = 0, .binding = 0, .format = vk::Format::eR32G32Sfloat, .offset = offsetof(Vertex, pos)},
+		         {.location = 1, .binding = 0, .format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, color)},
+		         {.location = 2, .binding = 0, .format = vk::Format::eR32G32Sfloat, .offset = offsetof(Vertex, texCoord)}}};
+    }
+};
+----
+
+テクスチャ座標用の `vec2` を含むよう `Vertex` 構造体を変更します。
+頂点シェーダでテクスチャ座標を入力としてアクセスできるよう、`vk::VertexInputAttributeDescription` も追加してください。
+正方形の表面全体で補間するため、それらをフラグメントシェーダへ渡せるようにする必要があります。
+色はシェーダ節の最後の追加例で使いますが、画像を表示するには不要で削除できます。
+その場合は `vertices` 配列とシェーダも合わせて更新してください。
+
+[,c++]
+----
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
+};
+----
+
+このチュートリアルでは、左上隅の `0, 0` から右下隅の `1, 1` までの座標を使って、正方形をテクスチャで埋めるだけにします。
+異なる座標で自由に試してみてください。
+`0` 未満や `1` 超の座標を使って、アドレッシングモードがどう動くか見てみてください。
+
+== シェーダ
+
+最後のステップは、テクスチャから色をサンプリングするようシェーダを変更することです。
+まず、テクスチャ座標をフラグメントシェーダへ通すよう頂点シェーダを変更する必要があります。
+
+[,slang]
+----
+struct VSInput {
+    float2 inPos;
+    float3 inColor;
+    float2 inTexCoord;
+};
+
+struct UniformBuffer {
+    float4x4 model;
+    float4x4 view;
+    float4x4 proj;
+};
+ConstantBuffer<UniformBuffer> ubo;
+
+struct VSOutput
+{
+    float4 pos : SV_Position;
+    float3 fragColor;
+    float2 fragTexCoord;
+};
+
+[shader("vertex")]
+VSOutput vertMain(VSInput input) {
+    VSOutput output;
+    output.pos = mul(ubo.proj, mul(ubo.view, mul(ubo.model, float4(input.inPos, 0.0, 1.0))));
+    output.fragColor = input.inColor;
+    output.fragTexCoord = input.inTexCoord;
+    return output;
+}
+
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+   return float4(vertIn.fragTexCoord, 0.0, 1.0);
+}
+----
+
+下の画像のようなものが見えるはずです。
+シェーダの再コンパイルを忘れないでください。
+
+image::/images/texcoord_visualization.png[]
+
+緑チャンネルが水平座標を、赤チャンネルが垂直座標を表します。
+黒と黄色の角は、テクスチャ座標が正方形全体で `0, 0` から `1, 1` へ正しく補間されていることを確認します。
+色でデータを可視化するのは、より良い選択肢がないときの、シェーダプログラミングにおける `printf` デバッグに相当します。
+
+Slang では、サンプラーが結合イメージサンプラーディスクリプタを表します。
+フラグメントシェーダにその参照を追加します。
+
+[,slang]
+----
+Sampler2D texture;
+----
+
+他の種類のイメージ用に、同等の `sampler1D` と `sampler3D` 型もあります。
+ここで正しいバインディングを使うようにしてください。
+
+[,slang]
+----
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+   return texture.Sample(vertIn.fragTexCoord);
+}
+----
+
+テクスチャは組み込みの `texture` 関数でサンプリングされます。
+`sampler` と座標を引数に取ります。
+サンプラーはバックグラウンドでフィルタリングと変換を自動的に処理します。
+アプリケーションを実行すると、正方形上にテクスチャが見えるはずです。
+
+image::/images/texture_on_square.png[]
+
+テクスチャ座標を `1` より大きい値にスケールして、アドレッシングモードを試してみてください。
+例えば、次のフラグメントシェーダは `VK_SAMPLER_ADDRESS_MODE_REPEAT` 使用時に下の画像の結果を生み出します。
+
+[,glsl]
+----
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+   return texture.Sample(vertIn.fragTexCoord * 2.0);
+}
+----
+
+image::/images/texture_on_square_repeated.png[]
+
+頂点色を使ってテクスチャ色を操作することもできます。
+
+[,slang]
+----
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+   return float4(vertIn.fragColor * texture.Sample(vertIn.fragTexCoord).rgb, 1.0);
+}
+----
+
+ここではアルファチャンネルをスケールしないよう、RGB とアルファチャンネルを分けました。
+
+image::/images/texture_on_square_colorized.png[]
+
+シェーダ内でイメージにアクセスする方法が分かりました。
+フレームバッファにも書き込まれるイメージと組み合わせると、これは非常に強力な手法です。
+これらのイメージを入力として使い、ポストプロセスや 3D 世界内のカメラディスプレイのような面白い効果を実装できます。
+
+xref:07_Depth_buffering.adoc[次の章]では、オブジェクトを正しく並べるための深度バッファリングの追加方法を学びます。
+
+link:/attachments/26_texture_mapping.cpp[C{pp} code] /
+link:/attachments/26_shader_textures.slang[slang shader] /
+link:/attachments/26_shader_textures.vert[GLSL Vertex shader] /
+link:/attachments/26_shader_textures.frag[GLSL Fragment shader]

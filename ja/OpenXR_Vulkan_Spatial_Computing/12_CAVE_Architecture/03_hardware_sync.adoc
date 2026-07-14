@@ -1,0 +1,51 @@
+:pp: {plus}{plus}
+= ハードウェア同期: スワップグループとバリア
+
+**CAVE** を駆動するネットワーククラスタでは、同期に「だいたい合っている」では不十分です。ノード A（左壁）がノード B（正面壁）よりわずか 1 ミリ秒早くバッファをスワップすると、ユーザーは気になる水平線や、二つの壁が交わる角をまたぐ「ずれ」た物体を見ます。これは **クラスタティアリング（Cluster Tearing）** として知られます。
+
+== スワップグループ: マシン内同期
+
+**スワップグループ** は、*単一* のワークステーションに接続された複数 GPU または複数ディスプレイを同期します。
+
+グループ内の一つの GPU が present の準備ができると、ハードウェアは同じマシン内の他のすべての GPU も準備できるまで「スワップ」信号を保持します。これにより、デュアル GPU ワークステーションの二つの出力が、まさに同じリフレッシュ周期でピクセルを更新することが保証されます。
+
+== スワップバリア: マシン間同期
+
+**スワップバリア** は、スワップグループのネットワーク拡張です。*複数* のワークステーションをまたいで動作します。
+
+1.  **ハードウェア接続**: 物理ケーブル（しばしば BNC または RJ45 同期ケーブル）がクラスタ全体の GPU を接続する。
+2.  **ハンドシェイク**: ノード A がフレームを終えると、ケーブル越しに「Ready」信号を送る。
+3.  **待機**: ノード A は実行をブロックする。
+4.  **解放**: クラスタ内の *すべての* ノードが「Ready」信号を送ったときだけ、ハードウェアがバリアを解放し、すべての GPU が同時にバッファをスワップする。
+
+== Vulkan でのバリア実装
+
+これらのハードウェアグループに参加するには **VK_NV_present_barrier** 拡張を使います。
+
+[source,cpp]
+----
+// Checking for Present Barrier support and joining a group
+auto features2 = physicalDevice.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDevicePresentBarrierFeaturesNV>();
+const auto& barrierFeatures = features2.get<vk::PhysicalDevicePresentBarrierFeaturesNV>();
+
+if (barrierFeatures.presentBarrier) {
+    // When creating the swapchain, we join Barrier 1
+    // This barrier is managed by the physical sync cable between machines
+    vk::SwapchainPresentBarrierCreateInfoNV barrierInfo{};
+    barrierInfo.presentBarrierEnable = VK_TRUE;
+    barrierInfo.barrierID = 1;
+
+    vk::SwapchainCreateInfoKHR createInfo{};
+    createInfo.pNext = &barrierInfo;
+    // ...
+}
+----
+
+== Genlock と Swaplock
+
+*   **Genlock（Generator Lock）**: ビデオ信号の *開始*（スキャンラインの開始）を同期する。「ローリング」アーティファクトを防ぐ。
+*   **Swaplock（スワップバリア）**: フロント／バックバッファがスワップされる *瞬間* を同期する。「古いフレーム」アーティファクトを防ぐ。
+
+Genlock（信号タイミング）とスワップバリア（フレームタイミング）を組み合わせることで、空間コンピューティング同期の「ゴールドスタンダード」——**フレーム完全クラスタレンダリング**——を達成します。部屋全体が、一枚のデジタル紙であるかのように更新されます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/12_CAVE_Architecture/02_projector_based_spatial_tech.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/12_CAVE_Architecture/04_incorporating_into_the_engine.adoc[Next]

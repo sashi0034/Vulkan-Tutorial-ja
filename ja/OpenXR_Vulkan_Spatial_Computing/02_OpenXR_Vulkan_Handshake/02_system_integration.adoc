@@ -1,0 +1,99 @@
+:pp: {plus}{plus}
+= システム統合
+
+標準のデスクトップアプリケーションでは、エンジンが通常、独自の内部ロジックに基づいて `VkInstance` を作成し、`VkPhysicalDevice` を選択する責任を持ちます。OpenXR に移ると、もはや単独の意思決定者ではありません。グラフィックスコンテキストがヘッドセットのコンポジタと互換であることを保証するため、まず XR ランタイムと交渉しなければなりません。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+Vulkan エンジンを XR ランタイムに接続することは、OpenXR 仕様で定義された必須のプロセスです。アプリケーションとランタイムがリソースを効率的かつ安全に共有できるよう、この協調したハンドシェイクを行う必要があります。
+
+OpenXR と Vulkan の橋渡しが拡張 **XR_KHR_vulkan_enable2** です。この拡張は、どのインスタンス／デバイス拡張が必要か、および空間パイプラインが機能するために有効化しなければならない特定の機能フラグを、OpenXR が正確に指定する仕組みを提供します。
+
+== アーキテクチャ境界: なぜハンドシェイクが必要か？
+
+この交渉が必要な理由を理解するには、**OpenXR Runtime**（SteamVR、Meta Link、Monado など）が裏で何をしているかを見る必要があります。標準のウィンドウシステムと異なり、XR ランタイムはしばしば別の高優先度システムサービスまたはプロセスとして動作します。
+
+*   **プロセス分離**: ランタイムは物理ハードウェア（カメラ、IMU、ディスプレイ）を管理し、エンジンがフレーム期限を逃した場合に最終画像をワープする **非同期リプロジェクション** などの重要タスクを行います。
+*   **VRAM 共有**: ランタイムとエンジンは別プロセスのため、GPU メモリへのアクセスを共有しなければなりません。これは両者が同じ物理メモリアドレスを見る「ゼロコピー」の受け渡しです。
+*   **検証**: `xrCreateSession` を呼ぶと、ランタイムは提供した `VkInstance` と `VkDevice` が、要求した拡張で作成されたことを検証します。
+
+ハンドシェイクは、OS と XR ランタイムに対し「私たちは同じ方言の Vulkan を話し、同じ拡張を使い、同じ物理シリコンを見ている」と伝える方法です。
+
+== XR グラフィックス要件の問い合わせ
+
+Vulkan インスタンスを作成する前に、OpenXR インスタンスを初期化し、`xrGetVulkanGraphicsRequirements2KHR` を使って対象システム（ヘッドセット）のグラフィックス要件を問い合わせる必要があります。
+
+この呼び出しは `XrGraphicsRequirementsVulkanKHR` 構造体を埋め、次の 2 つの重要な情報を含みます。
+
+1.  **minApiVersionSupported**: ランタイムがサポートする最小 Vulkan バージョン。
+2.  **maxApiVersionSupported**: ランタイムがテスト済みの最大 Vulkan バージョン。
+
+Vulkan 1.3 を対象とするため、選んだバージョンがこの範囲内にあることを検証しなければなりません。ほとんどの現代的ランタイムは最新仕様への対応を急速に進めており、必要な高度な同期ツールへのアクセスが確保されています。
+
+== 協調したエンジン初期化
+
+エンジンの初期化ロジックは、これらの外部要件を受け入れるよう修正する必要があります。インスタンス拡張の静的リストをハードコードする代わりに、協調したハンドシェイクを行います。
+
+1.  **OpenXR に問い合わせ**: `xrGetVulkanInstanceExtensionsKHR` でランタイムの必須インスタンス拡張を尋ねる。
+2.  **マージして初期化**: これらの OpenXR 要件をエンジン自身の必須拡張（例: `VK_EXT_debug_utils`）と結合し、インスタンスを作成する。
+
+[source,cpp]
+----
+// Example of merging requirements in our Engine's initialization using designated initializers
+std::vector<const char*> instanceExtensions = engineDefaults.getInstanceExtensions();
+
+// 1. Query the length of the extension string
+uint32_t xrExtensionCount = 0;
+xrGetVulkanInstanceExtensionsKHR(xrInstance, systemId, 0, &xrExtensionCount, nullptr);
+
+// 2. Retrieve the space-separated string
+std::string xrExtensionString(xrExtensionCount, '\0');
+xrGetVulkanInstanceExtensionsKHR(xrInstance, systemId, xrExtensionCount, &xrExtensionCount, xrExtensionString.data());
+
+// 3. Parse the string into individual extension names
+std::stringstream ss(xrExtensionString);
+std::string extension;
+while (ss >> extension) {
+    if (std::find(instanceExtensions.begin(), instanceExtensions.end(), extension) == instanceExtensions.end()) {
+        instanceExtensions.push_back(strdup(extension.c_str()));
+    }
+}
+
+vk::ApplicationInfo applicationInfo{
+    .pApplicationName = "SpatialEngine",
+    .applicationVersion = 1,
+    .pEngineName = "VulkanSpatial",
+    .engineVersion = 1,
+    .apiVersion = VK_API_VERSION_1_3
+};
+
+vk::InstanceCreateInfo createInfo{
+    .pApplicationInfo = &applicationInfo,
+    .enabledLayerCount = static_cast<uint32_t>(layers.size()),
+    .ppEnabledLayerNames = layers.data(),
+    .enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size()),
+    .ppEnabledExtensionNames = instanceExtensions.data()
+};
+
+vk::raii::Instance instance(context, createInfo);
+----
+
+[IMPORTANT]
+====
+**文字列パースの落とし穴**: `xrGetVulkanInstanceExtensionsKHR` は必要な拡張を単一のスペース区切り文字列として返します（例: `"VK_KHR_external_memory_capabilities VK_KHR_get_physical_device_properties2"`）。`vk::InstanceCreateInfo` に渡す前に、この文字列を手動でパースし、個々の `const char*` エントリに分割しなければなりません。
+====
+
+== ゼロコピー効率: 高度な Vulkan の利点
+
+このハンドシェイクの最終目標は **ゼロコピー効率** です。XR ランタイムが話せない GPU を選ぶと、OS は最終レンダーフレームをシステムメモリ経由でヘッドセットのディスプレイへコピーせざるを得なくなります。フレーム予算を破壊し、XR で乗り物酔いを引き起こす視覚的なカクつき——「ジャダー」——を導入します。
+
+ランタイムはグラフィックスハンドシェイク用の必須拡張を提供しますが、Vulkan ではさらに先へ進めます。
+
+*   **カスタムプロファイリング拡張の有効化**: ハンドシェイクは `VK_EXT_calibrated_timestamps` のようなエンジン固有ツールを自動では有効にしません。Vulkan ではこれらのカスタム要件を XR 駆動の初期化にマージでき、OpenXR 標準がネイティブに公開しない深い性能洞察が得られます。
+*   **デバッグのための API 呼び出し傍受**: Vulkan のレイヤーシステムを使うと、ランタイムが GPU に送る内部コマンドを傍受でき、OpenXR-Vulkan ブリッジ内で起きる同期問題やリソースリークをデバッグできます。
+
+TIP: 詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#XR_KHR_vulkan_enable2[XR_KHR_vulkan_enable2 Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/02_OpenXR_Vulkan_Handshake/01_introduction.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/02_OpenXR_Vulkan_Handshake/03_hardware_alignment_luid.adoc[次へ]

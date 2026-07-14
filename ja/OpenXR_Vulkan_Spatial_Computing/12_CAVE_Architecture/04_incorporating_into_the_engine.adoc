@@ -1,0 +1,50 @@
+:pp: {plus}{plus}
+= エンジンへの組み込み
+
+`simple_game_engine` を **CAVE アーキテクチャ** と **マルチ GPU 同期** に対応させるには、`renderer_rendering.cpp` でハードウェアレベルのバリアへ移行する必要があります。*現時点では、実装は読者への演習として残されています。*
+
+== スワップバリアへの参加
+
+`renderer_rendering.cpp` では、同期クラスタレンダリング向けに `VK_NV_present_barrier` 拡張をサポートするよう、`createSwapChain` ロジックを更新する必要があります。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+bool Renderer::createSwapChain() {
+    // ...
+    vk::SwapchainPresentBarrierCreateInfoNV barrierInfo{
+        .presentBarrierEnable = vk::True,
+        .presentBarrierName = 1 // All nodes in the CAVE must use the same ID
+    };
+
+    if (hasPresentBarrierSupport) {
+        createInfo.pNext = &barrierInfo;
+    }
+
+    // Create the synchronized swapchain
+    swapChain = vk::raii::SwapchainKHR(device, createInfo);
+    // ...
+}
+----
+
+== 同期された Present 呼び出し
+
+`Render` 関数では、`presentKHR` 呼び出しが同期イベントになります。GPU は、スワップグループ内の他のすべてのノードがバッファをフリップする準備ができるまで、自動的にブロックします。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+void Renderer::Render(...) {
+    // ... record and submit ...
+
+    // This call now blocks at the hardware level if a Swap Barrier is active
+    // ensuring no tearing or "seams" between CAVE walls
+    presentQueue.presentKHR(presentInfo);
+}
+----
+
+== なぜこれらの変更が必要か？
+
+ハードウェア同期だけが、CAVE 部屋の角を継ぎ目なく見せる方法です。`VK_NV_present_barrier` がなければ、プロジェクタ間の「継ぎ目」は常にティアリングやスタッタの線として見えます。これを `createSwapChain` と `Render` ロジックに組み込むことで、エンジンをマルチプロジェクタ環境を駆動できるプロ級シミュレーション基盤へ変えます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/12_CAVE_Architecture/03_hardware_sync.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/13_Warp_and_Blend/01_introduction.adoc[Next]

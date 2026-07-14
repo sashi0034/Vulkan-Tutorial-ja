@@ -1,0 +1,68 @@
+= SIGGRAPH 2025: ダイナミックレンダリングを使った Vulkan レイトレーシング実践
+
+== 概要
+
+ようこそ！本シリーズでは、Vulkan レンダラーにレイトレーシング機能を追加し、リアルタイムでピクセル精度のシャドウ（透明度あり／なし）と、ボーナスとして反射効果を実装します。Vulkan Tutorial を基にしたスキャフォールド付きのコードが提供されるので、手順に従ってシェーダーの主要な関数を埋めていきます。
+
+スライドは link:/attachments/Vulkan%20Ray%20Tracing%20With%20Dynamic%20Rendering.pdf[こちら] から入手できます。
+ソースコードは link:https://github.com/KhronosGroup/Vulkan-Tutorial/blob/main/attachments/38_ray_tracing.cpp[こちら] から入手できます。
+
+本コースの終わりまでに、次のことを学びます。
+
+- Vulkan の *ダイナミックレンダリング*（事前定義のレンダーパスなし）を使い、*RenderDoc* で検証する。
+- レイトレーシング用のボトムレベル／トップレベル *アクセラレーション構造*（BLAS と TLAS）を作成する。
+- レイクエリに基づく *シャドウレイ* を実装する（まずすべて不透明ジオメトリ、次にアルファテストによる *透明度*）。
+- *Nsight Graphics* でアクセラレーション構造をデバッグ／検査する。
+- （ボーナス）レイクエリに基づく *反射* を実装する。
+
+*前提条件*:
+本シリーズは中級の Vulkan プログラマを対象としています。基本的な Vulkan Tutorial（グラフィックスパイプライン、ディスクリプタセットなど）を完了していることを想定しています。未完了でも概念的には追えます。レイトレーシング対応 GPU（Vulkan Ray Query）、最新の Vulkan SDK（1.4.311）、ならびに RenderDoc と Nsight Graphics を備えた Windows マシンが用意されています。
+
+*モバイル向けベストプラクティス*:
+
+- 従来のレンダーパスではなく `VK_KHR_dynamic_rendering`（Vulkan 1.3 でコア）を使います。API が単純になるだけでなく、`VK_KHR_dynamic_rendering_local_read` 拡張によりサブパスに似たタイルローカルストレージ読み取りが可能になり、帯域を節約したいモバイルのタイルベース GPU にとって大きな利点です。
+- 独立したレイトレーシングパイプラインではなく、フラグメントシェーダー内でレイクエリ（`VK_KHR_ray_query`）を使います。モバイルではレイクエリの方が広くサポートされており、用途によってはフルのレイトレーシングパイプラインより効率的なことも多いです。レイクエリはフラグメントシェーディングにうまく組み込め、オンチップ圧縮の恩恵を受けつつコンテキストスイッチも避けられます。
+
+*提供コード*:
+提供コードは、すでにダイナミックレンダリング付きの基本グラフィックスパイプラインを実装した Vulkan レンダラーです。Vulkan Tutorial を基にしており、単一の C++ ソースファイルと Slang シェーダーファイルにまとまっています。
+
+- link:/attachments/38_ray_tracing.cpp[38_ray_tracing.cpp]
+- link:/attachments/38_ray_tracing.slang[38_ray_tracing.slang]
+- シェーダー課題で行き詰まった場合は、参照用の完成版を参照できます: link:/attachments/38_ray_tracing_complete.slang[38_ray_tracing_complete.slang]
+
+ソースコードは手順を案内する構成になっており、ヒントとボイラープレートが用意されています。また `VK_KHR_acceleration_structure` と `VK_KHR_ray_query` を含む、必要な拡張と機能もすべて設定済みです。
+各章で参照する `// TASKxx` でマークされたコード節があります。
+
+C++ ファイルの先頭に、次の変数があることに注意してください。
+
+[,c{pp}]
+----
+#define LAB_TASK_LEVEL 1
+----
+
+特定のタイミングで、この変数を更新して再ビルドし、重要な変更の効果を確認するよう指示されます。新しいコードを書く必要はありません。
+
+== 本シリーズの章構成
+
+- xref:./00_Overview.adoc[概要]
+- xref:./01_Dynamic_rendering.adoc[ダイナミックレンダリング]
+- xref:./02_Acceleration_structures.adoc[アクセラレーション構造]
+- xref:./03_Ray_query_shadows.adoc[レイクエリによるシャドウ]
+- xref:./04_TLAS_animation.adoc[TLAS アニメーション]
+- xref:./05_Shadow_transparency.adoc[シャドウの透明度]
+- xref:./06_Reflections.adoc[反射]
+- xref:./07_Conclusion.adoc[まとめ]
+
+== ビルドと実行
+
+提供サンプルは Visual Studio（スタートアッププロジェクトに 38_ray_tracing を設定）またはコマンドラインからビルド・実行できます。
+
+[,shell]
+----
+cmake --build build --target 38_ray_tracing --parallel; start .\build\38_ray_tracing\Debug\38_ray_tracing.exe -wo .\build\38_ray_tracing\
+----
+
+上記は基本チュートリアルから変わっていません。チュートリアルの他の部分と同様に、他のプラットフォームでもビルドを続けられます。
+
+== ナビゲーション
+- 次へ: xref:./01_Dynamic_rendering.adoc[ダイナミックレンダリング]

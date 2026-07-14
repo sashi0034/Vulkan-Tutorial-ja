@@ -1,0 +1,31 @@
+:pp: {plus}{plus}
+
+= カメラと変換: はじめに
+== はじめに
+
+「シンプルなエンジンの構築」シリーズの「カメラと変換」の章へようこそ。この章では、Vulkan で 3D カメラシステムを実装するために必要な、本質的な数学と技法を掘り下げます。
+
+3D 空間をどう操作するかを理解することは、インタラクティブな 3D アプリケーションを作るうえで基本です。3D 変換の数学的基盤を探り、任意の視点から 3D シーンをナビゲート・閲覧できる柔軟なカメラシステムを実装します。
+
+この章では次に焦点を当てます。
+
+* 3D 変換の数学的基盤の理解
+* 異なる種類の変換行列（モデル、ビュー、プロジェクション）の実装
+* 異なる移動モードを持つ柔軟なカメラシステムの作成
+* カメラを制御するユーザー入力の処理
+* カメラシステムと Vulkan レンダリングパイプラインの統合
+
+この章の終わりまでに、3D 変換の確かな理解と、Vulkan アプリケーションに統合できる再利用可能なカメラシステムを得られます。
+
+== 前提条件
+
+この章を始める前に、メインの Vulkan チュートリアルを終えている必要があります。また、次にも慣れておく必要があります。
+
+* Vulkan の基本概念:
+** xref:03_Drawing_a_triangle/03_Drawing/01_Command_buffers.adoc[コマンドバッファ]
+** xref:03_Drawing_a_triangle/02_Graphics_pipeline_basics/00_Introduction.adoc[グラフィックスパイプライン]
+* xref:04_Vertex_buffers/00_Vertex_input_description.adoc[頂点] および xref:04_Vertex_buffers/03_Index_buffer.adoc[インデックスバッファ]
+* xref:05_Uniform_buffers/00_Descriptor_set_layout_and_buffer.adoc[ユニフォームバッファ]
+* 基本的なプログラミング概念と C++
+
+xref:Building_a_Simple_Engine/Engine_Architecture/conclusion.adoc[前へ: エンジンアーキテクチャのまとめ] | xref:Building_a_Simple_Engine/Camera_Transformations/02_math_foundations.adoc[次へ: 数学的基盤]

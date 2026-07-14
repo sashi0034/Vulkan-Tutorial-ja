@@ -1,0 +1,148 @@
+:pp: {plus}{plus}
+
+= インデックスバッファ
+
+== はじめに
+
+実世界のアプリケーションで描画する 3D メッシュは、複数の三角形のあいだで頂点を共有することがよくあります。
+これは、長方形を描くような単純なものでもすでに起きています。
+
+image::/images/vertex_vs_index.svg[]
+
+長方形の描画には 2 つの三角形が必要で、つまり 6 頂点の頂点バッファが必要です。
+問題は、2 頂点のデータを複製する必要があり、50% の冗長性が生じることです。
+より複雑なメッシュではさらに悪化し、頂点は平均して 3 つの三角形で再利用されます。
+この問題の解決策が _インデックスバッファ_ の使用です。
+
+インデックスバッファは本質的に、頂点バッファへのポインタの配列です。
+頂点データの並び替えや、既存データを複数の頂点で再利用できます。
+上の図は、4 つの一意な頂点をそれぞれ含む頂点バッファがある場合の、長方形のインデックスバッファの様子を示しています。
+最初の 3 つのインデックスが右上の三角形を定義し、最後の 3 つのインデックスが左下の三角形の頂点を定義します。
+
+== インデックスバッファの作成
+
+この章では頂点データを変更し、図のような長方形を描くためにインデックスデータを追加します。
+4 つの角を表すよう頂点データを変更します。
+
+[,c++]
+----
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+----
+
+左上が赤、右上が緑、右下が青、左下が白です。
+インデックスバッファの内容を表す新しい配列 `indices` を追加します。
+右上の三角形と左下の三角形を描くため、図のインデックスと一致させるべきです。
+
+[,c++]
+----
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0
+};
+----
+
+`vertices` のエントリ数に応じて、インデックスバッファには `uint16_t` または `uint32_t` のいずれかを使えます。
+一意な頂点が 65535 未満なので、今は `uint16_t` のままで構いません。
+
+頂点データと同様に、インデックスも GPU がアクセスできるよう `vk::raii::Buffer` へアップロードする必要があります。
+インデックスバッファ用のリソースを保持する新しいクラスメンバを 2 つ定義します。
+
+[,c++]
+----
+vk::raii::Buffer       vertexBuffer       = nullptr;
+vk::raii::DeviceMemory vertexBufferMemory = nullptr;
+vk::raii::Buffer       indexBuffer        = nullptr;
+vk::raii::DeviceMemory indexBufferMemory  = nullptr;
+----
+
+これから追加する `createIndexBuffer` 関数は、`createVertexBuffer` とほぼ同じです。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createVertexBuffer();
+    createIndexBuffer();
+    ...
+}
+
+void createIndexBuffer()
+{
+		vk::DeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+		auto [stagingBuffer, stagingBufferMemory] =
+		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+		void *data = stagingBufferMemory.mapMemory(0, bufferSize);
+		memcpy(data, indices.data(), (size_t) bufferSize);
+		stagingBufferMemory.unmapMemory();
+
+		std::tie(indexBuffer, indexBufferMemory) =
+		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+		copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+}
+----
+
+注目すべき違いは 2 つだけです。
+`bufferSize` は、インデックス数にインデックスタイプ（`uint16_t` または `uint32_t`）のサイズを掛けたものになります。
+`indexBuffer` の usage は `vk::BufferUsageFlagBits::eVertexBuffer` ではなく `vk::BufferUsageFlagBits::eIndexBuffer` にするべきで、それは当然です。
+それ以外の手順はまったく同じです。
+`indices` の内容をコピーするステージングバッファを作成し、最終的なデバイスローカルなインデックスバッファへコピーします。
+
+== インデックスバッファの使用
+
+描画にインデックスバッファを使うには、`recordCommandBuffer` に 2 つの変更が必要です。
+まず、頂点バッファのときと同様にインデックスバッファをバインドする必要があります。
+違いは、インデックスバッファは 1 つしか持てないことです。
+残念ながら頂点属性ごとに異なるインデックスを使うことはできないので、属性が 1 つだけ異なる場合でも、頂点データ全体を複製する必要があります。
+
+[,c++]
+----
+commandBuffers[frameIndex].bindVertexBuffers(0, *vertexBuffer, {0});
+commandBuffers[frameIndex].bindIndexBuffer(*indexBuffer, 0, vk::IndexType::eUint16);
+----
+
+インデックスバッファは `vk::raii::CommandBuffer::bindIndexBuffer` でバインドし、パラメータはインデックスバッファ、その中のバイトオフセット、インデックスデータの型です。
+前述のとおり、可能な型は `vk::IndexType::eUint16` と `vk::IndexType::eUint32` です。
+
+インデックスバッファをバインドしただけではまだ何も変わらないので、Vulkan にインデックスバッファを使うよう伝えるために描画コマンドも変更する必要があります。
+`vk::raii::CommandBuffer::draw` の行を削除し、`vk::raii::CommandBuffer::drawIndexed` に置き換えます。
+
+[,c++]
+----
+commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+----
+
+この関数の呼び出しは `vk::raii::CommandBuffer::draw` と非常によく似ています。
+最初の 2 つのパラメータはインデックス数とインスタンス数を指定します。
+インスタンシングは使わないので、インスタンスは `1` と指定します。
+インデックス数は、頂点シェーダに渡される頂点数を表します。
+次のパラメータはインデックスバッファへのオフセットを指定し、値 `1` ならグラフィックスカードは 2 番目のインデックスから読み始めます。
+最後から 2 つ目のパラメータは、頂点バッファへインデックスする前に頂点インデックスへ加算するオフセットを指定します。
+最後のパラメータはインスタンシング用のオフセットで、こちらは使いません。
+
+プログラムを実行すると、次のように見えるはずです。
+
+image::/images/indexed_rectangle.png[]
+
+インデックスバッファで頂点を再利用してメモリを節約する方法が分かりました。
+これは、複雑な 3D モデルを読み込む今後の章で特に重要になります。
+
+前章でも、バッファのような複数のリソースを単一のメモリ割り当てから割り当てるべきだと述べましたが、実際にはさらに一歩進めるべきです。
+https://developer.nvidia.com/vulkan-memory-management[ドライバ開発者は]、頂点バッファとインデックスバッファのような複数のバッファも単一の `vk::raii::Buffer` に格納し、`vk::raii::CommandBuffer::bindVertexBuffers` のようなコマンドでオフセットを使うことを推奨しています。
+利点は、データがより近くにまとまるためキャッシュフレンドリーになることです。
+同じ描画操作中に使われないなら、データを更新する前提で、同じメモリチャンクを複数のリソースで再利用することさえ可能です。
+これは _エイリアシング_ と呼ばれ、一部の Vulkan 関数にはそれをしたいことを指定する明示的なフラグがあります。
+
+xref:05_Uniform_buffers/00_Descriptor_set_layout_and_buffer.adoc[次の章]では、頻繁に変わるパラメータを GPU へ渡す方法を学びます。
+
+link:/attachments/21_index_buffer.cpp[C{pp} code] /
+link:/attachments/19_shader_vertexbuffer.slang[slang shader] /
+link:/attachments/19_shader_vertexbuffer.vert[GLSL Vertex shader] /
+link:/attachments/19_shader_vertexbuffer.frag[GLSL Fragment shader]

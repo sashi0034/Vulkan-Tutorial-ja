@@ -1,0 +1,549 @@
+:pp: {plus}{plus}
+
+= 要素ごと演算
+
+== 導入
+
+要素ごと演算は最も単純な ML 操作であり、Vulkan コンピュートシェーダでニューラルネットワークレイヤを実装する優れた出発点です。これらの操作はテンソル内のすべての要素に同じ関数を独立して適用します——要素間の依存なし、完璧な並列性、素直な実装です。
+
+「要素ごと」の意味を考えてください。テンソル（数値の多次元配列）があり、各要素に同じ関数を独立して適用します。100 万要素のテンソルなら、100 万回の独立した関数評価を行います。要素間の通信も共有状態も複雑な依存もありません。要素ごと演算は embarrassingly parallel——GPU に最適です。
+
+活性化関数はニューラルネットワークで最も一般的な要素ごと演算です。ML 推論パイプライン章で学んだように、活性化関数は非線形性を導入し、ニューラルネットワークが複雑なパターンを学習できるようにします。推論時、活性化関数はほとんどのレイヤの後に適用されます。畳み込み → 活性化、全結合 → 活性化、正規化 → 活性化。至る所にあり、高速である必要があります。
+
+本章では、最も一般的な活性化関数を Vulkan コンピュートシェーダとして実装します。ReLU（現代ネットワークの workhorse）、sigmoid（特定文脈で依然使用）、tanh（再帰ネットワークで一般的）。並列化戦略、数値安定性の考慮、すべての要素ごと演算に適用される性能最適化技法を議論します。
+
+== 要素ごと演算が重要な理由
+
+実装に入る前に、これらの操作がなぜ重要か、単純さにもかかわらず何が課題かを理解しましょう。
+
+=== 計算集約度
+
+要素ごと演算は計算コストが低い——各要素はわずか数回の算術演算です。ReLU は文字通り `max(0, x)` で、比較と選択 1 回です。sigmoid は指数が必要でより高コストですが、それでも少数の演算にすぎません。
+
+課題は計算自体ではなくメモリ帯域幅です。100 万 float32 要素のテンソルでは、4MB の入力を読み、4MB の出力を書きます。500 GB/s メモリ帯域幅の GPU では、8MB / 500 GB/s ≈ 16 マイクロ秒がメモリ転送だけにかかります。実際の計算は数マイクロ秒かもしれません。
+
+つまり要素ごと演算は *メモリバウンド* であり、コンピュートバウンドではありません。最適化の焦点は算術効率よりメモリアクセスパターンに置くべきです。coalesced メモリアクセス、キャッシュ利用、冗長転送の最小化が、計算から数命令削ることより重要です。
+
+=== 融合の機会
+
+要素ごと演算は非常に安価なので、別々のコンピュートディスパッチとして実行するのは無駄です。各ディスパッチにはオーバーヘッドがあります。パイプラインのバインド、ディスクリプタセットの更新、コマンド発行、同期。数マイクロ秒で終わる単純な ReLU では、オーバーヘッドが実際の作業より大きくなることがあります。
+
+解決策は *操作融合* です。複数操作を 1 つのコンピュートシェーダにまとめます。次の代わりに:
+
+[source]
+----
+Convolution → Write to memory → Read from memory → ReLU → Write to memory
+----
+
+次を行います:
+
+[source]
+----
+Convolution + ReLU → Write to memory
+----
+
+中間結果はメモリに触れず——レジスタに留まります。メモリ帯域幅を排除し、レイテンシを減らし、スループットを改善します。本章の後半で融合戦略を議論します。
+
+=== 数値安定性
+
+一部の活性化関数は指数や除算を含み、数値問題を起こし得ます。sigmoid は `1 / (1 + exp(-x))` を計算します。大きな負の x では `exp(-x)` が infinity にオーバーフローします。大きな正の x では `exp(-x)` がゼロにアンダーフローし、`1 / 1 = 1` は正しいですが、中間のオーバーフローが問題です。
+
+数値安定性は学術的だけではありません——実際のバグを引き起こします。小さな入力でテスト中は問題なくても、本番でエッジケースに遭遇すると失敗することがあります。各活性化関数の安定実装を扱います。
+
+== ReLU: 最も単純な活性化
+
+ReLU（Rectified Linear Unit）は現代のニューラルネットワークで最も一般的な活性化関数です。定義は次のとおりです。
+
+[source]
+----
+ReLU(x) = max(0, x)
+----
+
+入力が正ならそのまま出力。負ならゼロを出力。それだけです。指数も除算もなく、比較と選択だけです。
+
+=== ReLU が支配的な理由
+
+ReLU は sigmoid や tanh を悩ませた勾配消失問題を解決したため、深いネットワークのデフォルト活性化になりました。訓練時、勾配はネットワークを逆方向に流れます。sigmoid では勾配が小さな数（sigmoid 導関数は最大 0.25）で乗算され、多くのレイヤを経るとほぼゼロに消失します。早期レイヤは学習を止めます。
+
+ReLU の勾配は単純です。正の入力で 1、負で 0。小さな数での乗算も消失もありません。数百レイヤのはるかに深いネットワークの訓練が可能になりました。
+
+推論（本章の焦点）では、ReLU の利点は速度です。計算が最も安価な活性化関数で、リアルタイムアプリに理想的です。
+
+=== Slang 実装
+
+ReLU の完全な Slang コンピュートシェーダは次のとおりです。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+} pc;
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+
+    if (global_id >= pc.num_elements) {
+        return;
+    }
+
+    float value = input_data[global_id];
+    output_data[global_id] = max(0.0, value);
+}
+----
+
+分解して見ましょう。
+
+*ワークグループサイズ*: `local_size_x = 256` は各ワークグループに 256 スレッド。ほとんどの GPU に良いデフォルト——レイテンシを隠すのに十分大きく、リソースを使い果たさない。特定ハードウェア向けにチューニングする場合もあります。
+
+*メモリレイアウト*: 入出力は単純な float 配列。`readonly` と `writeonly` 修飾子でコンパイラがメモリアクセスを最適化しやすくします。GPU は read-after-write ハザードを心配する必要がありません。
+
+*プッシュ定数*: 要素数をプッシュ定数で渡します。少量データには uniform バッファより高速です。プッシュ定数はコマンドバッファに直接埋め込まれます。
+
+*境界チェック*: `if (global_id >= pc.num_elements)` は要素数がワークグループサイズの倍数でない場合を扱います。これがないと、配列境界を超えたスレッドが無効メモリにアクセスします。
+
+*計算*: `max(0.0, value)` が ReLU 操作全体です。ほとんどのハードウェアで 1 命令にコンパイルされます。
+
+=== シェーダのディスパッチ
+
+Vulkan アプリケーションからこのシェーダをディスパッチする方法は次のとおりです。
+
+[source,cpp]
+----
+// Assuming you've already created the pipeline and descriptor sets
+
+// Update descriptor set with input/output buffers
+vk::DescriptorBufferInfo inputInfo{*inputBuffer, 0, VK_WHOLE_SIZE};
+vk::DescriptorBufferInfo outputInfo{*outputBuffer, 0, VK_WHOLE_SIZE};
+
+vk::WriteDescriptorSet writes[2] = {
+    {
+        .dstSet = *descriptorSet,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .pBufferInfo = &inputInfo
+    },
+    {
+        .dstSet = *descriptorSet,
+        .dstBinding = 1,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .pBufferInfo = &outputInfo
+    }
+};
+
+device.updateDescriptorSets(writes, nullptr);
+
+// Record commands
+commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *reluPipeline);
+commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 *pipelineLayout, 0, *descriptorSet, nullptr);
+
+// Push constants
+uint32_t numElements = 1000000;  // 1 million elements
+commandBuffer.pushConstants(*pipelineLayout,
+                           vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t), &numElements);
+
+// Dispatch: ceil(numElements / 256) work groups
+uint32_t numWorkGroups = (numElements + 255) / 256;
+commandBuffer.dispatch(numWorkGroups, 1, 1);
+----
+
+重要な計算はワークグループ数 `(numElements + 255) / 256` です。天井除算——すべての要素をカバーするのに十分なスレッドを確保するため切り上げます。
+
+=== 性能上の考慮
+
+ReLU は非常に高速なので、ボトルネックはほぼ常にメモリ帯域幅であり計算ではありません。性能を最大化する戦略:
+
+*Coalesced メモリアクセス*: シェーダはメモリを順次アクセス——スレッド 0 が要素 0、スレッド 1 が要素 1。GPU は複数読み取りを 1 トランザクションに coalesce できます。ランダムアクセスだと性能が大きく低下します。
+
+*ベクトル化*: スレッドあたり 1 float ではなく、ベクトル型（vec2、vec4）で複数 float を処理できます。一部 GPU でスループット改善:
+
+[source,slang]
+----
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    vec4 input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    vec4 output_data[];
+};
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+
+    if (global_id >= pc.num_elements) {
+        return;
+    }
+
+    vec4 value = input_data[global_id];
+    output_data[global_id] = max(vec4(0.0), value);
+}
+----
+
+各スレッドが 4 float を処理します。`numElements / 4` ワークグループをディスパッチします。一部ハードウェアで 10–30% 改善することがあります。
+
+*インプレース操作*: 入力を保持する必要がなければ、出力を入力バッファに書き戻し、1 バッファ割り当てを省きメモリ帯域幅を半分にできます。
+
+[source,slang]
+----
+layout(set = 0, binding = 0) buffer InOutBuffer {
+    float data[];
+};
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+
+    if (global_id >= pc.num_elements) {
+        return;
+    }
+
+    data[global_id] = max(0.0, data[global_id]);
+}
+----
+
+各スレッドは自分の要素だけにアクセス——レース条件はありません。
+
+== Sigmoid: 古典的な活性化
+
+Sigmoid の定義は次のとおりです。
+
+[source]
+----
+sigmoid(x) = 1 / (1 + exp(-x))
+----
+
+任意の入力を (0, 1) に写像し、二値分類（出力が確率）や再帰ネットワーク（LSTM、GRU）のゲートに有用です。
+
+Sigmoid は初期ニューラルネットワークの支配的活性化でしたが、隠れ層では ReLU に largely 置き換えられました。ただし特定文脈では依然使用されます。二値分類の出力層、attention メカニズム、ゲーティング関数。
+
+=== 数値安定性の問題
+
+素朴な実装には深刻な問題があります。大きな負の x（例: x = -100）では `exp(-x) = exp(100)` が infinity にオーバーフローします。`1 / (1 + infinity) = 0` は数学的に正しいですが、中間オーバーフローが NaN などを引き起こすことがあります。
+
+大きな正の x（例: x = 100）では `exp(-x) = exp(-100)` がゼロにアンダーフローします。`1 / (1 + 0) = 1` は正しいですが、アンダーフローした指数の計算は無駄です。
+
+解決策は正負で異なる定式化を使うことです。
+
+x >= 0 の場合:
+
+[source]
+----
+sigmoid(x) = 1 / (1 + exp(-x))
+----
+
+x < 0 の場合:
+
+[source]
+----
+sigmoid(x) = exp(x) / (1 + exp(x))
+----
+
+2 番目の定式は数学的に等価（分子分母に exp(x) を乗算）ですが、オーバーフローを避けます。負の x では exp(x) は常に 1 未満です。
+
+=== Slang 実装
+
+数値的に安定した sigmoid 実装は次のとおりです。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+} pc;
+
+float sigmoid(float x) {
+    if (x >= 0.0) {
+        // For positive x, use standard formulation
+        return 1.0 / (1.0 + exp(-x));
+    } else {
+        // For negative x, use exp(x) / (1 + exp(x)) to avoid overflow
+        float exp_x = exp(x);
+        return exp_x / (1.0 + exp_x);
+    }
+}
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+
+    if (global_id >= pc.num_elements) {
+        return;
+    }
+
+    float value = input_data[global_id];
+    output_data[global_id] = sigmoid(value);
+}
+----
+
+`sigmoid` 関数が両ケースを扱います。分岐は高コストに見えますが、warp/wavefront 内のスレッドが同じ経路を取る場合（入力の大きさが似ていることが多い）、最新 GPU は分岐をうまく処理します。
+
+=== 性能上の考慮
+
+Sigmoid は指数のため ReLU より高コストです。ほとんどの GPU で `exp()` は 10–20 サイクル、`max()` は 1–2 サイクル。同じ要素数で sigmoid は ReLU の 5–10 倍遅いことがあります。
+
+ただし大テンソルでは sigmoid も依然メモリバウンドです。指数はレイテンシを増やしますが、メモリ帯域幅がボトルネックのままです。
+
+*近似*: 最大性能が必要でわずかな誤差を許容できるなら、sigmoid の多項式近似が使えます。精度と速度のトレードオフ:
+
+[source,slang]
+----
+// Fast sigmoid approximation (less accurate)
+float fast_sigmoid(float x) {
+    return 0.5 + 0.5 * (x / (1.0 + abs(x)));
+}
+----
+
+この近似ははるかに高速（指数なし）ですが、特に大きな |x| で精度が低いです。プロファイリングで sigmoid がボトルネックで精度要件を満たす場合のみ使ってください。
+
+== Tanh: 対称活性化
+
+Tanh（双曲線正接）の定義は次のとおりです。
+
+[source]
+----
+tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+----
+
+入力を (-1, 1) に写像し、ゼロ中心（sigmoid の 0–1 出力と異なる）になります。このゼロ中心性は特定アーキテクチャ、特に再帰ネットワークに有用です。
+
+Tanh は sigmoid と数学的に関連します。
+
+[source]
+----
+tanh(x) = 2 * sigmoid(2x) - 1
+----
+
+sigmoid で tanh を実装することもできますが、直接計算の方が効率的です。
+
+=== 数値安定性
+
+Tanh も sigmoid と同様の数値問題があります。大きな正の x では `exp(-x)` がアンダーフロー。大きな負の x では `exp(x)` がアンダーフロー。安定定式は次のとおりです。
+
+x >= 0 の場合:
+
+[source]
+----
+tanh(x) = (1 - exp(-2x)) / (1 + exp(-2x))
+----
+
+x < 0 の場合:
+
+[source]
+----
+tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+----
+
+=== Slang 実装
+
+数値的に安定した tanh 実装は次のとおりです。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+} pc;
+
+float tanh_stable(float x) {
+    if (x >= 0.0) {
+        float exp_neg_2x = exp(-2.0 * x);
+        return (1.0 - exp_neg_2x) / (1.0 + exp_neg_2x);
+    } else {
+        float exp_2x = exp(2.0 * x);
+        return (exp_2x - 1.0) / (exp_2x + 1.0);
+    }
+}
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+
+    if (global_id >= pc.num_elements) {
+        return;
+    }
+
+    float value = input_data[global_id];
+    output_data[global_id] = tanh_stable(value);
+}
+----
+
+多くの Slang 実装には数値的に安定した組み込み `tanh()` があります。直接使えます。
+
+[source,slang]
+----
+output_data[global_id] = tanh(input_data[global_id]);
+----
+
+GPU ベンダーのドキュメントで、組み込みがハードウェア向けに最適化されているか確認してください。
+
+== 操作融合
+
+前述のとおり、活性化関数を別ディスパッチとして実行するのは非効率です。融合は複数操作を 1 シェーダにまとめ、中間メモリ転送を排除します。
+
+=== 畳み込みと ReLU の融合
+
+一般的なパターンは畳み込みの後に ReLU です。次の代わりに:
+
+1. 畳み込みシェーダをディスパッチ → 結果をバッファに書き込み
+2. パイプラインバリアを挿入
+3. ReLU シェーダをディスパッチ → バッファから読み、別バッファに書き込み
+
+次を行います:
+
+1. 融合畳み込み+ReLU シェーダをディスパッチ → 最終結果を直接書き込み
+
+融合シェーダの簡略例:
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) readonly buffer WeightBuffer {
+    float weights[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+// ... push constants for dimensions ...
+
+void main() {
+    // Compute convolution (simplified)
+    float sum = 0.0;
+    // ... convolution computation ...
+
+    // Apply ReLU immediately, before writing to memory
+    float activated = max(0.0, sum);
+
+    // Write final result
+    output_data[output_index] = activated;
+}
+----
+
+要点は `sum` がレジスタを離れないこと——計算、活性化、書き込みが 1 パスで行われます。1 バッファ割り当てと 2 回のメモリ転送（中間結果の書き込みと読み戻し）を排除します。
+
+=== 融合の利点
+
+*メモリ帯域幅の削減*: 読み書きが減り、しばしばボトルネックであるメモリ帯域幅への圧力が減ります。
+
+*低レイテンシ*: ディスパッチが減り、コマンド投入、パイプライン binding、同期のオーバーヘッドが減ります。
+
+*キャッシュ利用の改善*: データが操作間でキャッシュに留まり、追い出されて再ロードされません。
+
+欠点はシェーダ複雑化とモジュール性の低下です。各組み合わせ（conv+ReLU、conv+sigmoid など）に別の融合シェーダが必要です。本番システムでは性能上の利点が複雑さコストを上回ることが多いです。
+
+== バッチ処理とメモリアクセスパターン
+
+複数テンソル（バッチ処理）を処理するとき、メモリレイアウトが性能に大きく影響します。
+
+=== 連続アクセス対ストライドアクセス
+
+テンソルのバッチがメモリ上で連続配置されている場合:
+
+[source]
+----
+[tensor0_element0, tensor0_element1, ..., tensor1_element0, tensor1_element1, ...]
+----
+
+順次スレッドが順次メモリ位置にアクセスし、coalesced アクセスが可能です。理想的なケースです。
+
+テンソルがインターリーブされている場合:
+
+[source]
+----
+[tensor0_element0, tensor1_element0, tensor2_element0, tensor0_element1, tensor1_element1, ...]
+----
+
+スレッドはストライドでメモリにアクセスし、coalesce 効率が低下します。性能が 2–3 倍低下することがあります。
+
+可能な限り連続アクセス向けにデータを配置してください。ストライドアクセスが必要なら、共有メモリでアクセスパターンを改善することを検討してください。
+
+=== 多次元テンソル
+
+多次元テンソル（例: 形状 [batch, channels, height, width] の 4D）では、3D スレッド ID を線形バッファインデックスに写像する必要があります。
+
+[source,slang]
+----
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;
+
+    // Map 3D coordinates to linear index
+    // Assuming NCHW layout: [batch, channels, height, width]
+    uint index = z * (channels * height * width) +
+                 channel * (height * width) +
+                 y * width +
+                 x;
+
+    if (x >= width || y >= height || z >= batch) {
+        return;
+    }
+
+    output_data[index] = max(0.0, input_data[index]);
+}
+----
+
+3D ワークグループでディスパッチします。`vkCmdDispatch(cmd, width/16, height/16, batch)`。
+
+2D・3D テンソルにうまく機能します。より高次元では、次元を flatten するか複数ディスパッチを使うことがあります。
+
+== まとめ
+
+要素ごと演算は最も単純な ML 操作ですが、最適性能には慎重な実装が必要です。要点:
+
+*ReLU* は最速で最も一般的な活性化関数です。実装は自明（`max(0, x)`）で、リアルタイム推論に理想的です。
+
+*Sigmoid* と *tanh* はオーバーフロー/アンダーフローを避ける数値的に安定した実装が必要です。正負で異なる定式化を使います。
+
+*メモリ帯域幅* が要素ごと演算のボトルネックであり、計算ではありません。coalesced メモリアクセスと転送最小化に焦点を当てます。
+
+*操作融合* は複数操作を 1 シェーダにまとめ、中間メモリ転送を排除します。本番システムの性能に不可欠です。
+
+*バッチ処理* と適切なメモリレイアウトが GPU 利用効率を確保します。連続メモリアクセスは coalesce を可能にし、ストライドアクセスは性能を損ないます。
+
+これらの要素ごと演算を実装すれば、ニューラルネットワーク推論エンジンの活性化関数の building block が揃います。次章では行列演算——ニューラルネットワークの計算の workhorse——を扱います。
+
+xref:ML_Inference/Vulkan_Compute_for_ML/02_compute_pipeline_review.adoc[前へ: Vulkan コンピュートパイプラインの復習] | xref:ML_Inference/Vulkan_Compute_for_ML/04_matrix_operations.adoc[次へ: 行列演算]

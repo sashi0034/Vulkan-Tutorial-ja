@@ -1,0 +1,181 @@
+:pp: {plus}{plus}
+
+= 論理デバイスとキュー
+
+== はじめに
+
+使う物理デバイスを選んだ後、それとやり取りするための *論理デバイス* を設定する必要があります。論理デバイスの作成プロセスはインスタンスの作成と似ており、使いたい機能を記述します。利用可能なキューファミリーを問い合わせたので、どのキューを作成するかも指定する必要があります。要件が異なる場合、同じ物理デバイスから複数の論理デバイスを作成することもできます。
+
+まず、論理デバイスのハンドルを格納する新しいクラスメンバを追加します。
+
+[,c++]
+----
+vk::raii::Device device = nullptr;
+----
+
+次に、`initVulkan` から呼ばれる `createLogicalDevice` 関数を追加します。
+
+[,c++]
+----
+void initVulkan() {
+    createInstance();
+    setupDebugMessenger();
+    pickPhysicalDevice();
+    createLogicalDevice();
+}
+
+void createLogicalDevice() {
+
+}
+----
+
+== 作成するキューの指定
+
+論理デバイスの作成では、再び構造体に多くの詳細を指定します。その最初が `vk::DeviceQueueCreateInfo` です。この構造体は、単一のキューファミリーについて欲しいキューの数を記述します。今はグラフィックス能力を持つキューだけに関心があります。
+
+[,c++]
+----
+std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
+auto graphicsQueueFamilyProperty = std::ranges::find_if(queueFamilyProperties, [](auto const &qfp) { return (qfp.queueFlags & vk::QueueFlagBits::eGraphics) != static_cast<vk::QueueFlags>(0); });
+auto graphicsIndex = static_cast<uint32_t>(std::distance(queueFamilyProperties.begin(), graphicsQueueFamilyProperty));
+vk::DeviceQueueCreateInfo deviceQueueCreateInfo { .queueFamilyIndex = graphicsIndex };
+----
+
+現在利用可能なドライバでは、各キューファミリーについて作成できるキューの数は少なく、1 つより多くは実際には必要ありません。複数スレッドでコマンドバッファをすべて作成し、メインスレッドからオーバーヘッドの少ない単一の呼び出しですべて投入できるからです。
+
+Vulkan では `0.0` から `1.0` の浮動小数点数でキューに優先度を割り当て、コマンドバッファ実行のスケジューリングに影響を与えられます。キューが 1 つだけの場合でもこれは必須です。
+
+[,c++]
+----
+float queuePriority = 0.5f;
+vk::DeviceQueueCreateInfo deviceQueueCreateInfo { .queueFamilyIndex = graphicsIndex, .queueCount = 1, .pQueuePriorities = &queuePriority };
+----
+
+== 使用するデバイス機能の指定
+
+次に指定する情報は、使うデバイス機能の集合です。前の章で `vk::raii::PhysicalDevice::getFeatures` によりサポートを問い合わせた機能、たとえばジオメトリシェーダなどです。今は特別なものは不要なので、単純に定義してすべてを `vk::False` のままにできます。Vulkan でより面白いことをし始める頃に、この構造体に戻ってきます。
+
+[,c++]
+----
+vk::PhysicalDeviceFeatures deviceFeatures;
+----
+
+== 追加のデバイス機能の有効化
+
+Vulkan は後方互換になるよう設計されているため、デフォルトでは Vulkan 1.0 で利用可能だった基本機能にしかアクセスできません。新しい機能を使うには、デバイス作成時に明示的に要求する必要があります。
+
+Vulkan では、機能は導入時期や関連する機能性にもとづいて異なる構造体に整理されています。例:
+- 基本機能は `vk::PhysicalDeviceFeatures` にあります
+- Vulkan 1.3 の機能は `vk::PhysicalDeviceVulkan13Features` にあります
+- 拡張固有の機能はそれぞれ独自の構造体にあります（例: `vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT`）
+
+複数セットの機能を有効にするには、Vulkan は「構造体チェイン」という概念を使います。各機能構造体には別の構造体を指せる `pNext` フィールドがあり、機能要求のチェインを作ります。
+
+C++ Vulkan API は、この処理を簡単にする `vk::StructureChain` というヘルパーテンプレートを提供します。使い方を見てみましょう。
+
+[,c++]
+----
+// Create a chain of feature structures
+vk::StructureChain<vk::PhysicalDeviceFeatures2,
+                   vk::PhysicalDeviceVulkan11Features,
+                   vk::PhysicalDeviceVulkan13Features,
+                   vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
+    featureChain = {
+        {},                                    // vk::PhysicalDeviceFeatures2 (empty for now)
+        {.shaderDrawParameters = true},        // Enable shader draw parameters from Vulkan 1.1
+        {.dynamicRendering = true},            // Enable dynamic rendering from Vulkan 1.3
+        {.extendedDynamicState = true}         // Enable extended dynamic state from the extension
+    };
+----
+
+このコードで起きていることは次のとおりです。
+
+1. 3 つの異なる機能構造体で `vk::StructureChain` を作成します。
+2. チェイン内の各構造体に初期化子を与えます。
+   - 最初の構造体（`vk::PhysicalDeviceFeatures2`）は `{}` で空のままにします
+   - 2 番目の構造体では、Vulkan 1.1 の `shaderDrawParameters` 機能を有効にします
+   - 3 番目の構造体では、Vulkan 1.3 の `dynamicRendering` 機能を有効にします
+   - 4 番目の構造体では、拡張の `extendedDynamicState` 機能を有効にします
+
+`vk::StructureChain` テンプレートは、構造体間の `pNext` ポインタを自動で設定してこれらを連結します。各構造体を次に手動でリンクする手間が省けます。
+
+後で論理デバイスを作成するとき、このチェインの最初の構造体へのポインタを渡し、有効にしたい機能をすべて Vulkan が見られるようにします。
+
+== デバイス拡張の指定
+
+アプリケーションが正しく動作するには、特定のデバイス拡張を有効にする必要があります。これらの拡張は、チュートリアルの後半で必要になる追加機能を提供します。
+
+[,c++]
+----
+std::vector<const char*> requiredDeviceExtension = {
+    vk::KHRSwapchainExtensionName};
+----
+
+`VK_KHR_swapchain` 拡張は、レンダリングしたイメージをウィンドウに提示するために必要です。ほかの拡張は、チュートリアルの後半で使う追加機能を提供します。
+
+== 論理デバイスの作成
+
+必要な情報がすべて揃ったので、論理デバイスを作成できます。`vk::DeviceCreateInfo` 構造体を埋め、機能チェインを接続します。
+
+[,c++]
+----
+vk::DeviceCreateInfo deviceCreateInfo{
+    .pNext = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
+    .queueCreateInfoCount = 1,
+    .pQueueCreateInfos = &deviceQueueCreateInfo,
+    .enabledExtensionCount = static_cast<uint32_t>(requiredDeviceExtension.size()),
+    .ppEnabledExtensionNames = requiredDeviceExtension.data()
+};
+----
+
+機能チェインをデバイス作成プロセスにどう接続しているかを振り返ります。
+
+1. `featureChain.get<vk::PhysicalDeviceFeatures2>()` メソッドは、チェインの最初の構造体（`vk::PhysicalDeviceFeatures2` 構造体）への参照を取得します。
+
+2. この参照を `deviceCreateInfo` 構造体の `pNext` フィールドに代入します。
+
+3. 機能チェイン内のすべての構造体はすでに接続されている（`vk::StructureChain` のおかげ）ので、Vulkan は `pNext` ポインタのチェインをたどって、有効にしたい機能をすべて見られます。
+
+このアプローチにより、複数セットの機能をきれいに整理された形で要求できます。Vulkan はチェイン内の各構造体を処理し、デバイス作成時に要求された機能を有効にします。
+
+残りの情報は `vk::InstanceCreateInfo` 構造体に似ており、拡張の指定が必要です。違いは、今回はデバイス固有であることです。
+
+デバイス固有拡張の例は `VK_KHR_swapchain` で、そのデバイスからレンダリングしたイメージをウィンドウに提示できます。システム内にこの能力を持たない Vulkan デバイスがあることもあり得ます。たとえばコンピュート操作のみをサポートする場合です。この拡張にはスワップチェーンの章で戻ってきます。
+
+以前の Vulkan 実装ではインスタンスとデバイス固有のバリデーションレイヤを区別していましたが、link:https://docs.vulkan.org/spec/latest/chapters/raytracing.html#extendingvulkan-layers-devicelayerdeprecation[現在はそうではありません]。
+つまり最新の実装では、`vk::DeviceCreateInfo` の `enabledLayerCount` と `ppEnabledLayerNames` フィールドは無視されます。
+
+`vk::DeviceCreateInfo` を埋めたら、論理デバイスの作成に進めます。
+
+[,c++]
+----
+device = vk::raii::Device(physicalDevice, deviceCreateInfo);
+----
+
+渡すパラメータは、やり取りする物理デバイスと、今指定した作成情報です。追加のオプションパラメータには、アロケーションコールバックポインタと、作成した論理デバイスハンドルの格納先を指定するポインタがあります。私たちの場合、関数呼び出しは `vk::Device` ハンドルを直接返します。
+インスタンス作成関数と同様、存在しない拡張の有効化や未サポート機能の使用指定にもとづいてエラーを投げることがあります。
+
+論理デバイスはインスタンスと直接やり取りしないため、パラメータには含まれません。
+
+== キューハンドルの取得
+
+キューは論理デバイスと一緒に自動的に作成されますが、まだやり取りするためのハンドルがありません。
+まず、グラフィックスキューへのハンドルを格納するクラスメンバを追加します。
+
+[,c++]
+----
+vk::raii::Queue graphicsQueue = nullptr;;
+----
+
+デバイスキューはデバイス破棄時に暗黙的にクリーンアップされるので、`cleanup` で何もする必要はありません。
+
+あるキューファミリーのキューハンドルを取得するには、`vk::raii::Queue` コンストラクタを使えます。パラメータは論理デバイス、キューファミリーインデックス、キューインデックスです。このファミリーからキューを 1 つだけ作成するので、キューインデックスは単純に `0` を使います。
+
+[,c++]
+----
+graphicsQueue = vk::raii::Queue(device, graphicsIndex, 0);
+----
+
+論理デバイスとキューハンドルがあれば、いよいよグラフィックスカードを使って何かを始められます。xref:/03_Drawing_a_triangle/01_Presentation/00_Window_surface.adoc[次の数章] では、結果をウィンドウシステムに提示するためのリソースを設定します。
+
+link:/attachments/04_logical_device.cpp[C{pp} code]

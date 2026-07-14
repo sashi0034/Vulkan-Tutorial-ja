@@ -1,0 +1,23 @@
+:pp: {plus}{plus}
+= 空間シェーダーのための Slang: シングルパスステレオとその先
+
+空間コンピューティングの旅で最も刺激的な部分の一つへようこそ！ここまでは「Vulkan から OpenXR」への配管——イメージの取得、フレームタイミング、ユーザー入力の追跡——に集中してきました。今、焦点を **シェーダー** へ移します。空間コンピューティングでは、単一の平面スクリーンへ描くのではなく、両眼向けに描き、フォビエイテッドや広 FOV ヘッドセットではさらに多くのビュー向けに描く可能性があります。
+
+ステレオレンダリングの従来の方法は、シーン全体を二度——左眼用と右眼用——描くことでした。概念的には単純ですが、極めて非効率です。CPU はドローコールを二倍投入し、GPU はほぼ同一の頂点データで同じジオメトリを二度処理しなければなりません。ここで **シングルパスステレオ**、より具体的には **N-View** の考え方が登場します。
+
+[source,slang]
+----
+// The "N-View" mindset in Slang
+void main(uint viewID : SV_ViewID) {
+    // Shaders that know which eye they are rendering for
+    float4 eyePosition = loadEyePosition(viewID);
+}
+----
+
+この章では、**Slang** が従来の GLSL や HLSL より、これらのマルチビューシェーダーの記述をどれほど自然で生産的にするかを探ります。まず **ネイティブマルチビュー**（`VK_KHR_multiview`）——単一のドローコールをイメージ配列の複数レイヤーへブロードキャストし、それぞれが異なるビューを表すコア Vulkan 機能——を見ます。
+
+**SIMD**（Single Instruction, Multiple Data）などの主要概念と、それが「N-View」アーキテクチャとどう関係するかを定義し、Slang の現代的構文がクリーンで読みやすく、空間ハードウェア向けに高度に最適化されたシェーダーをどう書けるかを見ます。単純なモバイル VR ヘッドセットでもハイエンドのデスクトップ AR システムでも、効率的なマルチビューシェーダー設計の原則は同じままです。
+
+続くセクションでは、**ネイティブマルチビュー** の実装に深く入り、このハードウェアレベルの最適化を最大限活用するよう **Slang** シェーダーをどう設計するかを見ます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/07_Action_Spaces_Input/04_incorporating_into_the_engine.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/08_Slang_Spatial_Shaders/02_native_multiview.adoc[次へ]

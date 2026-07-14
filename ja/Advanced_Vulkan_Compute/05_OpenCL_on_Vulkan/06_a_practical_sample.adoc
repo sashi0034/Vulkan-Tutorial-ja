@@ -1,0 +1,130 @@
+:pp: {plus}{plus}
+
+= 実践サンプル: OpenCL で駆動する Vulkan レンダリング
+
+前のセクションでは、OpenCL-on-Vulkan ツールチェーンの 2 つのツールを紹介しました。
+`clspv`（Ahead-of-Time コンパイル）と `clvk`（ランタイムレイヤリング）です。本セクションでは、
+リアルタイムで対話的なサンプルで両者を結びつけます。
+
+枠組みを正しく捉えることが重要です。これは **「たまたま Vulkan 上で動く OpenCL プログラム」**
+ではありません。その反対です。通常の **Vulkan アプリケーション**——ウィンドウ、スワップチェーン、
+プレゼントループ、フリーフライカメラ——が、**シーンを OpenCL カーネルで描画する**のです。
+デフォルトモードでは、カーネルは `clspv` でコンパイルされ、Vulkan エンジン自身のコンピュートシェーダとして
+動き、コピーなしで提示用バッファへ直接書き込みます。レイヤードエコシステムの本当の価値はここにあります。
+Vulkan エンジンが既存の膨大な OpenCL カーネル群を第一級シェーダとして取り込めることです。
+
+完全なソースは `attachments/compute` にあります。
+
+- `05_opencl_on_vulkan.cl` — OpenCL C カーネル（レイマーチする *インスタンス化フォレスト*）
+- `05_opencl_on_vulkan.cpp` — ウィンドウ付き Vulkan ホストアプリケーション
+- `CMakeLists.txt` — オプションの `clspv` と OpenCL 検出を配線
+
+シーンはインスタンス化の小さなレッスンです。*単一*の木の距離場が無限グリッド（`round(p.xz / cell)`）に
+繰り返され、セルごとのハッシュが各インスタンスに固有の高さ、樹冠サイズ、色、時折の空き地を与えます。
+`WASD`/`EQ` とマウスドラッグで見回しながらリアルタイムに飛び回ります。
+
+== 2 つのバックエンド
+
+アプリケーションは起動時に選んだいずれかのバックエンドでカーネルを駆動できます
+（`--backend=aot` または `--backend=clvk` で上書き）。
+
+[cols="1,3"]
+|===
+|バックエンド |OpenCL カーネルが画面に届く方法
+
+|**clspv AOT**（デフォルト、ゼロコピー）
+|OpenCL C カーネルはビルド時に `clspv` で `forest.spv` へコンパイルされ、Vulkan エンジンの
+*自身の*コンピュートシェーダとして実行されます。提示される Vulkan ストレージバッファへ直接書き込みます——
+OpenCL カーネルは文字どおり Vulkan パイプライン内の「もう一つのシェーダ」であり、コピーも実行時の第二 API もありません。
+
+|**clvk ランタイム**（`--backend=clvk`）
+|同じ `.cl` が実行時に `clvk`（Vulkan 上にレイヤされた OpenCL 3.0）でコンパイル・実行されます。
+`clvk` は `cl_khr_external_memory` を実装していないため、結果はフレームごとの `clEnqueueReadBuffer` で
+Vulkan バッファへ橋渡しされます。ランタイムレイヤリングツールを示しつつ、フレームあたり 1 コピーのコストがかかります。
+|===
+
+== Vulkan シェーダとしてのカーネル（ゼロコピー）
+
+デフォルトパスは「Vulkan が OpenCL を使う」ことの最もきれいなデモです。`clspv` が OpenCL C カーネルを
+通常の Vulkan SPIR-V に変えるため、Vulkan アプリは他のコンピュートシェーダと同様にロードし、
+これから提示するバッファを指します——カーネルは最終ピクセルを Vulkan 所有メモリへ直接書き込みます。
+
+[source,cpp]
+----
+// forest.spv はビルド時に clspv が 05_opencl_on_vulkan.cl から生成したもの。
+vk::PipelineShaderStageCreateInfo stage{
+    .stage  = vk::ShaderStageFlagBits::eCompute,
+    .module = *shaderModule,
+    .pName  = "render"};               // clspv はエントリポイントをカーネル名にする
+// binding 0 = Params, binding 1 = present() が画面へコピーするストレージバッファ
+cb.dispatch((W + 15) / 16, (H + 15) / 16, 1);
+----
+
+相互運用レイヤも、FD エクスポートも、第二デバイスもありません。OpenCL カーネルはエンジンの残りの部分と
+同じ Vulkan コマンドバッファフローの中で動きます。
+
+== clvk ランタイムパス
+
+なぜ `clvk` でもバッファをゼロコピー共有しないのか？ メインラインの `clvk` は `cl_khr_external_memory` を
+公開しないため、`VkBuffer` をその OpenCL コンテキストへインポートする方法がないからです。ランタイムパスは
+そのため、通常の OpenCL バッファへ計算し、毎フレーム Vulkan 可視メモリへリードバックします。
+
+[source,cpp]
+----
+clEnqueueNDRangeKernel(queue, kernel, 2, nullptr, global, local, 0, nullptr, nullptr);
+clEnqueueReadBuffer(queue, outMem, CL_TRUE, 0, bytes, hostMappedVkBuffer, 0, nullptr, nullptr);
+// ... vkCmdCopyBufferToImage(vkBuffer -> intermediate) ; blit -> swapchain ; present
+----
+
+これが今日のツーリングの状態です。`clspv` は真のゼロコピー統合を与え、`clvk` は未変更の OpenCL ホストコードの
+実行時コンパイルを、ブリッジコピーのコストで与えます。
+
+== 移植可能なカーネル
+
+カーネルは前のセクションの移植性規則に従い、ディスクリプタマッピングが決定的で、両方のバックエンドで
+変更なしに動くようにしています。
+
+[source,c]
+----
+typedef struct {
+    int   width, height;
+    float camX, camY, camZ;     // フリーフライカメラ位置
+    float camYaw, camPitch, fog;
+} Params;
+
+#define MAX_STEPS 128           // コンパイル時定数 — 下記の注を参照
+
+__attribute__((reqd_work_group_size(16, 16, 1)))
+__kernel void render(__global const Params* P, __global uint* outRGBA) {
+    const int x = get_global_id(0), y = get_global_id(1);
+    if (x >= P->width || y >= P->height) return;     // 切り上げたグローバルサイズをガード
+    for (int i = 0; i < MAX_STEPS; ++i) { /* インスタンス化フォレスト SDF をレイマーチ */ }
+    // ... シェーディング後:
+    outRGBA[y * P->width + x] = r | (g << 8) | (b << 16) | (0xFFu << 24);
+}
+----
+
+[NOTE]
+====
+レイマーチのステップ数は**コンパイル時定数**であり、カーネルパラメータではありません。
+`clspv` は境界がストレージバッファからロードされるレイマーチループを誤コンパイルします——
+構造化制御フローパスがループの終了を証明できず、結果のシェーダが GPU をハングさせます。
+ネイティブ OpenCL ドライバは同じ動的境界を問題なくコンパイルするため、これは知っておくべき
+移植性の落とし穴です。`clspv`/`clvk` 経由で動かすカーネルではループ境界を定数に保ってください。
+====
+
+*   **バッファ引数のみ** → `clspv` は 2 つの `__global` ポインタを予測可能なレイアウト
+    （`set=0,binding=0` = Params、`set=0,binding=1` = 出力）へマップし、AOT パスの手書き
+    `VkDescriptorSetLayout` と正確に一致します。
+*   **`uint` 出力**（パック済み RGBA8）によりすべてを 32 ビットストレージアクセスに保ち、
+    特別な 8 ビットストレージ Vulkan 機能は不要です。
+*   **固定ワークグループサイズ**とホスト側の切り上げにより、NDRange をユニフォームに保ちます。
+*   **呼び出し間状態なし** — 各呼び出しが 1 ピクセルをレイマーチするため、同じカーネルが
+    両方のバックエンドで変更なしに動きます（両者の差は、異なる 2 つの GPU 間の float 丸めだけです）。
+
+`WASD`（移動）、`E`/`Q`（上下）、マウスドラッグ（見回し）、`Shift`（ブースト）、`R`（リセット）、
+`ESC`（終了）でフォレストを飛行してください。デフォルトバックエンドでは、見るすべてのピクセルが
+Vulkan エンジン自身のコンピュートシェーダとして動く OpenCL カーネルによって生成されています——
+コピーなし、第二 API なしです。
+
+xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/05_clvk_and_layering.adoc[前へ: clvk とレイヤリング] | xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/07_clspv_for_production.adoc[次へ: clspv での開発]

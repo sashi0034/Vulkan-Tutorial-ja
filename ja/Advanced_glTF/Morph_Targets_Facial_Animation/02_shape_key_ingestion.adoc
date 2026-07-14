@@ -1,0 +1,227 @@
+:pp: {plus}{plus}
+= シェイプキー取り込み: glTF からのモーフターゲット解析
+
+== スパースアクセサの問題
+
+Blender から 60 個のモーフターゲットを持つキャラクターをエクスポートし、結果の glTF ファイルを開くと、変位配列が想定よりはるかに小さいことに気づくかもしれません。50,000 頂点の顔メッシュと「笑顔」モーフターゲットでも、変位バッファのエントリは 50,000 ではなく 800 個程度しかないことがあります。これは glTF が **スパースアクセサ** をサポートしているためです。スパースアクセサは、配列のうちデフォルト値（この場合はゼロベクトル。あるモーフターゲットで動かない頂点は変位ゼロ）と異なるエントリだけを格納する方法です。
+
+スパースアクセサを理解することは不可欠です。tinygltf は自動的に展開してくれず、生のスパースデータを受け取り、完全な密配列を自分で構築する責任があります。glTF のスパースアクセサ構造には 3 つの要素があります。count（概念的な配列の要素数）、indices サブアクセサ（非デフォルト値を持つ要素インデックスのリスト）、values サブアクセサ（対応する非デフォルト値。indices と同じ順序）。完全な配列を再構築するには、サイズ `count` のゼロ初期化バッファを確保し、indices が示す位置に values を散らし込みます。
+
+実際に見てみましょう。tinygltf でモデルを読み込んだ後、各メッシュプリミティブの `targets` 配列にはモーフターゲットごとに 1 エントリがあります。各エントリは属性名（例: `"POSITION"`、`"NORMAL"`）からアクセサインデックスへのマップです。この構造を注意深く走査する必要があります。
+
+[source,cpp]
+----
+struct MorphTargetData {
+    std::string              name;            // From mesh's target names, if present
+    std::vector<glm::vec3>   position_deltas; // Size = vertex count; zero where unchanged
+    std::vector<glm::vec3>   normal_deltas;   // May be empty if no normal targets
+    VkBuffer                 gpu_buffer     = VK_NULL_HANDLE;
+    VmaAllocation            gpu_allocation = VK_NULL_HANDLE;
+};
+
+// Expand a potentially-sparse accessor into a dense vector of vec3.
+// Returns a vector of 'vertex_count' elements.
+static std::vector<glm::vec3> expand_sparse_accessor(
+    const tinygltf::Model&    model,
+    int                       accessor_index,
+    uint32_t                  vertex_count)
+{
+    std::vector<glm::vec3> result(vertex_count, glm::vec3(0.0f));
+    if (accessor_index < 0) return result;
+
+    const tinygltf::Accessor& accessor = model.accessors[accessor_index];
+
+    if (!accessor.sparse.isSparse) {
+        // Dense accessor: read all values directly
+        const tinygltf::BufferView& view = model.bufferViews[accessor.bufferView];
+        const uint8_t* data = model.buffers[view.buffer].data.data()
+                            + view.byteOffset
+                            + accessor.byteOffset;
+        const int stride = accessor.ByteStride(view) > 0
+                         ? accessor.ByteStride(view)
+                         : sizeof(glm::vec3);
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(accessor.count); ++i) {
+            std::memcpy(&result[i], data + i * stride, sizeof(glm::vec3));
+        }
+    } else {
+        // Sparse accessor: first read the index list, then scatter values
+        const tinygltf::AccessorSparse& sparse = accessor.sparse;
+
+        // Read the indices (which vertices are non-zero)
+        std::vector<uint32_t> indices(sparse.count);
+        {
+            const tinygltf::BufferView& idx_view =
+                model.bufferViews[sparse.indices.bufferView];
+            const uint8_t* idx_data = model.buffers[idx_view.buffer].data.data()
+                                    + idx_view.byteOffset
+                                    + sparse.indices.byteOffset;
+
+            for (int i = 0; i < sparse.count; ++i) {
+                // glTF sparse indices can be UNSIGNED_BYTE, UNSIGNED_SHORT, or UNSIGNED_INT
+                switch (sparse.indices.componentType) {
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+                        indices[i] = idx_data[i];
+                        break;
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+                        indices[i] = reinterpret_cast<const uint16_t*>(idx_data)[i];
+                        break;
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+                        indices[i] = reinterpret_cast<const uint32_t*>(idx_data)[i];
+                        break;
+                }
+            }
+        }
+
+        // Read the displacement values and scatter into result
+        {
+            const tinygltf::BufferView& val_view =
+                model.bufferViews[sparse.values.bufferView];
+            const uint8_t* val_data = model.buffers[val_view.buffer].data.data()
+                                    + val_view.byteOffset
+                                    + sparse.values.byteOffset;
+
+            for (int i = 0; i < sparse.count; ++i) {
+                uint32_t vertex_idx = indices[i];
+                if (vertex_idx < vertex_count) {
+                    std::memcpy(&result[vertex_idx],
+                                val_data + i * sizeof(glm::vec3),
+                                sizeof(glm::vec3));
+                }
+            }
+        }
+    }
+
+    return result;
+}
+----
+
+インデックスのコンポーネント型に対する switch 文は重要です。すべての glTF エクスポーターが同じインデックス幅を使うと仮定しないでください。Blender は通常、頂点数が 65,536 未満のメッシュでは `UNSIGNED_SHORT` を使いますが、他のエクスポーターはデフォルトで `UNSIGNED_INT` を使うことがあります。
+
+== モーフターゲット名の読み取り
+
+glTF はモーフターゲット名をメッシュの `extras` フィールドに JSON 配列として格納することを許可しますが、必須ではありません。Blender は `"targetNames"` キーでこの形式でエクスポートします。これらの名前は重要です。アニメーションチャネル（インデックスでモーフターゲットを参照）をデバッグ用の人間が読める名前にマッピングし、リップシンクイベントを正しいモーフターゲットに接続するために使います。
+
+[source,cpp]
+----
+std::vector<std::string> read_morph_target_names(const tinygltf::Mesh& mesh)
+{
+    std::vector<std::string> names;
+    if (!mesh.extras.Has("targetNames")) return names;
+
+    const tinygltf::Value& target_names = mesh.extras.Get("targetNames");
+    for (int i = 0; i < static_cast<int>(target_names.ArrayLen()); ++i) {
+        names.push_back(target_names.Get(i).Get<std::string>());
+    }
+    return names;
+}
+----
+
+== メッシュの全モーフターゲットの読み込み
+
+スパースアクセサの展開と名前の読み取りが整ったら、メッシュプリミティブのすべてのモーフターゲットを読み込むトップレベル関数を書けます。
+
+[source,cpp]
+----
+std::vector<MorphTargetData> load_morph_targets(
+    const tinygltf::Model&     model,
+    const tinygltf::Primitive& primitive,
+    const tinygltf::Mesh&      mesh,
+    uint32_t                   vertex_count)
+{
+    std::vector<MorphTargetData> targets;
+    std::vector<std::string>     names = read_morph_target_names(mesh);
+
+    for (size_t t = 0; t < primitive.targets.size(); ++t) {
+        MorphTargetData data;
+        data.name = (t < names.size()) ? names[t] : ("target_" + std::to_string(t));
+
+        // Position displacements are required; normals are optional
+        auto pos_it = primitive.targets[t].find("POSITION");
+        if (pos_it != primitive.targets[t].end()) {
+            data.position_deltas = expand_sparse_accessor(
+                model, pos_it->second, vertex_count);
+        } else {
+            data.position_deltas.assign(vertex_count, glm::vec3(0.0f));
+        }
+
+        auto nrm_it = primitive.targets[t].find("NORMAL");
+        if (nrm_it != primitive.targets[t].end()) {
+            data.normal_deltas = expand_sparse_accessor(
+                model, nrm_it->second, vertex_count);
+        }
+
+        targets.push_back(std::move(data));
+    }
+
+    return targets;
+}
+----
+
+== GPU へのアップロード
+
+CPU 上にモーフターゲットデータが揃ったら、各ターゲットの変位配列を専用の GPU バッファにアップロードします。バインドレスアクセスを使う予定なので、すべてのターゲットを 1 つのバッファに詰める必要はありません。各ターゲットが独自の `VkBuffer` を持ち、後でシェーダーが使うバッファアドレス（またはディスクリプタインデックス）を保存します。
+
+[source,cpp]
+----
+void upload_morph_target_to_gpu(
+    VmaAllocator    allocator,
+    VkDevice        device,
+    VkCommandBuffer cmd,
+    MorphTargetData& target)
+{
+    VkDeviceSize buffer_size =
+        target.position_deltas.size() * sizeof(glm::vec3);
+
+    // Create a host-visible staging buffer
+    VkBuffer      staging_buf;
+    VmaAllocation staging_alloc;
+    create_buffer(allocator,
+                  buffer_size,
+                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VMA_MEMORY_USAGE_CPU_TO_GPU,
+                  staging_buf, staging_alloc);
+
+    void* mapped;
+    vmaMapMemory(allocator, staging_alloc, &mapped);
+    std::memcpy(mapped, target.position_deltas.data(), buffer_size);
+    vmaUnmapMemory(allocator, staging_alloc);
+
+    // Create the device-local GPU buffer
+    create_buffer(allocator,
+                  buffer_size,
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                  VK_BUFFER_USAGE_TRANSFER_DST_BIT   |
+                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                  VMA_MEMORY_USAGE_GPU_ONLY,
+                  target.gpu_buffer, target.gpu_allocation);
+
+    // Copy staging → GPU
+    VkBufferCopy region { 0, 0, buffer_size };
+    vkCmdCopyBuffer(cmd, staging_buf, target.gpu_buffer, 1, &region);
+
+    // (Staging buffer cleanup deferred until after command submission)
+}
+----
+
+`VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` フラグにより、次の節で構築するバインドレス方式でこのバッファの GPU アドレスを使えます。このフラグを設定すれば `vkGetBufferDeviceAddress` で 64 ビットの GPU ポインタを取得でき、コンピュートシェーダーがディスクリプタなしで直接デリファレンスできます。
+
+== ウェイトアニメーションチャネル
+
+モーフターゲットのウェイトは、メッシュノード上の `WEIGHTS` パスをターゲットにする glTF アニメーションチャネルで駆動されます。このチャネルの解析と補間は、第 3 章でジョイント回転チャネル向けに構築したアクセサとサンプラーの仕組みと同じです。違いは、ジョイントのローカル回転にクォータニオンを書き込む代わりに、モーフターゲットのウェイト配列にスカラー float を書き込むことだけです。
+
+一般的なパターンは、メッシュごとにターゲットごと 1 要素の `std::vector<float>` モーフウェイトを維持し、アニメーションシステムが毎フレーム更新することです。この配列は小さなユニフォームまたはプッシュ定数として、各スキニングディスパッチの前に GPU にアップロードされます。
+
+[source,cpp]
+----
+struct MorphWeightBlock {
+    float    weights[24];     // Up to 24 active morph targets
+    uint32_t activeCount;     // How many entries in weights[] are valid
+    uint32_t applySkinning;   // 1 = also apply skeletal skinning, 0 = morph only
+    uint32_t pad[2];          // Align to 16 bytes
+};
+----
+
+ウェイトを単純なフラット配列にしておくと、コンピュートシェーダーは素直になります。各頂点について `active_count` 個のモーフターゲットを反復し、ウェイトと変位を読み、重み付き変位をベース位置に加算します。このシェーダーコードは次の節で書きます。
+
+xref:Advanced_glTF/Morph_Targets_Facial_Animation/01_introduction.adoc[前へ: はじめに] | xref:Advanced_glTF/Morph_Targets_Facial_Animation/03_bindless_morph_buffers.adoc[次へ: バインドレスモーフバッファ]

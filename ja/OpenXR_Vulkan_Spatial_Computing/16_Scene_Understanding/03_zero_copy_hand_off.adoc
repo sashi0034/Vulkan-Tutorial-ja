@@ -1,0 +1,58 @@
+:pp: {plus}{plus}
+= センサデータ向けゼロコピー引き継ぎ
+
+リアルタイムのシーン理解では、レイテンシを最小化するため、センサデータ（深度マップやカメラフィードなど）を CPU 介入なしで GPU へ直接移す必要があります。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan の併用**。
+
+Vulkan の外部メモリ拡張でランタイム割り当てセンサバッファをインポートすることは、高性能 Mixed Reality を達成する標準的な方法です。ヘッドセットのセンサとコンピュートシェーダー間のダイレクトメモリアクセス（DMA）を可能にするには、これらの拡張を使う必要があります。
+
+== 概念: ダイレクトメモリアクセス（DMA）
+
+ゼロコピー引き継ぎでは、OpenXR ランタイムがセンサデータを、Vulkan エンジンが見える GPU バッファへ直接取り込み、**DMA**（Direct Memory Access）経由でホストプロセッサを完全に迂回します。
+
+1.  **VRAM 割り当て**: ランタイムまたは OS ドライバがセンサデータ用に VRAM を割り当てる。
+2.  **外部メモリハンドル**: OpenXR がこのメモリへのハンドルを提供する（例: `VK_KHR_external_memory` 経由）。
+3.  **エンジンインポート**: エンジンがこのハンドルをインポートし、`vk::raii::DeviceMemory` オブジェクトにラップする。
+4.  **コンピュートアクセス**: コンピュートシェーダーがこの生データをその場で処理する。
+
+== 実装: コンピュートへのデータ配管
+
+CPU を迂回することで、センサデータは GPU 内部バスの速度で動き、**モーション・ツー・フォトンレイテンシ** を人間の知覚閾値以下に保ちます。指定初期化子を使い、メモリ割り当てとインポートを構成します。
+
+[source,cpp]
+----
+// Importing external sensor memory using designated initializers
+vk::ImportMemoryBufferInfoKHR importInfo{
+    .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd, // OpaqueFd for Linux/Android
+    .handle = sensorMemoryHandle
+};
+
+vk::MemoryAllocateInfo allocInfo{
+    .pNext = &importInfo,
+    .allocationSize = sensorDataSize,
+    .memoryTypeIndex = findSensorCompatibleMemoryType()
+};
+
+// RAII handle automatically manages the lifetime of the imported memory
+vk::raii::DeviceMemory importedMemory(device, allocInfo);
+----
+
+ランタイムは DMA 転送を調整し、トラッキングサービスとエンジンの両方が複製なしで同じフレームを同時に見られるよう、物理メモリを「エイリアス」することがあります。
+
+== なぜゼロコピーが MR に不可欠か
+
+Mixed Reality（MR）では、ユーザーは **パススルー** 経由で現実世界を見ます。わずか 20ms の遅延でも吐き気を催す断絶が生まれます。ゼロコピー引き継ぎはセンサデータの到着レイテンシを最小化し、仮想と物理の世界が同じ空間を占めるという錯覚を維持します。
+
+== 発展: センサデノイズと高頻度注入
+
+Vulkan により、標準ストリームを超えてセンサデータを洗練できます。
+
+*   **その場処理**: Vulkan の **Hardware Accelerators** を使い、生センサデータに専用のデノイズまたは深度補完シェーダーを走らせ、生 OpenXR ストリームよりクリーンな「デジタルツイン」を提供できる。
+*   **高頻度注入**: Vulkan の **Asynchronous Transfer Queues** を使い、90Hz レンダリングループと並列にセンサデータを補間し、センサがより低い頻度（例: 30Hz）で報告しても仮想オクルーダが完全に揃ったままにできる。
+
+TIP: 外部メモリとゼロコピー転送の詳細については、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#external-memory[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/02_environmental_ingestion.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/04_incorporating_into_the_engine.adoc[Next]

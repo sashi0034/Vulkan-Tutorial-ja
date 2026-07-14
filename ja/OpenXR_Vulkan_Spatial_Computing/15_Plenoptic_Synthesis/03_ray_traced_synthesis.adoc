@@ -1,0 +1,77 @@
+:pp: {plus}{plus}
+= レイトレース合成とマイクロレンズ配列
+
+高忠実度のホログラフィックディスプレイでは、**Vulkan Ray Tracing（VRT）** を使い、**マイクロレンズ配列（Microlens Array, MLA）** の正確な物理光学をシミュレートします。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+標準の OpenXR ランタイムは従来の投影モデル周りに構築されています。Vulkan のレイトレーシングパイプラインを使い、複雑な仮想マイクロレンズ光学をシミュレートし、標準ランタイムコンポジタの能力を超える輻輳－調節解とスパースライトフィールド走査を可能にします。
+
+== 物理光学: マイクロレンズ配列（MLA）
+
+レイトレース合成を理解するには、ライトフィールドカメラの仕組みを理解する必要があります。それらはセンサの前に置かれた何千もの小さなレンズのグリッド——**マイクロレンズ配列**——を使います。レイトレーシングパイプラインでは、この過程を逆にします。
+
+1.  **プライマリレイ**: 仮想の目からスクリーンへ光線をトレースする。
+2.  **マイクロレンズ交差**: 光線が仮想マイクロレンズを通る様子をシミュレートする。
+3.  **屈折**: 焦点距離と曲率に基づき、レンズが光線をどう曲げるかを計算する。
+4.  **ライトフィールド参照**: 屈折した光線は、特定の 4D プレノプティック座標を指すようになる。
+
+ランタイムはベンダー拡張経由で物理 MLA の焦点距離・ピッチ・曲率パラメータを提供し、レンズ幾何向けの事前構築された加速構造さえ提供することがあります。
+
+== Slang での仮想レンズ実装
+
+Vulkan の `RaytracingAccelerationStructure` を使うと、ラスタシェーダーではできない複雑なレンズをシミュレートできます。指定初期化子でレイ生成パスを構成します。
+
+[source,cpp]
+----
+// Configuring the ray tracing pipeline using designated initializers
+vk::RayTracingPipelineCreateInfoKHR pipelineInfo{
+    .pNext = &dynamicRenderingInfo, // Link to our dynamic rendering state
+    .stageCount = static_cast<uint32_t>(stages.size()),
+    .pStages = stages.data(),
+    .groupCount = static_cast<uint32_t>(groups.size()),
+    .pGroups = groups.data(),
+    .maxPipelineRayRecursionDepth = 1,
+    .layout = *pipelineLayout
+};
+----
+
+Slang の RayGen シェーダーでは、物理光学シミュレーションを行います。
+
+[source,slang]
+----
+// RayGen shader in Slang for plenoptic synthesis
+[shader("raygeneration")]
+void rayGenMain() {
+    uint2 pixelID = DispatchRaysIndex().xy;
+    float2 uv = float2(pixelID) / float2(DispatchRaysDimensions().xy);
+
+    // 1. Trace a ray through the virtual microlens optics
+    RayDesc ray = generateRayThroughLens(uv);
+
+    // 2. Intersect the ray with our 4D LightField "box"
+    float4 color = intersectLightField(ray, lightFieldData);
+
+    // 3. Write the final result to the OpenXR swapchain image
+    outputImage[pixelID] = color;
+}
+----
+
+== 発展: ホログラフィック持続と MLA 最適化
+
+Vulkan により、標準のビュー依存モデルを超えて合成を押し進められます。
+
+*   **時間的ホログラフィック持続**: Vulkan の **Ray Tracing Motion Blur** 拡張を使い、予測表示ウィンドウをまたいで光線をトレースし、ホログラフィックディスプレイの持続をシミュレートできる。動く物体がシャープで安定したままになる。
+*   **サブグループ MLA 交差**: Vulkan の **Subgroup Operations** を使い、高効率なレイ–円／レイ–六角形交差ロジックを実装し、レンズシミュレーションの計算コストを複数スレッドで共有できる。
+
+== なぜレイトレースか？ 物理的忠実度
+
+レイトレーシングにより **輻輳－調節矛盾（Vergence-Accommodation Conflict, VAC）** 解をシミュレートできます。マイクロレンズ配列の仮想焦点距離をリアルタイムで調整することで、ホログラフィック画像の「焦点面」を変えられます。ユーザーの目が近く／遠くの仮想物体に自然に焦点を合わせられ、眼精疲労を解消します。
+
+さらに、レイトレーシングは（オクトリーのような）**非均一ライトフィールド** を、フラグメントシェーダー内の入れ子ループよりはるかに効率よく扱います。
+
+TIP: レイトレーシングとホログラフィックディスプレイの詳細については、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#ray-tracing[Vulkan Specification on Ray Tracing]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/15_Plenoptic_Synthesis/02_synthesis_shaders.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/15_Plenoptic_Synthesis/04_incorporating_into_the_engine.adoc[Next]

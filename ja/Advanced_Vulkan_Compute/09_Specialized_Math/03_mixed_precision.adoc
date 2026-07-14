@@ -1,0 +1,103 @@
+:pp: {plus}{plus}
+= 混合精度の習得: FP16 と Int8
+
+高性能コンピューティングでは、ほぼすべてに伝統的に 32 ビット浮動小数点精度（FP32）に頼ってきました。しかしデータセットが大きくなり、より高いスループットを求めるにつれ、こう問う価値があります。すべての計算に本当に 32 ビットが*必要*か？ そこで **混合精度（Mixed Precision）** が登場します。
+
+核心の考えは単純です。計算の大部分に **FP16**（半精度 float）や **Int8**（8 ビット整数）のような低精度型を使い、絶対に必要なところだけ高精度を使う。現代の GPU アーキテクチャはこれらの低精度型向けに大きく最適化されています。たとえば多くの GPU は、同じ時間で FP32 演算の 2 倍の FP16 演算を実行できます。
+
+== なぜ混合精度か？
+
+低精度を受け入れる主な理由は 2 つです。
+
+1. **算術スループット**: 多くの現代 GPU は「パック」数学ユニットを持ちます。単一の 32 ビットレジスタが 2 つの 16 ビット値を保持でき、ハードウェアは 1 回の 32 ビット演算と同じサイクルで 2 回の 16 ビット演算を行えます。
+2. **メモリ帯域**: データの移動は高価です。16 ビットや 8 ビット型を使うことで、同じメモリバスを通じて動かせるデータ量を実質的に 2 倍または 4 倍にできます。
+
+== 精度対範囲: FP16 と BFloat16
+
+32 ビットから 16 ビットへ落とすとき、何を犠牲にするかを選ばなければなりません。
+
+* **FP16（IEEE 754）**: 1 符号ビット、5 指数ビット、10 仮数ビット。妥当な精度を提供しますが範囲は非常に限定的です（最大値 約 65,504）。
+* **BFloat16（Brain Float）**: 1 符号ビット、8 指数ビット、7 仮数ビット。FP32 と*同じ範囲*を持ちますが精度ははるかに低いです。オーバーフローに強いため機械学習でしばしば好まれます。
+
+Vulkan では、FP16 は `VK_KHR_shader_float16_int8` 拡張経由で広くサポートされ、BFloat16 サポートは `VK_KHR_shader_bfloat16` 拡張経由で提供されます。
+
+== Slang: 自然な混合精度
+
+Slang は `half` と `int8_t` をネイティブ型として扱うため、混合精度の使用が非常に簡単です。低レベルの変換命令は処理してくれます。
+
+[source,slang]
+----
+// Slang での半精度の使用
+void computeMain() {
+    // 16 ビット float（h 接尾辞）
+    half a = 1.0h;
+    half b = 2.0h;
+
+    // 混合累積: 16 ビット数学を行い、32 ビットで累積
+    float accumulator = 0.0f;
+    for(int i = 0; i < 100; i++) {
+        // 加算が 32 ビットであることを保証するための明示的キャスト
+        accumulator += (float)(a * b);
+    }
+}
+----
+
+== Int8 とドット積（DP4A）
+
+さらに高いスループットのため、多くの GPU は 8 ビット整数数学向けの専用命令をサポートします。最も一般的なものの一つが **DP4A**（Dot Product with 4-way Accumulation）です。
+
+ハードウェアは、それぞれ 4 つの 8 ビット値（$x_0, x_1, x_2, x_3$ と $y_0, y_1, y_2, y_3$）を含む 2 つの 32 ビットレジスタを取ります。次を実行します。
+[latexmath]
+++++
+Result = (x_0 \times y_0) + (x_1 \times y_1) + (x_2 \times y_2) + (x_3 \times y_3) + Accumulator
+++++
+これがすべて単一サイクルで起きます。Slang では、パックされた 8 ビットベクトル上で `dot` を使うことでこれを引き起こせます。
+
+[source,slang]
+----
+RWStructuredBuffer<uint> output;
+
+void computeMain(uint3 threadId : SV_DispatchThreadID) {
+    uint32_t packedA = loadPackedA(threadId.x);
+    uint32_t packedB = loadPackedB(threadId.x);
+
+    // uint32 を 4 つの 8 ビット int のベクトルとして再解釈
+    int8_t4 vecA = BitCast<int8_t4>(packedA);
+    int8_t4 vecB = BitCast<int8_t4>(packedB);
+
+    // ドット積組み込みが DP4A ハードウェアへ直接マップ
+    int result = dot(vecA, vecB);
+    output[threadId.x] = result;
+}
+----
+
+== C{pp} 側: データの準備
+
+これらのシェーダにデータを供給するには、CPU 上で正しくデータをパックしなければなりません。標準 C{pp} にはネイティブ 16 ビット float 型がないため（C{pp}23 の `std::float16_t` まで）、しばしば `glm` のようなライブラリを使うか手動ビットパッキングを行います。
+
+[source,cpp]
+----
+// 4 つの 8 ビット整数を 1 つの 32 ビット uint へパックする例
+uint32_t packInt8(int8_t a, int8_t b, int8_t c, int8_t d) {
+    return (uint32_t(a) << 0)  | (uint32_t(b) << 8) |
+           (uint32_t(c) << 16) | (uint32_t(d) << 24);
+}
+
+// RAII を使って Vulkan バッファへアップロード
+void uploadData(vk::raii::Device& device, const std::vector<uint32_t>& packedData) {
+    vk::BufferCreateInfo createInfo({}, packedData.size() * sizeof(uint32_t),
+                                   vk::BufferUsageFlagBits::eStorageBuffer);
+    vk::raii::Buffer storageBuffer(device, createInfo);
+    // ... メモリをバインドしデータをコピー ...
+}
+----
+
+== ダイナミックレンジの管理: Loss Scaling
+
+混合精度、特に **FP16** の最大の課題は、限定的な **ダイナミックレンジ** です。FP16 は FP32 よりはるかに小さな範囲を持ち、**オーバーフロー**（最大値を超える）や **アンダーフロー**（表現するには小さすぎる）がはるかに起きやすくなります。
+
+これを管理するには **Loss Scaling** として知られる技法が必要です。低精度計算を行う前に値にスケーリング係数（例: 128.0）を乗算して安全な範囲に保ち、終わったら同じ係数で割ります。
+
+混合精度を習得することは、単に「より多くの性能を絞り出す」ことではありません。ハードウェアリソースの使い方をより賢くすることです。流体シミュレーションでもリアルタイム信号処理エンジンでも、これらの技法は現代 GPU で可能なことの限界を押し広げるために不可欠です。
+
+xref:Advanced_Vulkan_Compute/09_Specialized_Math/02_cooperative_matrices.adoc[前へ: コオペラティブ行列] | xref:Advanced_Vulkan_Compute/10_Performance_Optimization/01_introduction.adoc[次へ: パフォーマンス最適化]

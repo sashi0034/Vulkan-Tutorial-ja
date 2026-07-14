@@ -1,0 +1,306 @@
+= アクセラレーション構造（BLAS/TLAS）
+
+*目的*: モデルのジオメトリ用に *ボトムレベルアクセラレーション構造*（BLAS）を作成し、それらの BLAS をインスタンス化する *トップレベルアクセラレーション構造*（TLAS）を作成する。
+レイクエリで使えるよう、TLAS をシェーダーにバインドする。
+
+シーンでレイを飛ばすとき、どの三角形に当たるかを素早く特定する最適化された構造が必要です。GPU はジオメトリをバウンディングボックスにまとめたアクセラレーション構造を使い、シーンの大部分をスキップできます。レイのトラバーサルは木を下り、交差した三角形まで効率よく絞り込みます。
+正確な実装は GPU 依存で、ユーザーには不透明です。
+
+image::../../../images/38_bounding_boxes.png[]
+
+本シーンは OBJ ファイルから読み込んだ単純な 3D モデル（テーブル上の植物）です。提供コードはすでにモデルの頂点、インデックス、法線、テクスチャをバッファに読み込んでいます。
+モデルはサブメッシュに分割され、それぞれ独自のマテリアルを持ちます。
+
+BLAS は 1 つのメッシュ／オブジェクトのジオメトリ（三角形）を保持します。
+TLAS は BLAS のインスタンス（変換付き）を保持し、シーン全体を構成します。
+区別されるメッシュ／マテリアルごとに 1 つの BLAS と、それらを参照する 1 つの TLAS を作成します。
+レイクエリは TLAS を使います。
+Vulkan で AS を構築するには、ジオメトリの記述、ビルドサイズの問い合わせ、バッファの割り当て、AS ハンドルの作成、ビルドコマンドの発行、といういくつかの手順があります。
+
+== タスク 2: 各サブメッシュ用の BLAS を作成する
+
+`createAccelerationStructures` の定義に進みます。ここではまず、モデル内の各サブメッシュ用に BLAS を作成します。コードにはすでにジオメトリデータを含む `submeshes` を反復するループがあります。
+
+まず、BLAS のジオメトリを記述する必要があります。この目的には `vk::AccelerationStructureGeometryKHR` 構造体を使います。
+
+[,c{pp}]
+----
+// Prepare the geometry data
+auto trianglesData = vk::AccelerationStructureGeometryTrianglesDataKHR{
+    .vertexFormat = vk::Format::eR32G32B32Sfloat,
+    .vertexData = vertexAddr,
+    .vertexStride = sizeof(Vertex),
+    .maxVertex = submesh.maxVertex,
+    .indexType = vk::IndexType::eUint32,
+    .indexData = indexAddr + submesh.indexOffset * sizeof(uint32_t)
+};
+
+vk::AccelerationStructureGeometryDataKHR geometryData(trianglesData);
+
+vk::AccelerationStructureGeometryKHR blasGeometry{
+    .geometryType = vk::GeometryTypeKHR::eTriangles,
+    .geometry = geometryData,
+    .flags = vk::GeometryFlagBitsKHR::eOpaque
+};
+----
+
+これをビルド情報構造体に記録します。
+
+[,c{pp}]
+----
+vk::AccelerationStructureBuildGeometryInfoKHR blasBuildGeometryInfo{
+    .type = vk::AccelerationStructureTypeKHR::eBottomLevel,
+    .mode = vk::BuildAccelerationStructureModeKHR::eBuild,
+    .geometryCount = 1,
+    .pGeometries = &blasGeometry,
+};
+----
+
+次に、BLAS のメモリ要件を問い合わせます。
+
+[,c{pp}]
+----
+// TASK02: Query the memory sizes that will be needed for this BLAS
+vk::AccelerationStructureBuildSizesInfoKHR blasBuildSizes =
+    device.getAccelerationStructureBuildSizesKHR(
+        vk::AccelerationStructureBuildTypeKHR::eDevice,
+        blasBuildGeometryInfo,
+        { primitiveCount }
+);
+----
+
+このヘルパー関数は `vkGetAccelerationStructureBuildSizesKHR()` を使い、BLAS に必要なメモリサイズを返します。割り当てが必要なのは次です。
+
+. BLAS 本体用のバッファ。
+. ビルド処理中に使うスクラッチ空間用の別バッファ。
+
+これらのバッファを作成し、後で必要になるため永続配列に格納できます。
+
+BLAS ハンドル自体も作成する必要があります。これは `vk::AccelerationStructureCreateInfoKHR` と、`vkCreateAccelerationStructureKHR()` を使うデバイス関数ヘルパーで行います。ハンドルは後で使うためにベクトルに格納します（サブメッシュごとに 1 つ必要であることを忘れないでください）。
+
+[,c{pp}]
+----
+// TASK02: Create and store the BLAS handle
+vk::AccelerationStructureCreateInfoKHR blasCreateInfo{
+    .buffer = blasBuffers[i],
+    .offset = 0,
+    .size = blasBuildSizes.accelerationStructureSize,
+    .type = vk::AccelerationStructureTypeKHR::eBottomLevel,
+};
+
+blasHandles.emplace_back(device.createAccelerationStructureKHR(blasCreateInfo));
+
+// Save the BLAS handle in the build info structure
+blasBuildGeometryInfo.dstAccelerationStructure = blasHandles[i];
+----
+
+次の図は、これまでに作成したすべての構造体とバッファをまとめたものです。
+
+image::../../../images/38_TASK02_blas_structures.png[]
+
+すべてをまとめるには、GPU 上で BLAS をビルドするコマンドバッファを投入する必要があります。これは `vkCmdBuildAccelerationStructuresKHR()` で行い、ビルド情報とレンジを取ります。レンジは一度に複数ジオメトリをビルドする柔軟性を与えますが、ここでは BLAS あたりジオメトリは 1 つなので単純にしています。
+
+[,c{pp}]
+----
+// TASK02: Prepare the build range for the BLAS
+vk::AccelerationStructureBuildRangeInfoKHR blasRangeInfo{
+    .primitiveCount = primitiveCount,
+    .primitiveOffset = 0,
+    .firstVertex = firstVertex,
+    .transformOffset = 0
+};
+----
+
+最後にコマンドバッファを準備して投入すると、ボトムレベルアクセラレーション構造の有効なハンドルが得られます。
+
+[,c{pp}]
+----
+// TASK02: Build the BLAS
+auto cmd = beginSingleTimeCommands();
+cmd->buildAccelerationStructuresKHR({ blasBuildGeometryInfo }, { &blasRangeInfo });
+endSingleTimeCommands(*cmd);
+----
+
+image::../../../images/38_TASK02_blas_build.png[]
+
+これでシーン内の各モデル用の BLAS ができました。次に、それらをすべて 1 つの TLAS にまとめ、フラグメントシェーダーで消費します。
+
+== タスク 3: BLAS のインスタンスを持つ TLAS を作成する
+
+BLAS ができたので、それらを参照する TLAS を作成します。TLAS は BLAS のインスタンスを保持し、変換（位置、回転、スケール）付きでシーンに配置できます。
+
+BLAS を作成したのと同じサブメッシュループ内でインスタンスを作成できます。各サブメッシュについて、対応する BLAS ハンドルを参照するインスタンスを作成します。この目的には `vk::AccelerationStructureInstanceKHR` 構造体を使います。
+
+[,c{pp}]
+----
+// TASK03: Create a BLAS instance for the TLAS
+vk::AccelerationStructureDeviceAddressInfoKHR addrInfo{
+    .accelerationStructure = *blasHandles[i]
+};
+vk::DeviceAddress blasDeviceAddr = device.getAccelerationStructureAddressKHR(addrInfo);
+
+vk::AccelerationStructureInstanceKHR instance{
+    .transform = tm,
+    .mask = 0xFF,
+    .accelerationStructureReference = blasDeviceAddr
+};
+
+instances.push_back(instance);
+----
+
+`vkGetAccelerationStructureDeviceAddressKHR()` で BLAS のデバイスアドレスを取得する必要があることに注意してください。変換行列は当面単位行列にしておき、ラボの後半で再度扱います。
+
+すべてのインスタンスがベクトルに格納されたら、TLAS 用のインスタンスデータを準備します。これにはインスタンスデータを保持するバッファの作成が含まれます。
+
+BLAS と非常に似た手順で、TLAS ビルド用のデータを準備し、バッファサイズを問い合わせ、バッファを割り当て、TLAS ハンドルを作成し、ビルドコマンドを発行します。次の図は TLAS 向けの主な変更点を示しています。
+
+image::../../../images/38_TASK03_tlas_structures.png[]
+
+TLAS 用のジオメトリデータを準備するには、BLAS のインスタンスから TLAS をビルドすることを示す `vk::GeometryTypeKHR::eInstances` を使います。
+
+[,c{pp}]
+----
+// TASK03: Prepare the geometry (instance) data
+auto instancesData = vk::AccelerationStructureGeometryInstancesDataKHR{
+    .arrayOfPointers = vk::False,
+    .data = instanceAddr
+};
+
+vk::AccelerationStructureGeometryDataKHR geometryData(instancesData);
+
+vk::AccelerationStructureGeometryKHR tlasGeometry{
+    .geometryType = vk::GeometryTypeKHR::eInstances,
+    .geometry = geometryData
+};
+----
+
+これをビルド情報構造体に記録します。
+
+[,c{pp}]
+----
+vk::AccelerationStructureBuildGeometryInfoKHR tlasBuildGeometryInfo{
+    .type = vk::AccelerationStructureTypeKHR::eTopLevel,
+    .mode = vk::BuildAccelerationStructureModeKHR::eBuild,
+    .geometryCount = 1,
+    .pGeometries = &tlasGeometry
+};
+----
+
+次に、TLAS のメモリ要件を問い合わせます。
+
+[,c{pp}]
+----
+// TASK03: Query the memory sizes that will be needed for this TLAS
+vk::AccelerationStructureBuildSizesInfoKHR tlasBuildSizes =
+    device.getAccelerationStructureBuildSizesKHR(
+        vk::AccelerationStructureBuildTypeKHR::eDevice,
+        tlasBuildGeometryInfo,
+        { primitiveCount }
+);
+----
+
+そして再び必要なバッファを作成します。
+
+TLAS ハンドルの作成には、以前と同様に `vkCreateAccelerationStructureKHR()` を使います。
+
+[,c{pp}]
+----
+// TASK03: Create and store the TLAS handle
+vk::AccelerationStructureCreateInfoKHR tlasCreateInfo{
+    .buffer = tlasBuffer,
+    .offset = 0,
+    .size = tlasBuildSizes.accelerationStructureSize,
+    .type = vk::AccelerationStructureTypeKHR::eTopLevel,
+};
+
+tlas = device.createAccelerationStructureKHR(tlasCreateInfo);
+
+// Save the TLAS handle in the build info structure
+tlasBuildGeometryInfo.dstAccelerationStructure = tlas;
+----
+
+もう一度、TLAS 用のビルドレンジを準備します。BLAS と似ていますが、今度はインスタンス数を使います。その後、TLAS をビルドするコマンドバッファを投入できます。
+
+[,c{pp}]
+----
+ // TASK03: Prepare the build range for the TLAS
+ vk::AccelerationStructureBuildRangeInfoKHR tlasRangeInfo{
+     .primitiveCount = primitiveCount,
+     .primitiveOffset = 0,
+     .firstVertex = 0,
+     .transformOffset = 0
+ };
+
+// TASK03: Build the TLAS
+auto cmd = beginSingleTimeCommands();
+cmd->buildAccelerationStructuresKHR({ tlasBuildGeometryInfo }, { &tlasRangeInfo });
+endSingleTimeCommands(*cmd);
+----
+
+完了です！モデル内のサブメッシュ用のすべての BLAS を参照する TLAS を作成しました。TLAS はフラグメントシェーダーのレイクエリで使える状態です。
+
+== タスク 4: アクセラレーション構造をシェーダーにバインドする
+
+アクセラレーション構造をシェーダーで使えるようにするには、TLAS 用のディスクリプタセットバインディングを追加する必要があります。これは `createDescriptorSetLayout()` 関数で行います（当面、より高いバインディングは無視して構いません）。
+
+[,c{pp}]
+----
+// TASK04: The acceleration structure uses binding 1
+std::array global_bindings = {
+    vk::DescriptorSetLayoutBinding( 0, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, nullptr),
+    vk::DescriptorSetLayoutBinding( 1, vk::DescriptorType::eAccelerationStructureKHR, 1, vk::ShaderStageFlagBits::eFragment, nullptr),
+    vk::DescriptorSetLayoutBinding( 2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eFragment, nullptr),
+    vk::DescriptorSetLayoutBinding( 3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eFragment, nullptr),
+    vk::DescriptorSetLayoutBinding( 4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eFragment, nullptr)
+};
+----
+
+次に、TLAS をバインドするようディスクリプタセットを更新します。これは `updateDescriptorSets()` 関数で行います。
+
+[,c{pp}]
+----
+vk::WriteDescriptorSetAccelerationStructureKHR asInfo{
+    .accelerationStructureCount = 1,
+    .pAccelerationStructures = {&*tlas}
+};
+
+vk::WriteDescriptorSet asWrite{
+    .pNext = &asInfo,
+    .dstSet = globalDescriptorSets[i],
+    .dstBinding = 1,
+    .dstArrayElement = 0,
+    .descriptorCount = 1,
+    .descriptorType = vk::DescriptorType::eAccelerationStructureKHR
+};
+----
+
+その後、リストに TLAS を含めて `vkUpdateDescriptorSets()` を呼び出します。
+
+[,c{pp}]
+----
+std::array<vk::WriteDescriptorSet, 4> descriptorWrites{bufferWrite, asWrite, indexBufferWrite, uvBufferWrite};
+
+device.updateDescriptorSets(descriptorWrites, {});
+----
+
+最後に、対応する属性をシェーダーに追加します。
+
+[,slang]
+----
+// TASK04: Acceleration structure binding
+[[vk::binding(1,0)]]
+RaytracingAccelerationStructure accelerationStructure;
+----
+
+次を使って再ビルドして実行します。
+
+[,c{pp}]
+----
+#define LAB_TASK_LEVEL 4
+----
+
+見た目の変化はありませんが、アクセラレーション構造はセットアップ済みで、フラグメントシェーダーで使える状態です。
+
+== ナビゲーション
+- 前へ: xref:./01_Dynamic_rendering.adoc[ダイナミックレンダリング]
+- 次へ: xref:./03_Ray_query_shadows.adoc[レイクエリによるシャドウ]

@@ -1,0 +1,517 @@
+:pp: {plus}{plus}
+
+= データ管理
+
+== 導入
+
+ニューラルネットワーク推論は大量のデータを動かします。入力テンソル、重み、中間活性化、出力です。典型的な ResNet-50 モデルは 2500 万パラメータ（100 MB の重み）を持ち、画像を数十レイヤで処理し、各レイヤが中間結果を生成します。このデータを効率的に管理する——メモリ上の整理、割り当て・解放のタイミング、CPU と GPU 間の転送——は性能に直接影響します。
+
+データ管理が不十分だと、最適化されたコンピュートシェーダでもボトルネックになります。シェーダが高速でもデータ転送待ちやメモリ不足があれば、全体性能は低下します。本章では Vulkan でテンソルデータを管理する実践的側面を扱います。メモリレイアウト、割り当て戦略、メモリ再利用、転送最適化です。
+
+== テンソルレイアウト: データの整理方法
+
+テンソルは多次元配列ですが、GPU メモリは線形（1 次元）です。多次元インデックスから線形メモリアドレスへの写像が必要です。この写像の選択——テンソルレイアウト——はメモリアクセスパターンと性能に影響します。
+
+=== 次元の理解
+
+ニューラルネットワークのテンソルは画像データで通常 4 次元です。
+
+- *N（Batch）*: 一緒に処理する画像数
+- *C（Channels）*: フィーチャマップ数（RGB 入力は 3、中間レイヤは 64/128/256 など）
+- *H（Height）*: 空間次元
+- *W（Width）*: 空間次元
+
+224×224 の RGB 画像 8 枚のバッチでは、テンソル形状は [8, 3, 224, 224] で、8 × 3 × 224 × 224 = 1,204,224 要素です。
+
+=== NCHW 対 NHWC レイアウト
+
+2 つの最も一般的なレイアウトは、メモリ上の次元順序が異なります。
+
+*NCHW（Channels First）*: 次元順 [Batch, Channels, Height, Width]。チャネル 0 のすべての値が先、次にチャネル 1 のすべて、という順序です。
+
+3 チャネルの 2×2 画像のメモリレイアウト:
+[source]
+----
+[N0_C0_H0_W0, N0_C0_H0_W1, N0_C0_H1_W0, N0_C0_H1_W1,  // Channel 0
+ N0_C1_H0_W0, N0_C1_H0_W1, N0_C1_H1_W0, N0_C1_H1_W1,  // Channel 1
+ N0_C2_H0_W0, N0_C2_H0_W1, N0_C2_H1_W0, N0_C2_H1_W1]  // Channel 2
+----
+
+*NHWC（Channels Last）*: 次元順 [Batch, Height, Width, Channels]。1 ピクセルのすべてのチャネルがまとまります。
+
+同じ画像のメモリレイアウト:
+[source]
+----
+[N0_H0_W0_C0, N0_H0_W0_C1, N0_H0_W0_C2,  // Pixel (0,0)
+ N0_H0_W1_C0, N0_H0_W1_C1, N0_H0_W1_C2,  // Pixel (0,1)
+ N0_H1_W0_C0, N0_H1_W0_C1, N0_H1_W0_C2,  // Pixel (1,0)
+ N0_H1_W1_C0, N0_H1_W1_C1, N0_H1_W1_C2]  // Pixel (1,1)
+----
+
+=== どちらのレイアウトを使うか
+
+選択は操作に依存します。
+
+*NCHW の利点*:
+
+- チャネル全体を処理する操作（バッチ正規化、チャネルごと演算）に有利
+- 歴史的に多くの ML フレームワークと HPC API で好まれた
+- チャネルごと演算でベクトル化を改善できる場合がある
+
+*NHWC の利点*:
+
+- 一部ハードウェア（特にモバイル GPU と tensor core）での畳み込みに有利
+- 空間操作でキャッシュフレンドリー
+- 画像形式（RGB 値がまとまったピクセル）に一致
+
+最新 GPU では畳み込みは NHWC、その他操作は NCHW が有利なことが多いです。最適な選択はハードウェア依存です。ターゲット GPU で両方をプロファイルしてください。
+
+=== インデックス計算
+
+線形バッファ内の要素 [n, c, h, w] へのアクセス:
+
+*NCHW*:
+[source]
+----
+index = n * (C * H * W) + c * (H * W) + h * W + w
+----
+
+*NHWC*:
+[source]
+----
+index = n * (H * W * C) + h * (W * C) + w * C + c
+----
+
+Slang では:
+[source,slang]
+----
+// NCHW layout
+uint get_index_nchw(uint n, uint c, uint h, uint w, uint C, uint H, uint W) {
+    return n * (C * H * W) + c * (H * W) + h * W + w;
+}
+
+// NHWC layout
+uint get_index_nhwc(uint n, uint h, uint w, uint c, uint H, uint W, uint C) {
+    return n * (H * W * C) + h * (W * C) + w * C + c;
+}
+----
+
+=== レイアウト変換
+
+レイアウト間の変換が必要な場合があります。1 つのレイアウトでテンソル全体を読み、別レイアウトで書きます。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer InputNCHW {
+    float input_nchw[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OutputNHWC {
+    float output_nhwc[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint N, C, H, W;
+} pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.y;
+    uint w = gl_GlobalInvocationID.x;
+
+    if (h >= pc.H || w >= pc.W) return;
+
+    for (uint n = 0; n < pc.N; n++) {
+        for (uint c = 0; c < pc.C; c++) {
+            uint nchw_idx = n * (pc.C * pc.H * pc.W) + c * (pc.H * pc.W) + h * pc.W + w;
+            uint nhwc_idx = n * (pc.H * pc.W * pc.C) + h * (pc.W * pc.C) + w * pc.C + c;
+            output_nhwc[nhwc_idx] = input_nchw[nchw_idx];
+        }
+    }
+}
+----
+
+レイアウト変換は高コスト（テンソル全体の読み書きが必要）なので、変換を最小化してください。可能なら 1 つのレイアウトを選び、パイプライン全体で一貫して使います。
+
+== メモリ割り当て戦略
+
+ニューラルネットワークは重み、入力、出力、中間活性化のメモリ割り当てを必要とします。これらの割り当て管理方法は性能とメモリ使用量の両方に影響します。
+
+=== 静的割り当て対動的割り当て
+
+*静的割り当て*: モデルアーキテクチャに基づき、推論開始前にすべてのメモリを一括割り当て。すべてのテンソルサイズが事前に既知。
+
+利点:
+
+- 推論中の割り当てオーバーヘッドなし
+- 予測可能なメモリ使用量
+- モデル全体のメモリレイアウトを最適化可能
+
+欠点:
+
+- すべてのテンソルサイズを事前に知る必要がある
+- 動的形状（可変バッチサイズ、可変長シーケンス）に対応できない
+
+*動的割り当て*: 推論中に必要に応じてメモリを割り当て。
+
+利点:
+
+- 動的形状に対応
+- 利用可能メモリに適応可能
+
+欠点:
+
+- 推論中の割り当てオーバーヘッド
+- 断片化の可能性
+- 最適化が困難
+
+ほとんどの推論シナリオでは静的割り当てが好まれます。モデルアーキテクチャと典型的な入力サイズが既知なので、すべてを事前に割り当てできます。
+
+=== メモリプール
+
+各テンソル用に個別バッファを割り当てる代わりに、複数テンソルが共有する大きなバッファ——メモリプール——を使います。
+
+[source,cpp]
+----
+class MemoryPool {
+    vk::raii::Buffer buffer;
+    vk::raii::DeviceMemory memory;
+    size_t totalSize;
+    size_t usedSize;
+
+public:
+    struct Allocation {
+        size_t offset;
+        size_t size;
+    };
+
+    Allocation allocate(size_t size, size_t alignment) {
+        // Align offset
+        size_t alignedOffset = (usedSize + alignment - 1) & ~(alignment - 1);
+
+        if (alignedOffset + size > totalSize) {
+            throw std::runtime_error("Pool exhausted");
+        }
+
+        Allocation alloc = {alignedOffset, size};
+        usedSize = alignedOffset + size;
+        return alloc;
+    }
+
+    void reset() {
+        usedSize = 0;  // Reuse the entire pool
+    }
+    // RAII handles cleanup automatically
+};
+----
+
+利点:
+- Vulkan 割り当て回数の削減（オーバーヘッドあり）
+- メモリ局所性の改善
+- メモリ上限の管理が容易
+
+=== メモリ再利用
+
+重要な最適化: ライフタイムが重ならない中間テンソルのメモリを再利用することです。
+
+次のネットワーク断片を考えます。
+[source]
+----
+Layer 1: Input → Tensor A
+Layer 2: Tensor A → Tensor B
+Layer 3: Tensor B → Tensor C
+Layer 4: Tensor C → Output
+----
+
+レイヤ 2 が終われば Tensor A は不要です。Tensor C は A のメモリを再利用できます。同様に、レイヤ 4 が始まれば Tensor B は不要です。
+
+メモリ再利用アルゴリズム:
+1. モデルグラフを解析し、各テンソルのライフタイム（最初の使用から最後の使用まで）を決定
+2. ライフタイムが重ならないテンソルを見つける
+3. 重ならないテンソルを同じメモリに割り当て
+
+[source,cpp]
+----
+struct Tensor {
+    size_t size;
+    int firstUse;  // Layer index
+    int lastUse;   // Layer index
+    size_t memoryOffset;  // Assigned offset in pool
+};
+
+void assignMemory(std::vector<Tensor>& tensors, MemoryPool& pool) {
+    // Sort by first use
+    std::sort(tensors.begin(), tensors.end(),
+              [](const Tensor& a, const Tensor& b) { return a.firstUse < b.firstUse; });
+
+    // Track which memory regions are free at each layer
+    std::map<int, std::vector<size_t>> freeOffsets;
+
+    for (auto& tensor : tensors) {
+        // Try to reuse freed memory
+        bool reused = false;
+        for (auto& [layer, offsets] : freeOffsets) {
+            if (layer < tensor.firstUse) {
+                for (auto offset : offsets) {
+                    // Check if this offset has enough space
+                    // (simplified - real implementation needs more checks)
+                    tensor.memoryOffset = offset;
+                    reused = true;
+                    break;
+                }
+            }
+            if (reused) break;
+        }
+
+        if (!reused) {
+            // Allocate new memory
+            auto alloc = pool.allocate(tensor.size, 256);
+            tensor.memoryOffset = alloc.offset;
+        }
+
+        // Mark memory as free after last use
+        freeOffsets[tensor.lastUse].push_back(tensor.memoryOffset);
+    }
+}
+----
+
+深いネットワークではメモリ使用量を 5–10 倍削減できます。
+
+=== アラインメント要件
+
+Vulkan にはバッファオフセットのアラインメント要件があります。通常:
+
+- Storage バッファ: 256 バイトアラインメント（`minStorageBufferOffsetAlignment` を確認）
+- Uniform バッファ: 256 バイトアラインメント（`minUniformBufferOffsetAlignment` を確認）
+
+割り当ては常にアラインメントしてください。
+[source,cpp]
+----
+size_t alignedSize = (size + alignment - 1) & ~(alignment - 1);
+----
+
+アラインメント違反はクラッシュや未定義動作を引き起こします。
+
+== データ転送の最適化
+
+CPU と GPU 間のデータ転送は高コストです。転送を最小化し、必要な転送を可能な限り効率的に行います。
+
+=== ステージングバッファ
+
+ホストからデバイスへの転送にはステージングバッファを使います。
+
+1. ホスト可視バッファ（ステージングバッファ）を割り当て
+2. マップして CPU からデータを書き込み
+3. `vkCmdCopyBuffer` でステージングバッファからデバイスローカルバッファへコピー
+4. コンピュートシェーダでデバイスローカルバッファを使用
+
+[source,cpp]
+----
+// Create staging buffer (host-visible)
+vk::BufferCreateInfo stagingInfo{
+    .size = dataSize,
+    .usage = vk::BufferUsageFlagBits::eTransferSrc
+};
+vk::raii::Buffer stagingBuffer(device, stagingInfo);
+
+vk::MemoryAllocateInfo allocInfo{
+    .allocationSize = memRequirements.size,
+    .memoryTypeIndex = findMemoryType(
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+};
+vk::raii::DeviceMemory stagingMemory(device, allocInfo);
+stagingBuffer.bindMemory(*stagingMemory, 0);
+
+// Map and write data
+void* mapped = stagingMemory.mapMemory(0, dataSize);
+memcpy(mapped, data, dataSize);
+stagingMemory.unmapMemory();
+
+// Copy to device-local buffer
+vk::BufferCopy copyRegion{0, 0, dataSize};
+commandBuffer.copyBuffer(*stagingBuffer, *deviceBuffer, copyRegion);
+// RAII handles cleanup automatically
+----
+
+デバイスローカルメモリは頻繁にアクセスするデータにとってホスト可視メモリよりはるかに高速なので、この 2 段階プロセスは価値があります。
+
+=== 永続ステージングバッファ
+
+毎フレーム転送するデータ（入力画像など）では、ステージングバッファを割り当てたまま再利用します。
+
+[source,cpp]
+----
+class PersistentStaging {
+    vk::raii::Buffer stagingBuffer;
+    vk::raii::DeviceMemory stagingMemory;
+    void* mapped;  // Keep mapped
+
+public:
+    void initialize(const vk::raii::Device& device, size_t size) {
+        // Create and map staging buffer
+        // ... (as above)
+        mapped = stagingMemory.mapMemory(0, size);
+        // Keep mapped for the lifetime of the buffer
+    }
+
+    void upload(const void* data, size_t size) {
+        memcpy(mapped, data, size);
+        // No need to unmap/remap
+    }
+    // RAII handles cleanup automatically
+};
+----
+
+頻繁な転送の map/unmap オーバーヘッドを排除します。
+
+=== 非同期転送
+
+データアップロード用に別の転送キューを使い、転送とコンピュートを重ねます。
+
+[source,cpp]
+----
+// Frame N: Compute on GPU
+computeQueue.dispatch(...);
+
+// Frame N+1: Transfer input while Frame N computes
+commandBuffer.copyBuffer(*stagingBuffer, *deviceBuffer, ...);
+
+// Synchronize: wait for transfer before starting Frame N+1 compute
+vk::raii::Semaphore transferComplete(device, vk::SemaphoreCreateInfo{});
+transferQueue.submit(..., *transferComplete);
+computeQueue.submit(..., waitSemaphore=*transferComplete);
+----
+
+転送レイテンシを計算の裏に隠します。
+
+=== 転送の最小化
+
+最良の転送は転送なしです。
+
+*重みを GPU に保持*: 初期化時に 1 回アップロードし、毎フレームではない。
+
+*バッチ処理*: 複数入力をまとめて処理し、転送オーバーヘッドを償却。
+
+*ピンポンバッファ*: ストリーミングデータでは 2 バッファを使用。GPU がバッファ A を処理している間、CPU がバッファ B を埋めます。
+
+== 実践例: ResNet-50 のメモリ管理
+
+ResNet-50 推論のメモリ管理を walkthrough します。
+
+=== モデル分析
+
+ResNet-50 は次を持ちます。
+
+- 2500 万パラメータ（100 MB）
+- 約 50 レイヤ
+- ピーク活性化メモリ: 約 200 MB（再利用なし）
+- 再利用あり: 約 20 MB
+
+=== メモリセットアップ
+
+[source,cpp]
+----
+class ResNet50Memory {
+    // Weights (persistent)
+    vk::raii::Buffer weightsBuffer;
+    vk::raii::DeviceMemory weightsMemory;
+
+    // Activation pool (reused across layers)
+    vk::raii::Buffer activationBuffer;
+    vk::raii::DeviceMemory activationMemory;
+
+    // Staging for input
+    vk::raii::Buffer inputStagingBuffer;
+    vk::raii::DeviceMemory inputStagingMemory;
+    void* inputMapped;
+
+public:
+    void initialize(const vk::raii::Device& device) {
+        // Allocate weights (100 MB, device-local)
+        createBuffer(device, 100 * 1024 * 1024,
+                     vk::BufferUsageFlagBits::eStorageBuffer,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal,
+                     weightsBuffer, weightsMemory);
+
+        // Allocate activation pool (20 MB with reuse, device-local)
+        createBuffer(device, 20 * 1024 * 1024,
+                     vk::BufferUsageFlagBits::eStorageBuffer,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal,
+                     activationBuffer, activationMemory);
+
+        // Allocate input staging (224*224*3*4 bytes = ~600 KB, host-visible)
+        createBuffer(device, 224 * 224 * 3 * sizeof(float),
+                     vk::BufferUsageFlagBits::eTransferSrc,
+                     vk::MemoryPropertyFlagBits::eHostVisible |
+                     vk::MemoryPropertyFlagBits::eHostCoherent,
+                     inputStagingBuffer, inputStagingMemory);
+
+        inputMapped = inputStagingMemory.mapMemory(0, VK_WHOLE_SIZE);
+    }
+
+    void uploadInput(const float* imageData, size_t size) {
+        memcpy(inputMapped, imageData, size);
+    }
+
+    const vk::raii::Buffer& getWeightsBuffer() { return weightsBuffer; }
+    const vk::raii::Buffer& getActivationBuffer() { return activationBuffer; }
+    // RAII handles cleanup automatically
+};
+----
+
+=== テンソルオフセット
+
+各レイヤのテンソルは活性化バッファ内のオフセットに割り当てられます。
+
+[source,cpp]
+----
+struct LayerTensors {
+    size_t inputOffset;
+    size_t outputOffset;
+    size_t weightsOffset;
+};
+
+std::vector<LayerTensors> layerTensors(50);
+
+// Assign offsets (simplified)
+size_t activationOffset = 0;
+size_t weightsOffset = 0;
+
+for (int i = 0; i < 50; i++) {
+    layerTensors[i].weightsOffset = weightsOffset;
+    weightsOffset += layerWeightSizes[i];
+
+    layerTensors[i].inputOffset = activationOffset;
+    layerTensors[i].outputOffset = activationOffset + layerInputSizes[i];
+
+    // Reuse memory after a few layers
+    if (i > 2) {
+        activationOffset = layerTensors[i-2].inputOffset;  // Reuse old input
+    } else {
+        activationOffset += layerInputSizes[i] + layerOutputSizes[i];
+    }
+}
+----
+
+再利用付きでオフセットを割り当て、総メモリを低く保ちます。
+
+== まとめ
+
+効果的なデータ管理はニューラルネットワーク推論の性能に crucial です。
+
+*テンソルレイアウト*（NCHW 対 NHWC）はメモリアクセスパターンに影響します。操作とハードウェアに基づいて選択してください。
+
+*メモリ割り当て* は可能な限り静的にし、効率のためメモリプールを使います。
+
+*メモリ再利用* は重ならないテンソル間でメモリを共有し、メモリ要件を劇的に削減します。
+
+*データ転送* は最小化し、ステージングバッファ、永続マッピング、非同期転送で最適化します。
+
+*アラインメント* 要件を守り、クラッシュと未定義動作を避けます。
+
+効率的なデータ管理により、コンピュートシェーダが必要なデータを必要なときに、メモリや帯域幅を無駄にせず利用できます。次章では同期——操作が正しい順序で実行されることの保証——を扱います。
+
+xref:ML_Inference/Vulkan_Compute_for_ML/04_matrix_operations.adoc[前へ: 行列演算] | xref:ML_Inference/Vulkan_Compute_for_ML/06_synchronization.adoc[次へ: 同期]

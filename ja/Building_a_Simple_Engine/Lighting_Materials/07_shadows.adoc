@@ -1,0 +1,206 @@
+= 影: Ray Query 統合
+
+影は地面の暗い染み以上のものです。3D 空間の知覚に基本的な役割を果たします。オブジェクトの位置・形状・スケール、およびそれらを照らす光源の性質について重要な視覚的手がかりを提供します。この節では、単純な「平坦な」ライティングから、**Vulkan Ray Query** を使ったハードウェア加速シャドウを実装し、よりリアルなモデルへ進みます。
+
+== 影の理解
+
+物理世界では、不透明なオブジェクトが光源から表面への光の経路を遮るときに影が生じます。コンピュータグラフィックスでこれをシミュレートするには、**可視性問題**を解く必要があります。表面上の任意の点について、光源への遮られない視線があるか？
+
+=== 影の解剖学
+
+現実世界の光源は、無限小の点であることは稀です。光には物理的なサイズ（エリアライト）があるため、影はしばしば 2 つの明確な領域から成ります。
+
+*   **本影（Umbra）**: 光源が完全に遮蔽された、影の最も暗い部分。
+*   **半影（Penumbra）**: 光源が部分的にしか遮蔽されない、影の「柔らかい」縁。
+
+初期実装は「ハード」シャドウ（点が影の中か完全に照らされているかのいずれか）に焦点を当てますが、ここで使う技法は、光を点ではなく面積としてサンプリングすることで高度な**ソフトシャドウ**をサポートします。
+
+=== シャドウマッピング対レイトレースシャドウ
+
+何十年もの間、**シャドウマッピング**が業界標準でした。光の視点からシーンの深度をテクスチャにレンダリングし、メインのレンダーパスで距離を比較します。しかしシャドウマッピングには大きな課題があります。
+
+*   **解像度とエイリアシング**: シャドウマップの解像度が低すぎると、影が「ブロック状」に見えることがあります。
+*   **バイアス問題**: *shadow acne*（自己シャドウ）と *peter-panning*（影がオブジェクトから離れる）を防ぐ適切な「バイアス」を見つけるのは絶え間ない苦労です。
+*   **メモリオーバーヘッド**: 各光源が独自の深度テクスチャを必要とします。
+
+**レイトレーシング（Ray Query）**は、精密な幾何交差を行うことでこれらの問題を解決します。低解像度テクスチャを調べる代わりに、GPU に「点 A と点 B の間でこのレイはいずれかの三角形に当たるか？」と尋ねます。その結果、ピクセルパーフェクトな精度が得られ、多数の深度マップを管理せずに複数のライト種別（ポイント、スポット、ディレクショナル）の扱いが単純化されます。
+
+== レイトレーシングの基礎
+
+レイトレーシングを効率的に行うには、ピクセルごとにシーン内のすべての三角形をループするわけにはいきません。代わりに**アクセラレーション構造**を使います。
+
+1.  **Bottom-Level Acceleration Structure（BLAS）**: 単一メッシュの生ジオメトリ（頂点とインデックス）を格納します。単一オブジェクト向けの空間インデックスと考えてください。
+2.  **Top-Level Acceleration Structure（TLAS）**: BLAS の*インスタンス*を含みます。各インスタンスは独自の変換行列を持ち、同じメッシュを最小のメモリオーバーヘッドでワールド内に複数回配置できます。
+
+=== 要件とセットアップ
+
+Ray Query にはハードウェアサポートと特定の Vulkan 拡張が必要です。エンジンでは、デバイス作成時にこれらが有効であることを保証します。
+
+*   `VK_KHR_acceleration_structure`
+*   `VK_KHR_ray_query`
+
+=== アクセラレーション構造の構築
+
+エンジンでは、`renderer_ray_query.cpp` の `Renderer::buildAccelerationStructures` メソッドが作成を担当します。一意のメッシュごとに 1 つの BLAS を構築し、それらを参照する TLAS を作ります。
+
+[source,cpp]
+----
+bool Renderer::buildAccelerationStructures(const std::vector<Entity *> &entities)
+{
+    // 1. Create BLAS for each unique mesh
+    for (auto &mesh : uniqueMeshes) {
+        buildBlas(mesh); // Compiles mesh data into a GPU-optimized format
+    }
+
+    // 2. Create TLAS by instancing BLASs
+    std::vector<vk::AccelerationStructureInstanceKHR> instances;
+    for (auto &entity : entities) {
+        auto mesh = entity->getComponent<MeshComponent>();
+        auto transform = entity->getComponent<TransformComponent>();
+
+        vk::AccelerationStructureInstanceKHR instance{};
+        instance.transform = toVkTransform(transform->getMatrix());
+        instance.accelerationStructureReference = getBufferDeviceAddress(mesh->blas.buffer);
+        instance.mask = 0xFF; // Allows filtering objects during ray tests
+        instances.push_back(instance);
+    }
+    buildTlas(instances);
+
+    return true;
+}
+----
+
+== シェーダーでの Ray Query 実装
+
+TLAS を構築してディスクリプタセットにバインドしたら、PBR フラグメントシェーダー（`pbr.slang`）で直接可視性テストを実行できます。
+
+=== 可視性テスト
+
+ヘルパー関数 `traceShadowOccluded` を実装します。`RayQuery` オブジェクトを初期化し、レイをトレースし、光に到達する前にジオメトリに当たるかを調べます。
+
+[source,slang]
+----
+[[vk::binding(11, 0)]] RaytracingAccelerationStructure tlas;
+
+static const float RASTER_SHADOW_EPS = 0.002;
+
+bool traceShadowOccluded(float3 origin, float3 direction, float tMin, float tMax)
+{
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = tMin;
+    ray.TMax = tMax;
+
+    RayQuery<RAY_FLAG_NONE> q;
+    q.TraceRayInline(
+        tlas,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, // Optimization: any hit is enough to shadow
+        0xFF,
+        ray
+    );
+
+    while (q.Proceed()) {
+        // q.Proceed() steps through potential hits.
+        // For simple opaque shadows, we don't need logic here.
+    }
+
+    return (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT);
+}
+----
+
+=== PBR ライティングとの統合
+
+メインのライティングループでは、ライトの寄与を加算する前に遮蔽状態を判定します。
+
+[source,slang]
+----
+// Inside the fragment shader lighting loop
+float3 L = normalize(light.position.xyz - input.WorldPos);
+float distToLight = length(light.position.xyz - input.WorldPos);
+
+// Important: Move the origin slightly along the normal to prevent the ray
+// from immediately hitting the surface it started from.
+float3 shadowOrigin = input.WorldPos + N * RASTER_SHADOW_EPS;
+
+bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, distToLight);
+
+if (!occluded) {
+    // Add diffuse and specular contributions if not in shadow
+    directLighting += calculatePBR(L, V, N, ...);
+}
+----
+
+== ハードシャドウからソフトシャドウへ
+
+エンジンの `ray_query.slang` における Ray Query 実装は、単純なハードシャドウを超え、**確率的ソフトシャドウ**を実装します。光を単一点として扱う代わりに、定義された半径を持つエリアライトとして扱います。
+
+=== エリアライト近似
+
+各シャドウレイについてライト位置をジッターすることでエリアライトをシミュレートします。安定した乱数生成器とディスクサンプリングを使い、光源の「半径」内のランダムな点を選びます。
+
+[source,slang]
+----
+// Generate a random sample on a disk to simulate light area
+float2 diskSample = rqSampleDisk(rngState);
+float3 samplePos = lightPos + (T * diskSample.x + B * diskSample.y) * lightRadius;
+
+float3 L = normalize(samplePos - worldPos);
+float distToLight = length(samplePos - worldPos);
+
+// Trace a ray toward the sampled point on the light
+bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, distToLight);
+----
+
+=== 複数サンプルの平均化
+
+エリアライト上の異なる点へ複数のレイ（`shadowSampleCount`）をトレースして結果を平均することで、照らされた領域と影の領域の間の滑らかな遷移（半影）を作ります。
+
+[source,slang]
+----
+float visibilityAcc = 0.0;
+for (int i = 0; i < shadowSampleCount; ++i) {
+    // ... calculate jittered L ...
+    visibilityAcc += traceShadowOccluded(...) ? 0.0 : 1.0;
+}
+float finalVisibility = visibilityAcc / float(shadowSampleCount);
+
+// Use visibility to scale the light's contribution
+directLighting += calculatePBR(...) * finalVisibility;
+----
+
+== 課題とベストプラクティス
+
+1.  **自己シャドウ（Acne）**: レイトレーシングでも、浮動小数点精度によりレイが開始した三角形自身に当たることがあります。常に小さな `EPSILON` オフセットまたは `TMin` 値を使ってください。
+2.  **アルファマスキングと透過性**: 葉やガラスでは、単純な二値ヒットテストでは不十分です。エンジンは次のように扱います。
+    *   **手動アルファテスト**: `while(q.Proceed())` ループ内でマテリアルのテクスチャを取得し、透明なヒットを破棄します。
+    *   **透過バイパス**: ガラスのような特定マテリアルをシャドウレイで非遮蔽としてフラグ付けし、真っ黒な影を落とさないようにできます。
+3.  **パフォーマンス**: レイトレーシングはコストが高いです。Ray Query は単純な可視性ではフルレイトレーシングパイプラインより速いですが、それでもコストは増えます。高性能シナリオでは次を検討してください。
+    *   **デノイジング**: ソフトシャドウに複数レイを使う場合、粒状感を消すデノイザーが必要になります。
+    *   **カリング**: 遠すぎる、または表面の背後にあるライトにはレイをトレースしない。
+
+== 要約と比較
+
+Ray Query は、モダンなエンジンで影を実装する強力で柔軟な方法を提供します。ハードウェアサポートが必要ですが、従来のシャドウマッピングに対して大きな利点があります。
+
+[cols="1,2,2"]
+|===
+| 機能 | シャドウマッピング | Ray Query
+
+| **精度** | テクスチャ解像度に制限（エイリアシング） | ピクセルパーフェクト（幾何交差）
+| **複雑さ** | 高い（バイアス、複数ライト管理） | 低い（直接可視性テスト）
+| **メモリ** | 高い（ライトごとの深度マップ） | 低い（アクセラレーション構造）
+| **ソフトシャドウ** | 複雑（PCSS、ブラー） | ネイティブ（エリアライトサンプリング）
+|===
+
+== 次のステップと参考資料
+
+影は深いトピックです。Ray Query で基本的およびソフトな影を実装する方法を理解した今、より高度な領域を探索できます。
+
+*   **PCSS（Percentage Closer Soft Shadows）**: 可変半影シャドウ（遮蔽物からの距離が増すにつれて影が柔らかくなる）向けのラスタベース技法。
+*   **Ambient Occlusion（RTAO）**: 法線周りの半球にレイをトレースし、点に届く環境光の量をレイトレーシングで計算します。
+*   **Vulkan Ray Tracing Tutorial**: link:https://nvpro-samples.github.io/vk_raytracing_tutorial_KHR/[NVIDIA Vulkan Ray Tracing Tutorial] は、これらの拡張を深く掘り下げる優れたリソースです。
+
+次の章では、これらのライティングとシャドウパラメータをリアルタイムで制御する Graphical User Interface（GUI）の追加方法を見ます。
+
+xref:Building_a_Simple_Engine/Lighting_Materials/05_vulkan_integration.adoc[前へ: Vulkan 統合] | xref:Building_a_Simple_Engine/Lighting_Materials/06_conclusion.adoc[次へ: まとめ]

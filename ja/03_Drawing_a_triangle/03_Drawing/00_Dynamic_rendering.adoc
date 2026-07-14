@@ -1,0 +1,87 @@
+:pp: {plus}{plus}
+
+= ダイナミックレンダリング
+
+以前のバージョンのVulkanでは、イメージビューをレンダーパスにバインドするためにフレームバッファを作成する必要がありました。しかし、Vulkan 1.3でダイナミックレンダリングが導入されたことで、フレームバッファやレンダーパスを作成せずにイメージビューへ直接レンダリングできるようになりました。
+
+== ダイナミックレンダリング入門
+
+ダイナミックレンダリングは、レンダーパスとフレームバッファオブジェクトの必要性をなくすことでレンダリング処理を単純化します。代わりに、レンダリングを開始するときにカラー、深度、ステンシルアタッチメントを直接指定できます。
+
+このアプローチにはいくつかの利点があります。
+- 管理するオブジェクトが少なくなりコードが単純になる
+- レンダリング中にアタッチメントを変える柔軟性が高い
+- 現代的なレンダリング手法との互換性が良い
+
+実際にどう動くか見てみましょう。アタッチメントとレンダリングパラメータの指定には、`vk::RenderingAttachmentInfo`と`vk::RenderingInfo`構造体を使います。
+
+== ダイナミックレンダリングでのコマンドバッファ記録
+
+次の章ではコマンドバッファを作成し、レンダリングコマンドを記録します。ダイナミックレンダリングの使い方のプレビューは次のとおりです。
+
+[,c++]
+----
+void recordCommandBuffer(uint32_t imageIndex)
+{
+    commandBuffer.begin({});
+
+    // Transition the image layout for rendering
+    transition_image_layout(
+        imageIndex,
+        vk::ImageLayout::eUndefined,
+        vk::ImageLayout::eColorAttachmentOptimal,
+        {},
+        vk::AccessFlagBits2::eColorAttachmentWrite,
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput
+    );
+
+    // Set up the color attachment
+    vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
+    vk::RenderingAttachmentInfo attachmentInfo = {
+		    .imageView   = swapChainImageViews[imageIndex],
+		    .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		    .loadOp      = vk::AttachmentLoadOp::eClear,
+		    .storeOp     = vk::AttachmentStoreOp::eStore,
+		    .clearValue  = clearColor};
+
+    // Set up the rendering info
+    vk::RenderingInfo renderingInfo = {
+		    .renderArea           = {.offset = {0, 0}, .extent = swapChainExtent},
+		    .layerCount           = 1,
+		    .colorAttachmentCount = 1,
+		    .pColorAttachments    = &attachmentInfo};
+
+    // Begin rendering
+    commandBuffer.beginRendering(renderingInfo);
+
+    // Rendering commands will go here
+
+    // End rendering
+    commandBuffer.endRendering();
+
+    // Transition the image layout for presentation
+    transition_image_layout(
+        imageIndex,
+        vk::ImageLayout::eColorAttachmentOptimal,
+        vk::ImageLayout::ePresentSrcKHR,
+        vk::AccessFlagBits2::eColorAttachmentWrite,
+        {},
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits2::eBottomOfPipe
+    );
+
+    commandBuffer.end();
+}
+----
+
+ご覧のとおり、`vk::RenderingAttachmentInfo`構造体でレンダリング先のイメージビューを直接指定します。レンダーパスで行うのと同様に、ロードとストアの操作も指定します。`vk::RenderingInfo`構造体が、これを他のレンダリングパラメータと組み合わせます。
+
+このアプローチではフレームバッファやレンダーパスを作成する必要がなく、コードが単純になり柔軟性も増します。
+
+xref:./01_Command_buffers.adoc[次の章]では、コマンドバッファを作成し、ダイナミックレンダリングを使って最初の実際の描画コマンドを書きます。
+
+link:/attachments/14_command_buffers.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

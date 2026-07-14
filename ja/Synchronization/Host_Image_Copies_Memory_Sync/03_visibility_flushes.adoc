@@ -1,0 +1,58 @@
+:pp: {plus}{plus}
+= 可視性とフラッシュ: コヒーレンシを極める
+
+== ホスト–デバイス同期の理解
+
+**Host Image Copies** を使うとき、本質的には CPU と GPU 間の直接メモリコピーを行っています。これは非常に効率的ですが、新しい種類の同期課題を導入します。ホスト（CPU）で書いたデータが、GPU が使い始める前に **見える（visible）** こと、およびホストコピーを始める前に先行する GPU 作業が **利用可能（available）** であることを保証しなければなりません。
+
+**Synchronization 2** の世界では、これを表現するために `vk::MemoryBarrier2` を使います。もはや二つの異なる GPU ステージを同期しているのではなく、ホストとデバイスを同期しています。
+
+== ホストからデバイスへの依存
+
+最も一般的なケースは **ホストからデバイスへ** の依存です。CPU でデータを書き、次に GPU にシェーダで読ませたい。そのためには、`srcStageMask = vk::PipelineStageFlagBits2::eHost`、`dstStageMask` をイメージが読まれるシェーダステージに設定したバリアを使います。
+
+[,cpp]
+----
+auto hostToDeviceBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eHost,
+    .srcAccessMask = vk::AccessFlagBits2::eHostWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    .oldLayout = vk::ImageLayout::eGeneral,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .image = gpuImage.image(),
+    .subresourceRange = subresourceRange
+};
+
+commandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &hostToDeviceBarrier});
+----
+
+`eHost` ステージマスクは特別なフラグで、GPU にこう伝えます。「このデータは CPU 上で更新された。フラグメントシェーダが読み取りを始める前に、すべての CPU 書き込みが見えるようにせよ。」
+
+== デバイスからホストへの依存
+
+逆のケースは **デバイスからホストへ** の依存——例えばスクリーンショットを撮るときです。CPU がホストコピーを始める前に、GPU がレンダリングを終えたことを保証しなければなりません。そのためには、適切な GPU ステージをソース、`eHost` を宛先とするバリアを記録します。
+
+[,cpp]
+----
+auto deviceToHostBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+    .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .newLayout = vk::ImageLayout::eGeneral,
+    .image = gpuImage.image(),
+    .subresourceRange = subresourceRange
+};
+
+commandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &deviceToHostBarrier});
+----
+
+バリアに加え、`device.copyImageToMemoryEXT` を呼ぶ前に、バリアを含むコマンドバッファが GPU 上で実際に実行を終えたことを保証するため、CPU 側で **フェンス** または **タイムラインセマフォ** も使わなければなりません。
+
+これらのホスト–デバイスハンドシェイクを極めることで、極めて速くかつ完璧に堅牢なレンダラを構築でき、エンジンのメモリを管理する強力な新しい道具が得られます。このシリーズの最後の章では、最新の Vulkan ツールを使ってこれらの複雑な同期パターンをどうデバッグし最適化するかを見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Host_Image_Copies_Memory_Sync/02_cpu_to_image_access.adoc[直接の CPU からイメージへのアクセス] | 次へ: xref:Synchronization/Synchronization_Validation/01_introduction.adoc[同期バリデーションによるデバッグ]

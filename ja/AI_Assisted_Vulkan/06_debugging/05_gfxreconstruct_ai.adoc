@@ -1,0 +1,119 @@
+:pp: {plus}{plus}
+
+= AI 支援トレース分析: GFXReconstruct
+
+== はじめに: 真実のストリーム
+
+**RenderDoc** は「凍ったフレーム」の達人ですが、木を見て森を見ないことがあります。多くの Vulkan バグ——特に同期ハザード、リソースライフサイクル問題、ドライバ固有退行——は複数フレームにわたって、または初期化フェーズ中に起きます。
+
+**GFXReconstruct** は、Vulkan API 呼び出しのストリームをキャプチャして再生する決定的ツールです。最初の `vkCreateInstance` から最終の `vkDestroyDevice` まで、GPU へ送られたすべてのコマンドを記録できます。この「真実のストリーム」を AI アシスタントの推論力と組み合わせることで、数ギガバイトのトレースファイルを **検索可能で監査済みの知識ベース** へ変えます。
+
+== なぜ AI + GFXReconstruct か？
+
+**協調エンジニアリング** では、GFXReconstruct が生データを提供し、AI が **アーキテクチャ監査** を提供します。トレースには何百万もの呼び出しが含まれ得ます。AI はそのストリームを「見て」次を特定できます。
+
+*   **初期化ハザード:** ターゲットハードウェアでサポートされていない拡張を有効にしたか？ AI は `gfxrecon-info` 出力を `vk.xml` レジストリコンテキストとクロス参照できる。
+*   **リソースライフサイクル監査:** コマンドバッファ内の最後の使用前にバッファを破棄しているか？ AI はトレースの「JSON 変換」をパースし、オブジェクトが無効になった正確な呼び出しシーケンスを見つけられる。
+*   **ドライバ退行分析:** あるドライバではトレースが動き、別のドライバでは失敗する場合、AI はあるドライバが他より寛容な「未定義動作」をトレースで監査できる。
+
+== チュートリアル: トレース監査ワークフロー
+
+**Goose** のような AI エージェントで GFXReconstruct を真に活用するには、バイナリトレースをエージェントが推論できる形式——**JSON**——へ変換しなければなりません。
+
+自動化されたトレース監査を実行する次のステップに従ってください。
+
+1.  **トレースのキャプチャ:**
+    GFXReconstruct レイヤを有効にしてアプリを実行。
++
+[source,bash]
+----
+# On Windows/Linux
+vkconfig # Use the GUI to enable GFXReconstruct
+# OR use environment variables
+VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_gfxreconstruct ./VulkanApp
+----
++
+これにより `vulkan_capture_20260313_174700.gfxr` のようなファイルが生成されます。
+
+2.  **構造化 JSON へ変換:**
+    `gfxrecon-convert` ツールを使い、バイナリトレースを構造化テキスト形式へ変換。長いトレースでは、「コンテキストウィンドウ」制限を避けるため特定フレーム範囲でフィルタすべきです。
++
+[source,bash]
+----
+# Convert frames 100 to 110 to JSON
+gfxrecon-convert --to-json --frames 100-110 capture.gfxr capture_frames.json
+----
+
+3.  **エージェンティック監査:**
+    Goose セッションで、特定の論理ハザードについて JSON を監査するようアシスタントにタスクを与える。
++
+[source,text]
+----
+Goose, I have converted a GFXReconstruct trace to JSON.
+Analyze 'capture_frames.json' and find all 'vkCmdPipelineBarrier' calls.
+Compare the 'oldLayout' and 'newLayout' of the 'GBuffer_Diffuse' image.
+Is there any point where we are transitioning FROM 'UNDEFINED'
+after the first frame? If so, this is a redundant clear hazard.
+----
+
+== 高度: GFXReconstruct MCP サーバの構築
+
+アシスタントを真に「ハードウェア認識」かつ「トレース認識」にするには、GFXReconstruct CLI をラップするカスタム **MCP サーバ** を構築できます。これにより、シェルコマンドを手動実行せずに AI がトレースファイルを直接「照会」できます。
+
+以下は MCP SDK を使った **GFXReconstruct-Connector** の Python 実装です。
+
+[source,python]
+----
+import subprocess
+import json
+from mcp.server import McpServer
+
+# Initialize the server
+server = McpServer("GFXReconstruct-Connector")
+
+@server.tool()
+def get_trace_info(file_path: str):
+    """Prints hardware and extension requirements for a .gfxr trace."""
+    result = subprocess.run(
+        ["gfxrecon-info", file_path],
+        capture_output=True, text=True
+    )
+    return result.stdout
+
+@server.tool()
+def extract_frame_json(file_path: str, frame_range: str):
+    """Extracts a range of frames (e.g., '10-15') from a trace to JSON."""
+    output_file = "temp_audit.json"
+    subprocess.run([
+        "gfxrecon-convert", "--to-json",
+        "--frames", frame_range,
+        file_path, output_file
+    ])
+    with open(output_file, "r") as f:
+        return f.read(50000) # Return the first 50k chars for reasoning
+
+if __name__ == "__main__":
+    server.run()
+----
+
+このサーバを `goose/config.yaml` に登録することで、エージェントはトレースを **自己診断** する能力を得ます。単に次のように言えます。*「Goose、『crash.gfxr』のハードウェア要件を分析し、M4 Max GPU で欠けている拡張を使っているか教えて。」*
+
+== 実世界体験: 「Undefined」レイアウトハザード
+
+エンジンを Windows（NVIDIA）から Android（Qualcomm）へ移植しているところを想像してください。Windows ではエンジンは完璧に動きます。Android ではシャドウマップにランダムな「ちらつき」が見えます。
+
+=== 手動の試み
+1 日かけてバリアを確認します。すべてが *正しく見える*。ドライババグを疑いますが、証拠がありません。
+
+=== AI + GFXReconstruct ソリューション
+トレースをキャプチャし、エージェントにタスクを与えます。*「すでに有効なデータを含むリソースで『oldLayout』として『VK_IMAGE_LAYOUT_UNDEFINED』を使う『VkImageMemoryBarrier』をトレースから分析して。」*
+
+AI は **GFXReconstruct MCP ツール** を使い呼び出しをスキャンします。「Cascaded Shadow Map」パスで、2 番目のカスケード向けにレイアウトを誤って `UNDEFINED` にリセットし、実質的に最初のカスケードのデータを破棄していることを見つけます。NVIDIA ではドライバが未定義遷移を無視して「救って」くれていました。Qualcomm ではタイルベースレンダラが（正しく）タイルメモリを破棄していました。
+
+**結果:** AI はバグを見つけるだけではなく、論理が誤っていた `ShadowRenderer.cpp` の特定行を特定し、修正を提供します。`oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`。
+
+== まとめ: 物語のキャプチャ
+
+GFXReconstruct は AI アシスタントに **タイムラインコンテキスト** を与えます。RenderDoc の単一フレームスナップショットを超えることで、AI がエンジンの **物語**——どう始まり、どう割り当て、時間とともにどう失敗するか——について推論できるようにします。これがプロの **協調エンジニアリング** ワークフローの印です。
+
+次へ: xref:AI_Assisted_Vulkan/07_advanced_mcp/01_introduction.adoc[高度な MCP ツーリングと自動化]

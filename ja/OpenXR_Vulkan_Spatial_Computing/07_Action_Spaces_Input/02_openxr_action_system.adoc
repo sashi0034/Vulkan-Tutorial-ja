@@ -1,0 +1,85 @@
+:pp: {plus}{plus}
+= OpenXR アクションシステム
+
+OpenXR 入力システムは 3 つのコア概念——**アクションセット**、**アクション**、**インタラクションプロファイル**——の周りに構築されています。エンジンのロジックを物理ハードウェアから分離することで、広大なコントローラエコシステム全体でアプリケーションが堅牢であり続けることを保証します。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+アクションベースシステムで入力を定義することは、OpenXR における必須のアーキテクチャパターンです。OpenXR エコシステムがサポートする多様なコントローラでアプリケーションを動かせるよう、これらの抽象を使わなければなりません。
+
+== ハードウェア抽象レイヤー: アクションで考える
+
+レガシー入力システムでは `if (buttonA.isPressed()) { jump(); }` のようなコードを書くかもしれません。ハードウェアが大きく異なる XR では、これは脆いアプローチです。OpenXR は **アクションベース** モデルを使います。ボタンを探す代わりに、エンジンはユーザーが *できること* を定義します。
+
+1.  **アクションを定義**: 「『Jump』というアクションが必要だ。」
+2.  **型を割り当て**: ブール（オン／オフ）、フロート（アナログトリガー）、ポーズ（手の位置）のどれか？
+3.  **バインディングを提案**: XR ランタイムが可能な限り最後の秒で変換を処理し、エンジンに統一されたイベントストリームを渡す。
+
+ランタイムが `/user/hand/right/input/grip/pose` のようなパスを物理センサーへ解決する変換レイヤーとして働く一方、エンジンは意図に集中し続けます。
+
+== 1. アクションセット: 文脈依存入力
+
+**アクションセット** は関連アクションのコンテナです。これにより、ユーザーがしていること（例: 「Gameplay」vs. 「Menu」）に基づき入力グループを有効／無効にできます。
+
+[source,cpp]
+----
+// 1. Create an Action Set using designated initializers
+XrActionSetCreateInfo actionSetInfo{
+    .type = XR_TYPE_ACTION_SET_CREATE_INFO,
+    .actionSetName = "gameplay",
+    .localizedActionSetName = "Main Gameplay",
+    .priority = 0
+};
+XrActionSet gameplayActionSet;
+xrCreateActionSet(instance, &actionSetInfo, &gameplayActionSet);
+----
+
+== 2. アクション: 意図の定義
+
+アクションセット内で、個々の **アクション** を定義します。
+
+[source,cpp]
+----
+// 2. Create a Pose Action for hand tracking
+XrActionCreateInfo actionInfo{
+    .type = XR_TYPE_ACTION_CREATE_INFO,
+    .actionName = "hand_pose",
+    .actionType = XR_ACTION_TYPE_POSE_INPUT,
+    .localizedActionName = "Hand Pose"
+};
+XrAction handPoseAction;
+xrCreateAction(gameplayActionSet, &actionInfo, &handPoseAction);
+----
+
+== 3. インタラクションプロファイル: マップの提案
+
+最後に、既知のコントローラ種別向けに「提案バインディング」を提供します。
+
+[source,cpp]
+----
+// 3. Map the action to a specific controller path using designated initializers
+std::vector<XrActionSuggestedBinding> bindings = {
+    { .action = handPoseAction, .binding = xrPathToString(instance, "/user/hand/right/input/grip/pose") }
+};
+
+XrInteractionProfileSuggestedBinding profileBinding{
+    .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+    .interactionProfile = xrPathToString(instance, "/interaction_profiles/oculus/touch_controller"),
+    .countSuggestedBindings = static_cast<uint32_t>(bindings.size()),
+    .suggestedBindings = bindings.data()
+};
+xrSuggestInteractionProfileBindings(instance, &profileBinding);
+----
+
+== 発展: GPU ベース入力フィルタリングと触覚合成
+
+Vulkan では、OpenXR 標準がネイティブに提供しない複雑な入力ロジックを実装できます。
+
+*   **GPU ベース入力フィルタリング**: Vulkan の **コンピュートシェーダー** を使い、OpenXR からの高周波ポーズデータストリームを処理し、ノイズ低減やジェスチャ意図予測などのリアルタイム信号解析を GPU 上で直接行い、最大の応答性を得られます。
+*   **物理駆動ハプティクス**: OpenXR のハプティクスは単純な振動コマンドですが、Vulkan の **ストレージバッファ** を使い、シェーダーで複雑で物理駆動の触覚波形を生成してランタイムへストリームし、視覚効果と物理フィードバックのよりタイトなリンクを作れます。
+
+TIP: 詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#input[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/07_Action_Spaces_Input/01_introduction.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/07_Action_Spaces_Input/03_space_manifolds.adoc[次へ]

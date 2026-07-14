@@ -1,0 +1,88 @@
+:pp: {plus}{plus}
+
+= シェーダデバッグとログ解析: 針を見つける
+
+== はじめに: グラフィックスのノイズ
+
+Vulkan はノイズの多い API です。2,000 ページの仕様、1 万行の API ログ、単一フラグメントシェーダ内の何千もの変数の間で、バグの「針」を見つけることはしばしば「ノイズ」をフィルタリングする問題です。
+
+**協調エンジニアリング** では、AI を高精度フィルタとして使います。シェーダ論理についての推論であれ、巨大な API ダンプの解析であれ、AI はデジタルふるいとして働き、肉眼では見えない異常を捕まえます。
+
+== チュートリアル: ログ診断スクリプトの構築
+
+「干し草の中の針」検索を自動化するには、API ダンプをキャプチャしアーキテクチャ監査のため **Goose** に渡す単純な Bash スクリプトを使えます。
+
+=== ステップ 1: API ダンプのキャプチャ
+`VK_LAYER_LUNARG_api_dump` レイヤを有効にし、出力をファイルへリダイレクトします。Linux または Windows では環境変数経由で行えます。
+
+[source,bash]
+----
+# Run your application with API dumping enabled
+VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_api_dump ./VulkanApp > api_dump.txt
+----
+
+=== ステップ 2: エージェンティック診断スクリプト
+エージェントにログコンテキストと特定の「パターンマッチ」指示を与えるスクリプト `diagnose_logs.sh` を作成します。
+
+[source,bash]
+----
+#!/bin/bash
+# diagnose_logs.sh
+
+# 1. Collect the last 5000 lines of the API dump
+LOG_CONTEXT=$(tail -n 5000 api_dump.txt)
+
+# 2. Command Goose to find synchronization hazards
+goose session --instruction "
+Analyze this Vulkan API dump:
+$LOG_CONTEXT
+
+Find any 'vkCmdDispatch' followed by a 'vkCmdDraw' where
+the output image of the dispatch is used as a texture
+in the draw call. Check if there is an intervening
+'vkCmdPipelineBarrier'. If not, propose the correct
+barrier parameters for 'VkImageMemoryBarrier2'.
+"
+----
+
+=== ステップ 3: 「ゴースト」アーティファクトの解決
+監査でエージェントは、行 8,452 でブルームシェーダへのディスパッチを記録したが、最終合成ドローの前にバリアを忘れていたことを特定します。バグは GPU が重い負荷の下にあるときだけ現れ、手動で見つけるのが難しかった理由です。エージェントにログを与えることで、検索を「手動スクレイプ」から「パターンマッチ診断」へ変えます。
+
+== チュートリアル: シェーダ論理シミュレーション
+
+シェーダのデバッグは悪名高いほど困難です。C{pp} と異なり、ブレークポイントを設定できません。しかし **Goose** を使い、単一フラグメントの論理を「シミュレート」できます。
+
+=== ステップ 1: フラグメントデータの抽出
+RenderDoc を使い失敗ピクセルを見つけ、その入力変数（例: `prevCoord`、`currentDepth`、`motionVector`）を抽出します。
+
+=== ステップ 2: シミュレーションプロンプト
+値と HLSL/Slang ソースコードをアシスタントに提供します。
+
+[source,text]
+----
+Goose, simulate our 'TemporalAA.hlsl' logic for this fragment.
+INPUTS:
+prevCoord: [0.45, 0.67]
+currentDepth: 0.892
+motionVector: [0.001, -0.002]
+
+Based on our 'historyRejection' threshold of 0.05,
+why is this pixel flickering?
+Is our motion vector scaling correctly for 4K resolution?
+----
+
+=== ステップ 3: 発見
+AI はデプス差を計算し、コード内のリジェクション閾値を確認し、モーションベクトルスケーリングが誤った解像度を使っていること——手動で計算するのに何時間もかかったであろう小さな数学エラー——を特定します。
+
+== まとめ: 精密デバッグとログ分析
+
+シェーダ推論とログ解析は、プロレベルデバッグの「ラストマイル」です。Vulkan のロギングレイヤとデバッガが生成する大量のデータを処理するために AI を使うことで、**情報過負荷** を **実行可能な知能** へ変えます。
+
+セクション 6 の完了により、完全な AI 強化法医ラボを構築しました。
+1.  **構文的証拠（VUID）:** 翻訳されオートフィックス済み。
+2.  **状態の証拠（RenderDoc）:** プログラマティックに監査済み。
+3.  **論理的証拠（シェーダとログ）:** フィルタリングされ推論済み。
+
+次のセクションでは **高度な MCP ツーリング** へ移り、AI に Vulkan レジストリとハードウェアリミットへの直接アクセスを与えるカスタムツールの構築方法を学びます。
+
+次へ: xref:AI_Assisted_Vulkan/06_debugging/05_gfxreconstruct_ai.adoc[AI 支援トレース分析: GFXReconstruct]

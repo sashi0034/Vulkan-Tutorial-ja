@@ -1,0 +1,87 @@
+:pp: {plus}{plus}
+
+= Vulkan レジストリと GPUInfo MCP
+
+== はじめに: 地上真理
+
+Vulkan はデータ駆動 API です。その構造、enum、拡張はすべて中央の XML ファイル——**Vulkan レジストリ（`vk.xml`）**——で定義されます。同様に、何千もの異なる GPU の能力は **Vulkan Hardware Database（`gpuinfo.org`）** で追跡されます。
+
+**協調エンジニアリング** では、これらのデータセットへの直接アクセスを AI に与えます。「確率的 AI」（学習データに基づき推測）から **「決定論的 AI」**（地上真理を照会）へ移ります。本章では、レジストリ向けの既存ツールの使い方と、アシスタントを `gpuinfo.org` データベースへ橋渡しする特化 MCP サーバを **自分で構築** する方法を探ります。
+
+== mcp-Vulkan によるレジストリ照会
+
+**mcp-Vulkan** プロジェクトは、`vk.xml` ファイルを「照会」するよう設計された特化 MCP サーバです。AI エージェントに `search-vulkan-docs` や `get-vulkan-topic` のようなツールを提供します。
+
+`VK_KHR_maintenance7` のようなまったく新しい拡張を実装している場合を考えてください。AI モデルがこの拡張のリリース前に学習されていたなら、構造名やフラグを幻覚するかもしれません。mcp-Vulkan 経由で `search-vulkan-docs` ツールを AI に与えることで、最新仕様を照会するよう頼めます。AI はサーバを呼び出し、レジストリをスキャンし、`VkPhysicalDeviceMaintenance7FeaturesKHR` のような正確な構造名を返し、100% 仕様どおりの応答を提供します。
+
+== チュートリアル: GPUInfo MCP サーバの構築
+
+`mcp-Vulkan` が公式仕様を扱う一方、AI を **Vulkan Hardware Database（`gpuinfo.org`）** につなぐにはカスタム「Connector」MCP サーバが必要です。`gpuinfo.org` はコミュニティ駆動の Web リソースなので、アシスタントが特定ハードウェアリミットについてデータベースを「検索」できる単純な Python ベース MCP サーバを構築できます。
+
+本チュートリアルでは、Python MCP SDK を使い **GPUInfo Connector** を作成します。このサーバは、アーキテクチャ設計フェーズ中にハードウェア制約を確認するために AI が使える `query_gpu_limit` というツールを提供します。
+
+=== ステップ 1: 環境のセットアップ
+
+まず MCP サーバ用の新しいディレクトリを作成し、必要な依存をインストールします。プロトコル用に `mcp` ライブラリ、Web からのデータ取得用に `requests` が必要です。
+
+[source,bash]
+----
+mkdir gpuinfo-mcp && cd gpuinfo-mcp
+python -m venv venv
+source venv/bin/activate
+pip install mcp requests
+----
+
+=== ステップ 2: サーバ論理の定義
+
+`server.py` というファイルを作成します。`McpServer` を初期化し、GPU 名と特定リミット（`maxDescriptorSetSampledImages` など）を取り、データベースから値を返すツールを定義します。
+
+[source,python]
+----
+import requests
+from mcp.server import McpServer
+from mcp.types import Tool
+
+# Initialize the server
+server = McpServer("GPUInfo-Connector")
+
+@server.tool()
+def query_gpu_limit(gpu_name: str, limit_name: str) -> str:
+    """
+    Queries gpuinfo.org for a specific hardware limit of a given GPU.
+    """
+    # In a real-world scenario, you would use a search API
+    # For this tutorial, we simulate a database lookup logic
+    search_url = f"https://vulkan.gpuinfo.org/listreports.php?devicename={gpu_name.replace(' ', '+')}"
+
+    # The AI will receive this URL and can use a browser-mcp to navigate it,
+    # or this tool can parse the latest report for that device.
+    return f"Searching gpuinfo.org for '{limit_name}' on '{gpu_name}'. Accessing reports at: {search_url}"
+
+if __name__ == "__main__":
+    server.run()
+----
+
+=== ステップ 3: AI エージェントへの登録
+
+このツールを使うには、エージェントの設定にサーバを追加します。**Goose** を使っている場合、`~/.config/goose/config.yaml` ファイルに次のエントリを追加します。
+
+[source,yaml]
+----
+extensions:
+  gpuinfo:
+    cmd: python
+    args: ["/path/to/gpuinfo-mcp/server.py"]
+----
+
+== 実世界体験: ハードウェア認識システム設計
+
+新しい **バインドレスレンダリング** システムを設計しているところを想像してください。アシスタントに尋ねます。*「Adreno 600 シリーズの `maxDescriptorSetSampledImages` リミットは何か、私の 1024 テクスチャ戦略は動くか？」*
+
+GPUInfo MCP サーバが接続されていれば、アシスタントは推測しません。`query_gpu_limit` ツールを使い、リミット（多くの Adreno 600 デバイスで 128）を特定し、計画が失敗すると即座に報告します。次にターゲットハードウェアと互換なリファクタ済みアーキテクチャ——「タイル」ディスクリプタ戦略やモバイル固有フォールバックなど——を提案します。
+
+== まとめ: データ駆動エンジニアリング
+
+AI を **Vulkan レジストリ** につなぎ、カスタム **GPUInfo Connector** を構築することで、**ハードウェア認識アシスタント** へ変えます。もはや静的な学習データに頼らず、プロのグラフィックスエンジニアがハイパフォーマンス・クロスプラットフォームエンジンを設計するのに使う同じ「ライブな真実源」を使います。
+
+次へ: xref:AI_Assisted_Vulkan/07_advanced_mcp/03_agentic_automation_qa.adoc[エージェンティック自動化と監査]

@@ -1,0 +1,14 @@
+:pp: {plus}{plus}
+
+= カメラと変換
+
+この章では、Vulkan における 3D カメラシステムの実装と、3D 変換の数学的基盤を扱います。
+
+== 目次
+
+* xref:Building_a_Simple_Engine/Camera_Transformations/01_introduction.adoc[はじめに]
+* xref:Building_a_Simple_Engine/Camera_Transformations/02_math_foundations.adoc[数学的基盤]
+* xref:Building_a_Simple_Engine/Camera_Transformations/03_transformation_matrices.adoc[変換行列]
+* xref:Building_a_Simple_Engine/Camera_Transformations/04_camera_implementation.adoc[カメラ実装]
+* xref:Building_a_Simple_Engine/Camera_Transformations/05_vulkan_integration.adoc[Vulkan 統合]
+* xref:Building_a_Simple_Engine/Camera_Transformations/06_conclusion.adoc[まとめ]

@@ -29,8 +29,8 @@ setup_tutorial:
 		--exclude '*/__pycache__/' \
 		../attachments $(ROOT)
 	mkdir -p $(ROOT)/pages
-	rsync -a --delete --exclude ${EXCLUDE} ../en/ $(ROOT)/pages
-	cp ../en/Building_a_Simple_Engine/GUI/index.adoc $(ROOT)/pages/Building_a_Simple_Engine/GUI/index.adoc
+	rsync -a --delete --exclude ${EXCLUDE} ../ja/ $(ROOT)/pages
+	cp ../ja/Building_a_Simple_Engine/GUI/index.adoc $(ROOT)/pages/Building_a_Simple_Engine/GUI/index.adoc
 # Use a python script to automat some file content changes that are necessary due to differences between Antora and github
 	python3 make_helper.py
 

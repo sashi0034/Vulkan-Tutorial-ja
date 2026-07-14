@@ -1,0 +1,155 @@
+:pp: {plus}{plus}
+= Cyclic Coordinate Descent IK
+
+== 問題を幾何学的に理解する
+
+アルゴリズムに入る前に、コンピュータに実際に何を解かせているのかを理解しておくとよいでしょう。3 リンクのチェーンを想像してください。太ももがすねにつながり、すねが足につながっています。各ジョイントは回転できます。足（**エンドエフェクタ**）は今どこか空中にあり、地面のターゲット点に正確に着地させたい。必要なのは、太ももとすねのジョイントにどんな回転を加えればよいか、という問いです。
+
+直接解析式で解こうとすると、すぐに問題が見えてきます。2 ボーンチェーン（肩と肘だけの単純な腕）なら閉形式解があります。少し三角関数が必要で、肘を上げるか下げるかの 2 解、またはターゲットが届かない場合は解なし、という結果になります。しかし 3 ボーンチェーンや 5 ボーンの脊椎では、きれいな閉形式はありません。系は **未決定** になります。自由度（回転軸）が制約（ターゲットの 3 座標）より多いため、エンドエフェクタをターゲットに置くポーズは無数にあり、その中から選ぶアルゴリズムが必要です。
+
+**Cyclic Coordinate Descent**、すなわち CCD は、見事に単純なヒューリスティックでこれを解きます。チェーン全体を一度に解くのではなく、1 ジョイントずつ回転させてエンドエフェクタをターゲットにできるだけ近づけ、次のジョイント、次のジョイントと進み、チェーンを繰り返し巡回するまで、エンドエフェクタが十分近づくか反復上限に達します。
+
+== CCD アルゴリズムをステップごとに追う
+
+脚チェーンで CCD の 1 反復を追ってみましょう。ジョイント `[thigh, knee, ankle]` と、地面のターゲット位置があるとします。CCD はチェーンの末端から根元に向かって働きます。
+
+**ステップ 1 — エンドエフェクタに最も近いジョイントから始める。** 脚チェーンでは足首です。2 つのベクトルを計算します。足首から現在のエンドエフェクタ位置（つま先）へのベクトルと、足首からターゲット位置へのベクトルです。足首ジョイントを回転させ、最初のベクトルが 2 番目に揃うようにします。足首はエンドエフェクタに最も近いジョイントなので、その回転がエフェクタをターゲットへ最も直接的に動かします。
+
+**ステップ 2 — 内側の次のジョイントへ進む。** 次は膝です。再び、膝からエンドエフェクタの*新しい*位置（足首を回したとき動いた位置）へのベクトルと、膝からターゲットへのベクトルを計算します。膝を回転して揃えます。膝は足首より長いレバーアームを持つため、回転するとエンドエフェクタはより大きな円弧を描き、このステップでは大きな補正が出ることが多いです。
+
+**ステップ 3 — 根ジョイントへ進む。** 太ももでも同様に繰り返します。この時点でエンドエフェクタはすでにターゲットにかなり近いかもしれません。アルゴリズムの収束性により、チェーンを 1 周するたびに誤差は減ります。
+
+**ステップ 4 — 収束を確認する。** エンドエフェクタからターゲットまでの距離を計算します。しきい値（通常ワールド空間で 1 ミリ以下）未満なら停止します。そうでなければ足首からまた 1 周を始め、繰り返します。
+
+CCD の妙味は、各回転ステップが自明に計算できることです。1 ベクトルを別のベクトルへ回すクォータニオンにすぎません。最悪ケースでは収束は保証されませんが、妥当なジョイント制限を持つヒューマノイド骨格では、実用上 2〜5 反復で収束します。
+
+== CCD の実装
+
+自己完結型の CCD ソルバーを書きます。ジョイントチェーン（シーングラフ内のノードインデックスのリスト）、ターゲットのワールド位置、最大反復回数を受け取ります。
+
+[source,cpp]
+----
+struct IKChain {
+    std::vector<uint32_t> joints;  // Ordered from root to end effector
+    uint32_t effector_node;        // The node whose position we are trying to place
+    float    threshold;            // Convergence threshold in world-space units
+    int      max_iterations;       // Safety cap
+    glm::vec3 target_world;        // Target position
+    glm::vec3 pole_vector;         // For algorithms like FABRIK or constrained CCD
+};
+
+// Rotate joint 'node' so that the vector from the joint to the effector aligns
+// with the vector from the joint to the target. Updates the node's local rotation
+// and marks the subtree dirty so world matrices are recomputed.
+static void ccd_rotate_joint(
+    std::vector<Node>& nodes,
+    uint32_t           joint_idx,
+    uint32_t           effector_idx,
+    const glm::vec3&   target_world)
+{
+    Node& joint = nodes[joint_idx];
+
+    // We need the world position of the joint. This assumes world matrices
+    // are up to date for this joint (but not necessarily for descendants).
+    glm::vec3 joint_world = glm::vec3(joint.world_matrix[3]);
+
+    // Vector from this joint to the current effector position
+    glm::vec3 to_effector = glm::normalize(
+        glm::vec3(nodes[effector_idx].world_matrix[3]) - joint_world);
+
+    // Vector from this joint to where we want the effector to be
+    glm::vec3 to_target = target_world - joint_world;
+    float dist = glm::length(to_target);
+    if (dist < 1e-6f) return; // Effector is already at the joint; nothing to do
+    to_target /= dist;
+
+    // Compute the rotation that takes to_effector onto to_target
+    float dot = glm::clamp(glm::dot(to_effector, to_target), -1.0f, 1.0f);
+    if (dot > 0.9999f) return; // Already aligned
+
+    float     angle = std::acos(dot);
+    glm::vec3 axis  = glm::cross(to_effector, to_target);
+    if (glm::length(axis) < 1e-6f) return; // Parallel or anti-parallel vectors
+    axis = glm::normalize(axis);
+
+    glm::quat delta_rotation = glm::angleAxis(angle, axis);
+
+    // Apply this rotation in world space, then convert to local space.
+    // The joint's local rotation is relative to its parent's world rotation.
+    // parent_world_rotation * local_rotation = world_rotation
+    // Therefore: local_rotation = inverse(parent_world_rotation) * world_rotation
+
+    glm::quat world_rotation = delta_rotation * joint.get_world_rotation();
+    glm::quat parent_world_rotation = (joint.parent_index != INVALID_NODE_INDEX)
+        ? nodes[joint.parent_index].get_world_rotation()
+        : glm::quat(1,0,0,0);
+
+    joint.local_rotation = glm::inverse(parent_world_rotation) * world_rotation;
+    joint.mark_dirty();
+
+    // Recompute world matrices for this joint and all its descendants
+    // so that subsequent CCD steps see correct positions.
+    update_world_matrices_subtree(nodes, joint_idx);
+}
+
+void solve_ccd(std::vector<Node>& nodes, const IKChain& chain, const glm::vec3& target_world)
+{
+    // Check reachability: if the target is farther than the total chain length,
+    // we can still run CCD but it will converge toward the direction of the target
+    // without reaching it. For foot placement, this is usually a sign that the
+    // character's body needs to be lowered, which we handle at a higher level.
+
+    for (int iter = 0; iter < chain.max_iterations; ++iter) {
+        // Check if we are already close enough
+        glm::vec3 effector_pos = glm::vec3(nodes[chain.effector_node].world_matrix[3]);
+        if (glm::distance(effector_pos, target_world) < chain.threshold) break;
+
+        // Iterate from the joint closest to the end effector toward the root.
+        // chain.joints is ordered root-to-tip, so we iterate it in reverse.
+        for (int j = static_cast<int>(chain.joints.size()) - 1; j >= 0; --j) {
+            ccd_rotate_joint(nodes, chain.joints[j], chain.effector_node, target_world);
+        }
+    }
+}
+----
+
+`get_world_rotation` ヘルパー（第 2 章で `Node` 構造体に追加したもの）は、基底列を正規化してスケールを除去し、ワールド行列から純粋な回転クォータニオンを取り出します。
+
+== CCD へのジョイント制限の追加
+
+上の基本 CCD 実装には重大な問題が 1 つあります。解剖学的制約を無視して、どの方向にも回転を適用してしまいます。膝が横に曲がったり、足首が不自然な向きに回ったりします。各 CCD ステップの後に、ジョイント回転を許容範囲へクランプする必要があります。
+
+CCD とジョイント制限を統合する最もきれいな方法は、各 `ccd_rotate_joint` 呼び出しの後にジョイントのローカル回転をクランプすることです。ジョイント制限は物理制約定義の一部として保存されている（第 4 章より）ので、そのデータを再利用できます。
+
+[source,cpp]
+----
+// After computing joint.local_rotation in ccd_rotate_joint, apply limits:
+void apply_hinge_limit(Node& joint, const ConstraintDef& limits)
+{
+    // For a hinge joint, the local rotation should only have a component
+    // around the hinge axis. We extract the angle around that axis and clamp it.
+    glm::vec3 axis = limits.hinge_axis;
+    float angle = 2.0f * std::atan2(
+        glm::dot(glm::vec3(joint.local_rotation.x, joint.local_rotation.y, joint.local_rotation.z), axis),
+        joint.local_rotation.w
+    );
+    float clamped = glm::clamp(
+        glm::degrees(angle),
+        limits.hinge_min_deg,
+        limits.hinge_max_deg
+    );
+    joint.local_rotation = glm::angleAxis(glm::radians(clamped), axis);
+}
+----
+
+ボールアンドソケットジョイントでは、回転制限はより複雑です。スイング制限は円錐制約であり、これを強制するにはクォータニオンの分解におけるスイング成分をクランプする必要があります。多くの物理エンジンはこれ用のヘルパーを提供します。なければ、ジョイントのレストポーズに対するスイング・アンド・ツイスト分解で実装できます。
+
+== CCD の長所と短所
+
+CCD は速いです。各反復は少数のベクトル演算とクォータニオン乗算だけで、多くのヒューマノイドチェーンではすぐに収束します。ジョイント制限とも自然に統合でき、正しく実装するのも素直です。これらの理由から、長年リアルタイムゲーム開発で支配的な IK アルゴリズムであり、多くの用途では依然として良いデフォルトです。
+
+CCD の主な弱点は **エンドエフェクタバイアス** として知られる視覚的アーティファクトです。先端から根へジョイントを処理するため、エンドエフェクタ近くのジョイントほど根近くより多く回転しがちです。脚では足首が過回転し、太ももはわずかしか動かない、という傾向になります。極端に届かせるとき、太ももが硬く足首だけ曲がった見た目が目立ちます。緩やかな凹凸地形の足置きでは通常気づきません。体から大きく離れた腕のリーチアニメーションでは不自然に見えることがあります。
+
+次に見る FABRIK は、別の戦略でこの弱点に対処します。
+
+xref:Advanced_glTF/Procedural_Animation_IK/01_introduction.adoc[前へ: はじめに] | xref:Advanced_glTF/Procedural_Animation_IK/03_fabrik.adoc[次へ: FABRIK]

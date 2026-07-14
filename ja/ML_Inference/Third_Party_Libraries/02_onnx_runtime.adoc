@@ -1,0 +1,375 @@
+:pp: {plus}{plus}
+
+= ONNX Runtime
+
+== 導入
+
+本番環境で ML モデルをデプロイする準備が整ったとき、ONNX Runtime は利用可能な中でも最も汎用性が高く強力な選択肢の一つです。Microsoft が開発し、広範な業界コンソーシアムが支援する推論エンジンで、根本的な課題——異なるフレームワークで学習したモデルを、多様なハードウェア上で効率的に実行する——を解決するために設計されています。
+
+典型的な ML のワークフローを考えてみましょう。研究チームは PyTorch の柔軟性と実験のしやすさを好むかもしれません。本番のインフラは別のツールで構築されているかもしれません。デプロイ先は、NVIDIA GPU を搭載したハイエンドサーバーから、AMD や Intel のグラフィックスを積んだ Windows デスクトップ、リソースの限られた組み込みデバイスまで幅広く存在します。ONNX Runtime はこれらすべてのギャップを埋めます。
+
+本章では ONNX Runtime を深く掘り下げます——それが何であるか、Vulkan アプリケーション向けの第一推奨である理由、セットアップ方法、そしてレンダリングパイプラインと効果的に統合する方法です。
+
+== ONNX Runtime とは
+
+ONNX Runtime は機械学習モデル向けの高性能な推論エンジンです。しかしこの簡単な説明だけでは、その特徴を十分に捉えられません。主要な特性を一つずつ見ていきましょう。
+
+=== フレームワークに依存しない設計
+
+ONNX Runtime の「ONNX」は Open Neural Network Exchange——ニューラルネットワークを表現するための標準形式——を意味します。この形式は、ML フレームワーク間の翻訳役として機能します。
+
+PyTorch で学習し、ONNX へエクスポートして ONNX Runtime で実行できます。TensorFlow で学習し、ONNX へエクスポートして ONNX Runtime で実行できます。Keras や scikit-learn など、ONNX へのエクスポートに対応する他のフレームワークも同様です。学習に使うフレームワークは開発に最も適したものを自由に選べるようになり、特定のデプロイ経路に縛られることがなくなります。
+
+このフレームワークからの独立性は、開発者にとって大きな自由をもたらします。研究チームは好みのツールを使い、本番システムは ONNX Runtime を使う。両者は ONNX という形式だけで結ばれ、疎結合な関係になります。
+
+=== クロスプラットフォームサポート
+
+ONNX Runtime は Windows、Linux、macOS、Android、iOS、その他各種の組み込みプラットフォームで動作します。同じモデルファイル、同じ API がすべての環境で使えます。統合のコードを一度書けば、どこにでもデプロイできます。
+
+このクロスプラットフォームの一貫性は ML の世界では珍しいことです。多くのフレームワークにはプラットフォーム固有の癖があり、OS ごとに異なる API を持ち、特定の OS へのサポートが限定的です。ONNX Runtime は統一された体験を提供します。
+
+=== 複数の実行プロバイダ
+
+ONNX Runtime が真に力を発揮するのはここです。推論を実際に実行するバックエンドとして、複数の「実行プロバイダ」をサポートしています。第一推奨は **WebGPU** で、「一度書けばどこでも動く」という体験を得られます。特定のハードウェアでさらなる高速化を狙うときだけ、専用のプロバイダを選びましょう。
+
+*   **WebGPU 実行プロバイダ**: 汎用的なクロスプラットフォーム GPU コンピュートの現代的な標準です。Windows、Linux、Android、macOS で最適な下位 API を自動的に選択します。Windows では **DirectML**（DirectX 12）、Linux と Android では **Vulkan** を利用します。ほぼどのようなモダンハードウェアでも汎用的に動かしたい場合の最良の選択です。
+
+*   **DirectML 実行プロバイダ**: Windows 上で Microsoft の DirectML API によるハードウェア加速 ML を提供します。Windows では WebGPU が裏側でこれを使いますが、Windows 専用アプリでネイティブの性能をより直接的に活用したい場合は、DirectML プロバイダを明示的に選択できます。
+
+*   **CPU 実行プロバイダ**: Intel MKL-DNN や ARM Compute Library などを使った最適化された CPU 推論です。GPU がない場合の信頼できるフォールバックとして、どこでも動作します。
+
+*   **CUDA / TensorRT 実行プロバイダ**: Tensor Cores など NVIDIA 固有の機能を活用します。NVIDIA のハードウェアに縛られますが、大幅な高速化が得られ、サーバー側のデプロイや Jetson などの NVIDIA 組み込み向けに推奨されます。
+
+*   **OpenVINO 実行プロバイダ**: Intel のハードウェア（CPU、統合 GPU、VPU）向けに特化した最適化を行います。
+
+*   **CoreML 実行プロバイダ**: Apple の CoreML を活用し、Apple Silicon の Neural Engine にアクセスします。iOS と macOS で最大の効率を発揮します。
+
+要点はこうです。汎用的にどこでも動かすなら **WebGPU** を使う。特定ベンダーのハードウェアでさらなる性能が必要になったときだけ、**DirectML** や **CUDA** など特定のプロバイダへ切り替える、という考え方です。
+
+== なぜ Vulkan アプリケーション向けに ONNX Runtime を選ぶのか
+
+本チュートリアルが Vulkan ベースのグラフィックスアプリに焦点を当てる中で、なぜ ONNX Runtime を第一の ML 推論ソリューションとして推奨するのでしょうか。
+
+=== 相補的な強み
+
+Vulkan は GPU レンダリングを低レベルで制御する手段を与えます。ONNX Runtime は高レベルで最適化された ML 推論の手段を与えます。両者は美しく補い合います。
+
+ほとんどの ML ワークロードでは、レンダリング向けに Vulkan が提供するレベルの制御は不要です。すべてのバッファ割り当て、同期点、シェーダディスパッチを管理する必要はありません。推論が速く正しい結果を出せば十分です。その複雑さは ONNX Runtime が処理してくれます。
+
+エンジニアリングの努力を、アプリ独自の部分——レンダリングパイプライン、UX、ゲームメカニクス、創造的な機能——に集中できます。ML 推論は ONNX Runtime に任せましょう。
+
+=== WebGPU によるクロスベンダー GPU サポート
+
+NVIDIA のハードウェアに縛られる CUDA 中心のワークフローとは異なり、WebGPU 実行プロバイダを備えた ONNX Runtime は、プラットフォームのネイティブ API を活用し、任意のモダン GPU でアプリが動作することを保証します。
+
+*   **普遍的なリーチ**: AMD、Intel、NVIDIA のユーザー全員が、プラットフォーム固有のコードなしで GPU 加速 AI を得られます。
+*   **バックエンド**: Windows では WebGPU が **DirectML**（DirectX 12）を利用します。Linux と Android では **Vulkan** を利用します。単一の統合経路を保ちながら、ローカル API の性能を得られます。
+*   **開発者にとってのシンプルさ**: `webgpu` プロバイダを指定するだけです。現在の環境に合った正しいバックエンドを選ぶという重い作業は ONNX Runtime が処理してくれます。
+*   **ゼロコピーの可能性**: レンダリング（Vulkan）と推論（Linux では Vulkan バックエンドを使う WebGPU）が同じ下位のドライバリソースを共有できるため、コストの高い PCIe データ転送を最小化できます。
+
+=== 広いモデルサポート
+
+ONNX Runtime は数百の操作を標準でサポートします。モデル動物園から事前学習済みモデルをダウンロードすれば、ほぼ確実に変更なしで動作します。この広い互換性により、異なるモデルの実験、最先端アーキテクチャの試行、最新の研究成果の活用が、実装の詳細を心配せずに行えます。
+
+=== 本番環境での信頼性
+
+ONNX Runtime は Microsoft（Bing、Office、Azure など)、Facebook、その他多数の企業で本番利用されています。大規模にテストされ、1 日あたり数十億件の推論リクエストを処理しています。バグは見つかり次第修正され、エッジケースも処理され、性能も最適化されています。
+
+ONNX Runtime を使うことは、実世界で実証された基盤の上に構築することを意味します。
+
+== ONNX Runtime の入手
+
+実践に入りましょう。プロジェクト向けに ONNX Runtime をどのように入手し、セットアップするかを見ていきます。
+
+=== 公式リリース
+
+主要な入手先は公式の GitHub リリースページです: https://github.com/microsoft/onnxruntime/releases
+
+各リリースは複数のプラットフォーム向けに事前ビルド済みのバイナリを提供します。
+
+- Windows (x64, ARM64)
+- Linux (x64, ARM64)
+- macOS (x64, ARM64)
+
+各プラットフォームのパッケージには次が含まれます。
+
+- ヘッダファイル（`include/` ディレクトリ）
+- ライブラリファイル（`lib/` ディレクトリ）
+- ドキュメントとライセンス情報
+
+ターゲットのプラットフォーム向けパッケージをダウンロードしてください。クロスプラットフォーム開発では複数のパッケージを取得することもあります。
+
+=== パッケージマネージャ
+
+Python での開発やプロトタイピングでは、パッケージマネージャで簡単にインストールできます。
+
+*CPU のみの版*:
+[source,bash]
+----
+pip install onnxruntime
+----
+
+*GPU 対応版（Windows 向け DirectML）*:
+[source,bash]
+----
+pip install onnxruntime-directml
+----
+
+*GPU 対応版（WebGPU）*:
+[source,bash]
+----
+# WebGPU プロバイダは通常、標準または GPU 向けビルドに含まれています
+pip install onnxruntime-gpu
+----
+
+Windows での C++ 開発では NuGet がパッケージを提供します。
+[source,powershell]
+----
+# クロスベンダー GPU 加速（DirectML）
+Install-Package Microsoft.ML.OnnxRuntime.DirectML
+----
+
+=== ソースからのビルド
+
+特殊なプラットフォームやカスタム構成では、ソースからビルドすることもできます。
+
+[source,bash]
+----
+git clone --recursive https://github.com/microsoft/onnxruntime.git
+cd onnxruntime
+./build.sh --config Release --build_shared_lib --parallel
+----
+
+ソースからのビルドでは、含める実行プロバイダ、最適化フラグ、プラットフォーム固有のチューニングを完全に制御できます。より複雑になりますが、最大の柔軟性が得られます。
+
+== ONNX Runtime のセットアップ
+
+バイナリを入手したら、C++ プロジェクトへの統合は簡単に行えます。
+
+=== プロジェクトの構成
+
+CMake ベースのプロジェクト（推奨）では次のようにします。
+
+[source,cmake]
+----
+# ONNX Runtime を検索
+find_package(onnxruntime REQUIRED)
+
+# ターゲットにリンク
+target_link_libraries(your_target PRIVATE onnxruntime::onnxruntime)
+----
+
+システム全体にインストールされていない場合は、パスを直接指定します。
+
+[source,cmake]
+----
+set(ONNXRUNTIME_ROOT_DIR "/path/to/onnxruntime")
+include_directories(${ONNXRUNTIME_ROOT_DIR}/include)
+link_directories(${ONNXRUNTIME_ROOT_DIR}/lib)
+target_link_libraries(your_target PRIVATE onnxruntime)
+----
+
+=== プラットフォーム固有の考慮点
+
+*Linux*: ONNX Runtime には glibc 2.27 以降が必要です（Ubuntu 18.04 以降、CentOS 8 以降）。GPU サポートには WebGPU のドライバを最新にしておいてください。
+
+*Windows*: Visual Studio 2019 以降のランタイムが必要です。GPU サポートには DirectX 12（DirectML）または WebGPU 用のドライバが利用可能である必要があります。
+
+*macOS*: 既定では CPU のみです。CoreML プロバイダ経由で Apple Neural Engine を、Metal 経由の WebGPU プロバイダも利用できます。
+
+=== ランタイムの依存関係
+
+アプリを配布する際は、ONNX Runtime の共有ライブラリを同梱してください。
+
+- Windows: `onnxruntime.dll`
+- Linux: `libonnxruntime.so`
+- macOS: `libonnxruntime.dylib`
+
+GPU の実行プロバイダを使う場合は、ユーザー側に適切なドライバとランタイム（Vulkan、DirectX 12 など)がインストールされている必要があります。
+
+== ONNX Runtime の基本的な使い方
+
+ONNX Runtime で推論を実行する基本的なワークフローを見ていきます。
+
+=== ステップ 1: 環境の作成
+
+`Ort::Env` オブジェクトは ONNX Runtime の環境を表します。アプリの起動時に一度だけ作成します。
+
+[source,cpp]
+----
+#include <onnxruntime_cxx_api.h>
+
+// ログレベルを指定して環境を作成
+Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "MyApp");
+----
+
+環境はグローバルな状態とログを管理します。通常はアプリ全体で 1 つの環境だけを作成します。
+
+=== ステップ 2: セッションオプションの構成
+
+セッションオプションは推論の実行方法を制御します。
+
+[source,cpp]
+----
+Ort::SessionOptions session_options;
+
+// CPU 実行時のスレッド数
+session_options.SetIntraOpNumThreads(4);
+
+// 最適化を有効化
+session_options.SetGraphOptimizationLevel(
+    GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+// WebGPU 実行（Windows では DirectML、Linux と Android では Vulkan）
+session_options.AppendExecutionProvider("WebGPU");
+----
+
+実行プロバイダの選択はここで行います。複数追加することもできます——ONNX Runtime は順に試し、最初に動作するものを使います。
+
+=== ステップ 3: モデルの読み込み
+
+ONNX モデルファイルを読み込んでセッションを作成します。
+
+[source,cpp]
+----
+const wchar_t* model_path = L"model.onnx";
+Ort::Session session(env, model_path, session_options);
+----
+
+セッションはモデルを解析し、リソースを割り当て、推論の準備を行います。比較的コストの高い操作なので、一度だけ行い、複数回の推論実行でセッションを再利用してください。
+
+=== ステップ 4: 入出力情報の照会
+
+推論を行う前に、モデルが期待する入力と生成する出力を把握しておく必要があります。
+
+[source,cpp]
+----
+// 入力情報を取得
+size_t num_input_nodes = session.GetInputCount();
+const char* input_name = session.GetInputName(0, allocator);
+Ort::TypeInfo input_type_info = session.GetInputTypeInfo(0);
+auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
+std::vector<int64_t> input_shape = input_tensor_info.GetShape();
+
+// 出力情報を取得
+size_t num_output_nodes = session.GetOutputCount();
+const char* output_name = session.GetOutputName(0, allocator);
+----
+
+これで期待される入力の次元、データ型、出力の構造が分かります。
+
+=== ステップ 5: 入力データの準備
+
+データを使って入力テンソルを作成します。
+
+[source,cpp]
+----
+// 入力用メモリを割り当て
+std::vector<float> input_data(input_size);
+// ... 前処理済みの入力データで input_data を埋める ...
+
+// 入力テンソルを作成
+auto memory_info = Ort::MemoryInfo::CreateCpu(
+    OrtArenaAllocator, OrtMemTypeDefault);
+Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+    memory_info, input_data.data(), input_data.size(),
+    input_shape.data(), input_shape.size());
+----
+
+テンソルはデータをコピーせずにラップするため、推論が完了するまでデータを有効な状態に保つ必要があります。
+
+=== ステップ 6: 推論の実行
+
+モデルを実行します。
+
+[source,cpp]
+----
+std::vector<const char*> input_names = {input_name};
+std::vector<const char*> output_names = {output_name};
+
+auto output_tensors = session.Run(
+    Ort::RunOptions{nullptr},
+    input_names.data(), &input_tensor, 1,
+    output_names.data(), 1);
+----
+
+ここで実際の推論が行われます。呼び出しは推論が完了するまでブロックします。
+
+=== ステップ 7: 結果の取得
+
+出力テンソルを処理します。
+
+[source,cpp]
+----
+float* output_data = output_tensors[0].GetTensorMutableData<float>();
+auto output_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+
+// アプリのニーズに応じて output_data を処理
+----
+
+出力テンソルには、後処理可能なモデルの予測結果が含まれています。
+
+== Vulkan アプリケーションとの統合
+
+Vulkan ベースのアプリへ ONNX Runtime を効果的に統合する方法を説明します。
+
+=== 別コンテキストによるアプローチ
+
+最もシンプルで信頼性の高いアプローチは、ONNX Runtime と Vulkan を別々のコンテキストで実行し、CPU メモリ経由でデータを転送することです。
+
+1. Vulkan でフレームをレンダリングする
+2. ML 推論が必要になったら、関連データを GPU から CPU へ読み戻す
+3. ONNX Runtime で CPU または GPU（独自の実行プロバイダ経由)で推論を行う
+4. レンダリングに必要なら結果を GPU へ戻す
+
+これはすべてのプラットフォームで動作する単純明快なアプローチです。データ転送はレイテンシを加えますが、推論が毎フレーム発生しない多くのアプリでは許容できる範囲です。
+
+=== Windows での DirectML 統合
+
+Windows では、ONNX Runtime の DirectML 実行プロバイダによってより密な GPU 統合が可能です。
+
+[source,cpp]
+----
+session_options.AppendExecutionProvider_DML(0); // デバイス ID 0
+----
+
+DirectML は Vulkan と同じ GPU 上で、OS が管理して動作します。メモリを直接共有することはありませんが、GPU のコンピュートリソースは共有されます。大きなモデルでは、CPU-GPU 間の転送より効率的な場合があります。
+
+トレードオフはプラットフォームへの依存です——DirectX 12 をサポートする Windows でのみ動作します。
+
+=== メモリ共有（上級者向け）
+
+一部のプラットフォームでは、外部メモリ拡張を使うことで Vulkan と ONNX Runtime の間でメモリを共有できます。複雑でプラットフォーム固有ですが、データ転送を排除できます。
+
+1. Vulkan の外部メモリ拡張を使ってメモリを割り当てる
+2. メモリハンドルをエクスポートする
+3. ONNX Runtime へハンドルをインポートする（実行プロバイダがサポートしている場合）
+4. Vulkan と ONNX Runtime が同じ物理メモリにアクセスする
+
+慎重な同期が必要であり、データ転送が実際にボトルネックであると確認された非常に高スループットなシナリオでのみ、この複雑さをかける価値があります。
+
+== ONNX Runtime を使うべき場面
+
+ONNX Runtime が理想的な場合は次のとおりです。
+
+*クロスフレームワークの互換性*: 異なる学習フレームワーク（PyTorch、TensorFlow など)のモデルを扱う必要がある場合です。
+
+*デスクトップ/サーバーへのデプロイ*: ONNX Runtime の最適化が力を発揮する、十分な計算リソースを持つプラットフォームをターゲットにする場合です。
+
+*実行プロバイダの柔軟性*: コードの変更なしに CPU、WebGPU、DirectML などのバックエンドを切り替えたい場合です。
+
+*広いオペレータサポート*: 多様な操作を使うモデルで、包括的な標準サポートが必要な場合です。
+
+*本番環境での信頼性*: 大規模で実証済みの、信頼できるソリューションが必要な場合です。
+
+Vulkan アプリでは、ほとんどのユースケースにおいて ONNX Runtime が性能、信頼性、統合の容易さの最良のバランスを提供します。
+
+== まとめ
+
+ONNX Runtime は、任意のフレームワークのモデルをサポートする高性能でクロスプラットフォームな ML 推論エンジンです。フレームワークに依存しない設計、複数の実行プロバイダ、本番環境で実証された信頼性により、Vulkan アプリケーションにとって優れた選択となります。
+
+基本的なワークフロー——環境の作成、モデルの読み込み、入力の準備、推論の実行、出力の取得——はシンプルで、プラットフォーム間で一貫しています。Vulkan との統合は、CPU 経由でデータを転送する別コンテキストの方式から、Windows で DirectML を介して GPU リソースを共有する方式まで幅広い選択肢があります。
+
+ML 推論が必要なほとんどの Vulkan ベースアプリでは、ONNX Runtime を第一選択にすべきです。ゼロから推論を実装する複雑さを負わずに、必要な信頼性と性能を得られます。
+
+xref:ML_Inference/Third_Party_Libraries/01_introduction.adoc[前へ: はじめに] | xref:ML_Inference/Third_Party_Libraries/03_tensorflow_lite.adoc[次へ: TensorFlow Lite]

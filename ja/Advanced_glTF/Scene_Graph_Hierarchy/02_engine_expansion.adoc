@@ -1,0 +1,202 @@
+= エンジン拡張: シーングラフの最適化
+
+== 単純なインスタンスからグローバル階層へ
+
+「シンプルなエンジンの構築」シリーズでは、素直な `ObjectInstance` ベクトルでワールドオブジェクトを管理していました。各オブジェクトは独自の位置・回転・スケールを持ち、一つずつレンダリングしていました。
+
+[source,cpp]
+----
+struct ObjectInstance {
+    glm::vec3 position;
+    glm::vec3 rotation;
+    glm::vec3 scale;
+    // ...
+};
+std::vector<ObjectInstance> objectInstances;
+----
+
+このアプローチは Vulkan の基礎を学ぶには最適ですが、いわゆる **「浅い世界（Shallow World）」** を生み出します。このモデルでは、すべてのオブジェクトが独立しています。インスタンス内のモデルが内部 glTF 階層を持てても、ワールド内のオブジェクト同士は容易に相互作用できません。
+
+高度なキャラクターアニメーションへ進むと、この「浅い」アーキテクチャは大きな障壁になります。キャラクターが剣を持っている場面を想像してください。浅い世界では、剣とキャラクターは別々のエンティティです。手が動くたびに、毎フレーム剣の位置を手動で計算しなければなりません。ホルスター、盾、さらには移動する乗り物に複数キャラクターが乗る場合など、難易度は指数関数的に上がります。
+
+これを解くには、フラットなリストを **統一シーングラフ** に置き換える必要があります。このシステムでは、キャラクターの骨盤ボーン、剣、巨大なエレベーターなど、エンジン内のすべてのエンティティが単一のグローバル階層内の **ノード** です。各ノードに任意の `parent_index` を与えることで、任意のオブジェクトを任意のオブジェクトにアタッチできます。親が動けば、子は自動的に追従します。
+
+== 性能の障壁: 冗長な計算
+
+再帰的な階層はアーキテクチャ上は優雅ですが、重大な性能上の課題をもたらします。従来のシーングラフでは、ノードの「ワールド行列」（3D ワールド内の最終位置）を計算するには、ローカルトランスフォームに親のワールド行列を乗算する必要があります。
+
+`WorldMatrix = ParentWorldMatrix * LocalMatrix`
+
+200 ボーンの複雑なキャラクターでは、指先のワールド空間位置を求めるには、骨盤から脊椎、肩、腕、手首まで階層全体をたどる必要があります。すべてのボーンについて毎フレームこの計算を行うと、キャラクターが動いていなくても膨大な CPU サイクルを浪費します。
+
+プロ品質の性能を得るために、**Dirty Flag パターン** を実装します。
+
+=== Dirty Flag の理解
+
+「Dirty Flag」は単純ながら強力な最適化です。毎フレーム盲目的に行列を再計算する代わりに、各ノードに小さな「状態」変数を追加します。ノードの位置を変更したら、それを **「Dirty」** とマークします。
+
+その後、ノード（またはその親）が dirty のときだけ、高価な行列乗算を行います。ノードが **「Clean」** なら、前フレームで計算したワールド行列をそのまま再利用します。
+
+[source,cpp]
+----
+static constexpr uint32_t INVALID_NODE_INDEX = 0xFFFFFFFF;
+
+enum TransformStatus : uint8_t {
+    Clean = 0,
+    LocalDirty = 1 << 0,  // This node's position/rotation/scale changed
+    WorldDirty = 1 << 1   // This node's world matrix needs recalculation
+};
+
+struct ColliderDef {
+    enum class Shape { CAPSULE, BOX, NONE };
+    Shape shape     = Shape::NONE;
+    float radius    = 0.0f;
+    float half_height = 0.0f;
+    glm::vec3 box_half_extents = {0,0,0};
+    float mass      = 1.0f;
+    std::string collision_group;
+    std::string collision_mask;
+};
+
+struct ConstraintDef {
+    enum class Type { NONE, BALL_SOCKET, HINGE };
+    Type        type              = Type::NONE;
+    float       swing_limit_deg   = 180.0f;
+    float       twist_limit_deg   = 180.0f;
+    float       hinge_min_deg     = -180.0f;
+    float       hinge_max_deg     =  180.0f;
+    glm::vec3   hinge_axis        = {0,0,1};
+    std::string parent_bone;
+};
+
+struct Node {
+    uint32_t node_index;
+    uint32_t parent_index = INVALID_NODE_INDEX;
+    std::vector<uint32_t> child_indices;
+    std::string name;
+
+    // Local transform data (SRT: Scale, Rotation, Translation)
+    glm::vec3 translation    = {0,0,0};
+    glm::quat local_rotation = glm::identity<glm::quat>();
+    glm::vec3 scale          = {1,1,1};
+
+    // Cached world matrix - we only update this when dirty!
+    glm::mat4 world_matrix = glm::mat4(1.0f);
+
+    uint8_t status = TransformStatus::Clean;
+    bool is_joint = false;
+
+    // Physics metadata (extracted from glTF extras)
+    ColliderDef collider_def;
+    ConstraintDef constraint_def;
+
+    // Call this whenever you change translation, rotation, or scale
+    void mark_dirty() {
+        status |= TransformStatus::LocalDirty | TransformStatus::WorldDirty;
+    }
+
+    // Computes the local transform matrix from SRT components.
+    // The order is TRS (Translation * Rotation * Scale).
+    glm::mat4 get_local_matrix() const {
+        return glm::translate(glm::mat4(1.0f), translation) *
+               glm::mat4_cast(local_rotation) *
+               glm::scale(glm::mat4(1.0f), scale);
+    }
+
+    // Safely extracts rotation from the world matrix, stripping any scale.
+    glm::quat get_world_rotation() const {
+        glm::mat3 rot_scale = glm::mat3(world_matrix);
+        glm::mat3 rotation;
+        // We must normalize the axes to remove scale before converting to a quaternion,
+        // otherwise non-uniform scaling will corrupt the rotation data.
+        rotation[0] = glm::normalize(rot_scale[0]);
+        rotation[1] = glm::normalize(rot_scale[1]);
+        rotation[2] = glm::normalize(rot_scale[2]);
+        return glm::quat_cast(rotation);
+    }
+};
+----
+
+この最適化は、数体のアニメーションキャラクターで詰まるエンジンと、群衆全体を扱えるエンジンの差です。トランスフォームの「汚れ」を追跡することで、ほとんどのシーンの大部分を占める静的な環境オブジェクトは、トランスフォーム更新にほぼゼロの CPU 時間しか消費しません。
+
+== キャッシュに優しいメモリ: データ指向設計（DOD）
+
+ノードの格納方法は、更新に使う数学と同じくらい重要です。従来のシーングラフはしばしばポインタ（例: `std::vector<Node*> children`）を使い、**「ポインタチェイシング」** を引き起こします。CPU が階層を更新しようとすると、各子ノードを見つけるためにメモリ上の異なる予測不能な場所へ飛び回る必要があります。この「ランダムアクセス」は CPU の高速キャッシュを外すため、非常に遅くなります。
+
+性能を最大化するために、すべてのノードを **フラットなデータ指向配列** に格納します。ポインタの代わりに、安定したインデックス（`uint32_t`）で親子をリンクします。
+
+[source,cpp]
+----
+class SceneGraph {
+public:
+    std::vector<Node> nodes;
+
+    // Linear update: Only works if nodes are topologically sorted (parent before children)
+    void update_transforms() {
+        for (auto& node : nodes) {
+            if (node.status & TransformStatus::WorldDirty) {
+                if (node.parent_index != INVALID_NODE_INDEX) {
+                    node.world_matrix = nodes[node.parent_index].world_matrix * node.get_local_matrix();
+                } else {
+                    node.world_matrix = node.get_local_matrix();
+                }
+
+                for (uint32_t child_index : node.child_indices) {
+                    nodes[child_index].status |= TransformStatus::WorldDirty;
+                }
+                node.status = TransformStatus::Clean;
+            }
+        }
+    }
+
+    // Recursive update: Correctly handles any node order and sub-tree updates
+    void update_world_matrices_subtree(uint32_t index) {
+        Node& node = nodes[index];
+
+        if (node.parent_index != INVALID_NODE_INDEX) {
+            node.world_matrix = nodes[node.parent_index].world_matrix * node.get_local_matrix();
+        } else {
+            node.world_matrix = node.get_local_matrix();
+        }
+
+        for (uint32_t child_idx : node.child_indices) {
+            // We force WorldDirty on children because their parent's matrix just changed
+            nodes[child_idx].status |= TransformStatus::WorldDirty;
+            update_world_matrices_subtree(child_idx);
+        }
+
+        node.status = TransformStatus::Clean;
+    }
+};
+----
+
+=== 順序の重要性: トポロジカルソート
+
+上のループには、微妙だが重要な詳細があります。「親から子へ」の更新を一回のパスで正しく行うには、親ノードが **常に** 子より配列内で前に現れる必要があります。
+
+骨盤ボーンがインデックス 0、大腿骨がインデックス 50 なら、骨盤が先に更新され、`world_matrix` が準備でき、「dirty」状態が大腿骨へ伝播します。順序が逆なら、大腿骨は前フレームの *古い* 骨盤行列を使って更新しようとし、四肢が体から遅れて見える「ジッター」が起きます。
+
+この順序を保証することを **トポロジカルソート** と呼びます。フラット配列でこの特定の順序を維持することで、CPU はノードデータを線形にプリフェッチでき、数千ノードを 1 ミリ秒の何分の一で処理できる、非常に高速でキャッシュに優しい更新が可能になります。
+
+== キャラクターパイプラインへの準備
+
+このエンジン拡張はレンダリング性能だけでなく、アーキテクチャ上の準備でもあります。統一された Dirty Flag 駆動のシーングラフを実装することで、後で実装するいくつかの高度な機能の土台を整えました。
+
+*   **スケルタルアニメーション**: ボーンはこの階層内の単なるノードになります。
+*   **物理同期**: 特定のノードに物理リジッドボディをアタッチします。ノードの `world_matrix` が dirty になったとき、物理プロキシを更新すべきタイミングが正確に分かります。
+*   **レイトレーシング（RTAS）**: レイトレーシング用の加速構造の構築は高コストです。Dirty Flag は、オブジェクトが動いたためにどの BLAS（Bottom-Level Acceleration Structure）を再構築すべきかを正確に示します。
+
+次の節では、この視覚的階層を物理シミュレーションとどう結びつけるかを見ていきましょう。
+
+== シンプルエンジンからの移行
+
+「シンプルなエンジンの構築」シリーズから来た場合、`ObjectInstance` 構造体のコレクションを持っている可能性があります。統一シーングラフへの移行は大きなアーキテクチャ上の転換です。移行チェックリストは次のとおりです。
+
+1.  **ポインタからインデックスへ**: `Node*` や `Entity*` 参照を、グローバルな `std::vector<Node>` への `uint32_t` インデックスに置き換えます。
+2.  **ストレージの統一**: 各 `Model` が独自の内部ノード階層を持つのではなく、すべての glTF ノードをグローバル `SceneGraph` に直接読み込みます。
+3.  **Dirty Flag の採用**: レンダーループ内の毎フレーム `Parent * Local` 行列計算を削除します。代わりに、フレーム開始時に一度だけ `update_transforms()` を呼び出します。
+4.  **トポロジカルソート**: glTF 読み込み時、親が常に子より先に `std::vector` へ追加される順序を保証します。これにより高速な線形更新ループが正しく動作します。
+
+これらの変更により、独立したオブジェクトの集合から、すべての要素が親に反応できる一貫したワールドへ移行し、複雑なキャラクター相互作用の舞台が整います。
+
+xref:Advanced_glTF/Scene_Graph_Hierarchy/01_introduction.adoc[前へ: はじめに] | xref:Advanced_glTF/Scene_Graph_Hierarchy/03_physics_syncing.adoc[次へ: 物理同期]

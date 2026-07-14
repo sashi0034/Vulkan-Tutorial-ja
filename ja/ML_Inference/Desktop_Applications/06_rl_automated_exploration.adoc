@@ -1,0 +1,414 @@
+= 自動探索のための強化学習
+:stem: latexmath
+
+ここまで CI に既知事項の検証を教えてきました。「このボタンを確認」「このテクスチャを検証」と指示。しかし*思いつかなかった*バグは？ レベル読み込み中に Options メニューを正確に 3 回クリックしたときだけ起きる rare クラッシュは？
+
+デスクトップアプリケーション節の最終章では、真に自律的なものを構築します。**強化学習（RL）エージェント**——疲れ知らずのデジタル QA テスター——を作り、アプリを探索して「新しい」または「壊れた」ものを見つけるのが唯一の仕事。
+
+== スクリプト化テストを超えて
+
+従来テストはチェックリスト。手順に従いボックスにチェック。しかしアプリケーションは複雑で状態空間は無限。すべての入力系列のテストは書けない。
+
+RL エージェントはスクリプトに従いません。相互作用で学習。ボタンクリック、カメラ移動、メニュー操作。人間と違い、CI パイプライン内で 1 時間に数千回、24/7 実行可能。
+
+=== マルコフ決定過程（MDP）
+
+探索者を構築するには Vulkan アプリケーションを**MDP**として枠組み化。
+*   **状態（latexmath:[s]）**: 現在の画面ピクセル（エージェントが「見る」もの）。
+*   **行動（latexmath:[a]）**: クリックまたはキー入力（エージェントが「する」こと）。
+*   **遷移**: 行動に基づき次フレーム/メニューへ。
+*   **報酬（latexmath:[r]）**: 行動がどれだけ「良い」かを伝える数値。
+
+多くの RL 問題（Atari ゲームなど）では報酬はゲームスコアです。Vulkan アプリにはスコアがありません。考案する必要があります。
+
+== 好奇心駆動探索
+
+**好奇心駆動探索**に焦点。エージェントに「勝利」ではなく「驚き」で報酬。
+
+.Random Network Distillation（RND）好奇心メカニズム
+image::images/ML_Inference/Desktop_Applications/rnd_diagram.svg[RND diagram showing Target and Predictor networks and how prediction error generates a reward,800]
+
+== 課題: QA テスターにどう報酬を与えるか
+
+典型的 RL——チェスを教える——では報酬は単純: 勝ち（+1）か負け（-1）。Vulkan アプリケーションに「勝利」はない。可能な限り探索したい。
+
+クラッシュ発見で報酬すると、同じクラッシュを繰り返してスコア最大化するかも——役に立たない。
+
+代わりに **Random Network Distillation（RND）** を使い、*見たことのない*ものを見ることで報酬。
+
+=== 「驚き」メカニズム: RND
+
+友達 Alice と Bob がいると想像。
+*   **Alice**: アプリの可能なすべての画面を一度見、完璧な記憶。どんな画面も即座に正確に説明。
+*   **Bob**: 現在 Alice から学習中。
+
+両方が千回見た画面（メインメニューなど）では、Bob は Alice の言うことを正確に予測。驚きなし。
+
+まれな画面——クラッシュレポートや隠しデバッグメニュー——では Bob は Alice の応答予測に苦戦します。その「予測誤差」が報酬です！
+
+==== なぜ「Distillation」？
+RND では human Alice はいない。**ランダム固定ネットワーク**を使う。ランダム重みで初期化し*学習しない*。複雑な数学的「ランドスケープ」を表す。
+
+エージェントの「好奇心ネットワーク」がそのランダムネットワーク出力を**Distill**（予測）しようとする。
+*   馴染みピクセルでは成功（低誤差）。
+*   新ピクセルでは失敗（高誤差）。
+
+[latexmath]
+++++
+\text{Intrinsic Reward} = || \hat{f}(s) - f(s) ||^2
+++++
+
+latexmath:[f(s)] は固定ランダムターゲット、latexmath:[\hat{f}(s)] は学習可能 predictor。
+
+== アーキテクチャ: エージェントと Vulkan の接続
+
+動作させるには 3 要素:
+1.  **環境**: Vulkan アプリケーション。フレームをエージェントへ送り、入力（クリック/キー）を受け取る。
+2.  **頭脳**: RL エージェント（PPO アルゴリズム使用）が次に何をするか決定。
+3.  **好奇心**: RND モジュールが各フレームの「驚き」を計算。
+
+.RL エージェントと Vulkan 統合アーキテクチャ
+image::images/ML_Inference/Desktop_Applications/rl_system_architecture.svg[Architecture diagram showing the loop between Vulkan App, RL Agent, and RND Module,800]
+
+== RND モジュールの実装
+
+好奇心報酬システムから:
+
+[source,python]
+----
+class RNDCuriosityModule:
+    """Computes a reward based on how 'surprised' we are by a frame."""
+    def __init__(self, device='cuda'):
+        # Alice: Fixed random network (the 'Target')
+        self.random_net = RandomNetwork().to(device)
+        # Bob: Trainable network (the 'Predictor')
+        self.predictor_net = PredictorNetwork().to(device)
+
+    def compute_intrinsic_reward(self, frames):
+        with torch.no_grad():
+            target_features = self.random_net(frames)
+
+        predicted_features = self.predictor_net(frames)
+
+        # The more Bob struggles to predict Alice's output,
+        # the higher the 'curiosity' reward.
+        reward = torch.mean((predicted_features - target_features) ** 2, dim=1)
+        return reward
+----
+
+predictor は馴染み状態でランダムネットワークに徐々に一致し、それらの報酬を下げる。新状態は十分見るまで高報酬のまま。
+
+== Vulkan アプリケーションインタフェース
+
+エージェントは Vulkan アプリと相互作用する必要。2 アプローチ:
+
+=== アプローチ 1: プログラム制御
+
+RL エージェントからコマンドを受け付けるようアプリを計器化:
+
+[source,cpp]
+----
+class RLControllableApp {
+public:
+    void run() {
+        while (!shouldClose_) {
+            // 1. Check for actions from the RL agent
+            if (popAction(action)) executeAction(action);
+
+            // 2. Standard Vulkan Render
+            render();
+
+            // 3. Capture observation (frame) for the agent
+            auto pixels = readFramebuffer();
+            sendToAgent(pixels);
+        }
+    }
+
+private:
+    void executeAction(const Action& action) {
+        // Map agent actions to UI events (e.g. ImGui mouse/key injection)
+        if (action.type == Action::Click) injectClick(action.x, action.y);
+        // ...
+    }
+};
+----
+
+=== アプローチ 2: 外部制御（Linux）
+
+X11 や Wayland で外部から入力イベント注入:
+
+[source,python]
+----
+class ExternalVulkanController:
+    """Uses OS-level tools (like xdotool) to control a standard Vulkan app."""
+    def __init__(self, app_command):
+        self.process = subprocess.Popen(app_command)
+        self.window_id = self.find_window("VulkanApp")
+
+    def capture_frame(self):
+        # Capture the window region using OS screenshot tools
+        screenshot = ImageGrab.grab(bbox=self.get_window_geometry())
+        return np.array(screenshot)
+
+    def click(self, x, y):
+        # Inject mouse click via xdotool
+        subprocess.run(['xdotool', 'mousemove', '--window', self.window_id, str(x), str(y), 'click', '1'])
+----
+
+プログラム制御は高速で信頼性高い。外部制御は既存アプリへの変更なし追加が容易。
+
+== RL エージェント: PPO（Proximal Policy Optimization）
+
+エージェントの brain には **PPO**。安定で信頼性の高い学習の業界標準。
+
+=== なぜ PPO？
+古いアルゴリズム（Vanilla Policy Gradient など）は不安定。1 回「悪い」更新で性能 collapse、回復不能。PPO は**Clipping Mechanism**で各更新が行動を*あまり*変えないよう保証。
+
+=== Actor-Critic アーキテクチャ
+PPO エージェントに 2 つの「head」:
+1.  **Actor（Policy）**: 各行動の確率（例: ボタン A 80%、B 20%）。
+2.  **Critic（Value）**: 現在状態の将来報酬予測。
+
+実際報酬と Critic 予測を比較し**Advantage**——期待より行動がどれだけ良い（悪い）か——を計算。
+
+[latexmath]
+++++
+\text{Advantage} = \text{Actual Reward} - \text{Predicted Value}
+++++
+
+Advantage が正なら将来その行動確率を増加。
+
+[source,python]
+----
+class PPOAgent:
+    def select_action(self, state):
+        # 1. Pass the screen pixels through the CNN
+        # 'logits' come from the Actor head, 'value' from the Critic head
+        logits, value = self.policy_net(state)
+
+        # 2. Sample an action (exploration vs exploitation)
+        # We don't always pick the best action; sometimes we pick
+        # a less likely one to keep exploring.
+        action = sample_from_distribution(logits)
+
+        return action, value
+----
+
+== 行動空間設計
+
+エージェントができること:
+
+[source,python]
+----
+class ActionSpace:
+    """Discrete actions the agent can take (e.g., Click X,Y or Press Key)."""
+    def action_to_command(self, action_id):
+        if action_id < self.num_click_actions:
+            # Map grid cell to screen pixel coordinates
+            return {'type': 'click', 'x': px, 'y': py}
+        elif action_id < self.total_actions:
+            # Map to specific keyboard keys (ESC, Space, etc.)
+            return {'type': 'key', 'key': key_map[action_id - offset]}
+        return {'type': 'wait'}
+----
+
+グリッドベースクリックは離散（多くの RL アルゴリズムで必要）だが UI 要素を reasonable にカバー。
+
+== 学習ループ
+
+すべて統合:
+
+[source,python]
+----
+def train_explorer():
+    # 1. Initialize our curiosity module and the agent
+    curiosity = RNDCuriosityModule()
+    agent = PPOAgent()
+
+    while True:
+        # 2. Agent interacts with the Vulkan app
+        action = agent.select_action(current_screen)
+        execute_in_vulkan(action)
+
+        # 3. Calculate 'Surprise' reward
+        reward = curiosity.compute_intrinsic_reward(next_screen)
+
+        # 4. If the app crashed, give a huge bonus reward!
+        if app_crashed(): reward += 10.0
+
+        # 5. Learn from this experience
+        agent.update(experience_buffer)
+        curiosity.update(next_screen)
+----
+
+== ユースケース 1: CI バグ発見
+
+CI で一晩エージェント学習:
+
+[source,yaml]
+----
+name: RL Exploration Testing
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Run nightly at 2 AM
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build application
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Install RL dependencies
+        run: |
+          pip install torch torchvision numpy opencv-python pyautogui
+
+      - name: Run RL exploration
+        run: |
+          python scripts/rl_explorer.py \
+            --app ./build/my_vulkan_app \
+            --episodes 1000 \
+            --checkpoint models/explorer_checkpoint.pt
+
+      - name: Upload crash logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: rl-discovered-crashes
+          path: crashes/
+----
+
+エージェントが数時間アプリを探索し、再現手順付きクラッシュをログします。さらに重要なのは、発見した視覚異常を第 4 章で確立した**Bug Harvesting**パイプラインへ自動的に流し込み、実世界の失敗ケースで意味的検証器を強化できることです。
+
+=== QA 向けハイパーパラメータチューニング
+探索エージェントはゲームエージェントと異なる設定:
+*   **latexmath:[\gamma]（Gamma）**: 「割引係数」。高く（0.999）設定——新メニューへ至る長期クリック系列を重視。
+*   **latexmath:[\lambda]（Lambda）**: GAE（Generalized Advantage Estimation）用。分散とバイアスのバランス。
+*   **Entropy Coefficient**: 高く（0.01–0.1）設定——良い経路を見つけても**ランダムクリックを強制**。「疲れ知らず」QA テスターの部分。
+
+== ユースケース 2: 自動ベンチマーク
+
+性能負荷シーンへナビゲートするエージェント学習:
+
+[source,python]
+----
+class BenchmarkingAgent(PPOAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fps_history = []
+
+    def compute_reward(self, frame, fps):
+        """Reward agent for finding slow scenes"""
+        # Intrinsic curiosity reward
+        intrinsic = self.curiosity.compute_intrinsic_reward(frame)
+
+        # Extrinsic reward: finding low FPS is good (for benchmarking)
+        extrinsic = 0.0
+        if fps < 30:
+            extrinsic = (30 - fps) / 30.0  # Reward proportional to slowness
+
+        return intrinsic + extrinsic
+----
+
+このエージェントで性能ボトルネックを自動発見。
+
+== ユースケース 3: 自動デモモード
+
+機能を紹介するエージェントを学習:
+
+[source,python]
+----
+# Reward function for impressive demos
+def demo_reward(state, action, next_state):
+    # High reward for visual variety
+    visual_change = np.mean(np.abs(next_state - state))
+
+    # High reward for accessing different menus
+    ui_diversity = measure_ui_diversity(next_state)
+
+    # Penalty for getting stuck
+    stuck_penalty = -1.0 if visual_change < 0.01 else 0.0
+
+    return visual_change + ui_diversity + stuck_penalty
+----
+
+学習済みエージェントは展示会やトレーラーで「デモモード」実行、印象的機能を自動ナビゲート。
+
+== デバッグとモニタリング
+
+エージェントが何を学んでいるか追跡:
+
+[source,python]
+----
+import matplotlib.pyplot as plt
+from collections import deque
+
+class ExplorationMonitor:
+    def __init__(self):
+        self.visited_states = {}  # Hash -> visit count
+        self.crashes_found = []
+        self.episode_rewards = deque(maxlen=100)
+
+    def record_state(self, state):
+        state_hash = hash(state.tobytes())
+
+        if state_hash not in self.visited_states:
+            self.visited_states[state_hash] = 0
+
+        self.visited_states[state_hash] += 1
+
+    def plot_exploration(self):
+        # Histogram of state visit counts
+        visit_counts = list(self.visited_states.values())
+
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.hist(visit_counts, bins=50)
+        plt.xlabel('Visit Count')
+        plt.ylabel('Number of States')
+        plt.title('State Visit Distribution')
+
+        # Reward over time
+        plt.subplot(1, 2, 2)
+        plt.plot(self.episode_rewards)
+        plt.xlabel('Episode')
+        plt.ylabel('Total Reward')
+        plt.title('Learning Progress')
+
+        plt.tight_layout()
+        plt.savefig('exploration_stats.png')
+
+    def coverage_stats(self):
+        total_states = len(self.visited_states)
+        novel_states = sum(1 for c in self.visited_states.values() if c == 1)
+
+        print(f"Total unique states: {total_states}")
+        print(f"Novel states (seen once): {novel_states}")
+        print(f"Crashes found: {len(self.crashes_found)}")
+----
+
+== まとめ
+
+RL ベース自動探索は好奇心駆動学習と実践 Vulkan アプリテストを組み合わせ:
+
+**Random Network Distillation**: スコア不要で新アプリ状態発見の内的報酬。
+
+**PPO エージェント**: アプリナビゲーション学習、探索（新状態）と exploitation（報酬につながった行動の反復）のバランス。
+
+**プログラム/外部制御**: フレーム取得と入力イベント注入で Vulkan アプリとインタフェース。
+
+**複数ユースケース**: CI バグ発見、自動ベンチマーク、デモモード、一般 GUI 自動化。
+
+**実践 CI 統合**: GitHub Actions で一晩実行しクラッシュとエッジケースを自動発見。
+
+人間がテストを思いつかないバグ発見、性能特性の自動探索、アプリデモの学習——すべて real Vulkan アプリへの ML 技法適用。
+
+xref:ML_Inference/Desktop_Applications/05_real_time_camera.adoc[前へ: リアルタイムカメラ統合] | xref:ML_Inference/Desktop_Applications/07_ray_tracing_optimization.adoc[次へ: レイトレーシング最適化]

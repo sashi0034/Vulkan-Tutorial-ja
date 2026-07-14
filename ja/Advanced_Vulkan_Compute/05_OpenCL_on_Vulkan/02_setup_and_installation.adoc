@@ -1,0 +1,77 @@
+:pp: {plus}{plus}
+
+= セットアップとインストール: 環境の準備
+
+Vulkan 上で OpenCL コードを動かすには、開発キットにいくつかの追加ツールが必要です。最も重要な 2 つは **clspv**（コンパイラ）と **clvk**（ランタイムライブラリ）です。
+
+== ツールの入手先
+
+`clspv` と `clvk` はどちらも GitHub でホストされているオープンソースプロジェクトです。現時点では標準の Vulkan SDK には含まれていないため、自分で取得してビルドする必要があります。ただし一部プラットフォーム向けの事前ビルドバイナリが時折利用可能です。
+
+- **clspv**: link:https://github.com/google/clspv[github.com/google/clspv]
+- **clvk**: link:https://github.com/kpet/clvk[github.com/kpet/clvk]
+
+== clspv のビルド
+
+`clspv` は LLVM と Clang の上に構築された複雑なツールです。そのため、いくつかの依存があります。
+
+1.  **CMake**: バージョン 3.17.2 以上。
+2.  **Python 3**: 各種ビルドスクリプトで使用。
+3.  **Git**: リポジトリとその依存のクローン用。
+4.  **C{pp} コンパイラ**: 現代的なコンパイラ（GCC 7+、Clang 5+、または MSVC 2017+）。
+
+`clspv` をビルドするには、次の手順に従ってください。
+
+[source,bash]
+----
+git clone --recursive https://github.com/google/clspv.git
+cd clspv
+python3 utils/fetch_sources.py
+mkdir build && cd build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja clspv
+----
+
+ビルドが完了すると、`build` フォルダに `clspv` 実行ファイルがあります。アクセスしやすいようシステムの `PATH` に追加してください。
+
+== clvk のビルド
+
+`clvk` は依存として `clspv` をビルドし、実行時に OpenCL C カーネルを Vulkan 互換 SPIR-V へコンパイルするために内部で使います。したがって、目標が `clvk` の利用だけなら `clspv` を別途ビルドする必要はありません。ビルドに主に必要なのは Vulkan ドライバとヘッダです。
+
+[source,bash]
+----
+git clone --recursive https://github.com/kpet/clvk.git
+cd clvk
+mkdir build && cd build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja
+----
+
+これにより共有ライブラリ（例: Linux では `libOpenCL.so.1`、Windows では `OpenCL.dll`）が生成されます。
+
+== プラットフォーム固有の注意
+
+ビルドプロセスはプラットフォーム間で似ていますが、いくつか重要な考慮点があります。
+
+=== Linux
+
+Linux では、Vulkan SDK またはディストリビューションの Vulkan 開発パッケージ（`vulkan-headers`、`libvulkan-dev`）がインストールされていることを確認してください。多くの開発者は `clvk` を **Vulkan Layer** として使うか、`clvk` 共有ライブラリに明示的にリンクすることを好みます。
+
+=== Windows
+
+Windows では Visual Studio が必要です。`clspv` は Visual Studio コマンドプロンプトでビルドできます。`clvk` を使うには、生成された `OpenCL.dll` を `clvk.dll` にリネームし（システム全体の OpenCL ドライバとの衝突を避けるため）、アプリケーションで動的にロードできます。
+
+=== Android
+
+Android は `clvk` で最も人気のあるプラットフォームの一つです。Android 向けにビルドするには **Android NDK** が必要です。ホストマシンで `clspv` をクロスコンパイルして SPIR-V バイナリを生成し、Android プロジェクトの `jniLibs` フォルダに `clvk` ライブラリをネイティブ共有ライブラリとして含められます。
+
+== セットアップの検証
+
+ツールをビルドしたら、インストールを検証してください。
+
+1.  **clspv**: ターミナルで `clspv --version` を実行します。現在のバージョンと LLVM/Clang ベースが報告されるはずです。
+2.  **clvk**: `clinfo` のようなツールで、`clvk` がシステム上の OpenCL プラットフォームとして正しく認識されるか確認できます。Linux では `LD_LIBRARY_PATH=/path/to/clvk/build clinfo` で実行し、Vulkan バックの OpenCL デバイスが現れるか見てください。
+
+環境の準備ができたら、`clspv` を使って最初の OpenCL カーネルを Vulkan 向けにコンパイルする方法を見ていきましょう。
+
+xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/01_introduction.adoc[前へ: OpenCL on Vulkan] | xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/03_clspv_pipeline.adoc[次へ: clspv パイプライン]

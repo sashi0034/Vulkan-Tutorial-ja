@@ -1,0 +1,40 @@
+:pp: {plus}{plus}
+= ビューポートスウィズルによる投影の最適化
+
+一部の広 FOV ヘッドセットでは、物理ディスプレイパネルが標準のデカルト座標系と揃わない角度で取り付けられていることがあります。ここで **VK_NV_viewport_swizzle** 拡張が非常に有用になります。
+
+== スウィズルステージ: パイプラインの再配線
+
+ビューポートスウィズルを理解するには、ピクセルのハードウェア経路を見る必要があります。頂点シェーダーが終わった後、GPU は **透視除算（Perspective Division）** と **ビューポート変換（Viewport Transformation）** を行います。通常これは固定で、X は X へ、Y は Y へ行きます。
+
+**ビューポートスウィズル** では、これらの成分を *ハードウェアレベルで* 再配線できます。
+
+*   **なぜ？**: 一部のヘッドセットは、特定の FOV に多くのピクセルを収めるために回転したディスプレイパネルを使います。
+*   **シェーダーの問題**: シェーダーで X と Y を入れ替えるのは簡単ですが、それはラスタライズ *前* に起きるため、深度テストやハードウェアカリングが壊れることがあります。
+*   **ハードウェア解法**: スウィズルはシェーダーの *後*、ピクセルが描かれる *前* に起きます。回転や反転した軸を、性能ペナルティなしでハードウェアに処理させられます。
+
+[source,cpp]
+----
+// Configuring a viewport swizzle for non-standard display layouts
+vk::PipelineViewportSwizzleStateCreateInfoNV swizzleState{};
+vk::ViewportSwizzleNV leftEyeSwizzle{
+    vk::ViewportCoordinateSwizzleNV::ePositiveX,
+    vk::ViewportCoordinateSwizzleNV::eNegativeY, // Invert vertical axis for hardware-level flip
+    vk::ViewportCoordinateSwizzleNV::ePositiveZ,
+    vk::ViewportCoordinateSwizzleNV::ePositiveW
+};
+swizzleState.pViewportSwizzles = &leftEyeSwizzle;
+
+vk::GraphicsPipelineCreateInfo pipelineInfo{};
+pipelineInfo.pNext = &swizzleState;
+----
+
+== デバイス固有性と移植性
+
+ビューポートスウィズルは低レベルのハードウェア最適化として強力ですが、しばしば **ベンダー固有**（`NV` 接尾辞が示す通り）であることを覚えておくことが重要です。
+
+モダンな空間コンピューティングエンジンでは、スウィズルを「ハードウェアドライバ」機能として扱うべきです。エンジンのコロジックは直線のままにし、ハンドシェイク中に発見したヘッドセット要件に基づいて `VulkanContext` がこれらのスウィズルを適用します。これによりゲームコードはクリーンに保ちつつ、特殊な広 FOV ハードウェアで最大限の性能を出せます。
+
+次の章では、**CAVE アーキテクチャとマルチ GPU 同期** を使い、これらの空間コンピューティング手法をより大規模な環境へ拡張する方法を見ます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/11_Canted_Displays/02_non_parallel_projections.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/11_Canted_Displays/04_incorporating_into_the_engine.adoc[Next]

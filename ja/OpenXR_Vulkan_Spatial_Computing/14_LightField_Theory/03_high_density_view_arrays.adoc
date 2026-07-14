@@ -1,0 +1,70 @@
+:pp: {plus}{plus}
+= 高密度ビュー配列
+
+4D ライトフィールドの管理には、容易にギガバイト級に達するデータセットを扱うための格納とアクセスの両方の最適化が必要です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+標準の OpenXR ランタイムは固定解像度の投影レイヤに焦点を当てています。Vulkan の Buffer Device Address（BDA）と Sparse Residency を使い、プレノプティックデータに必要な高密度ビュー配列を管理し、標準 OpenXR バッファモデルを超える空間詳細を可能にします。
+
+== ギガバイト問題
+
+4D ライトフィールドの管理は大きなメモリ課題を伴います。latexmath:[1024 \times 1024] の入口点と latexmath:[32 \times 32] の角度を持つ控えめなライトフィールドでも、およそ 10 億本の光線を含みます。光線あたり 16 バイト（RGBA FP32）なら **16 GB の VRAM**——多くのコンシューマ GPU の容量を超えます。
+
+ランタイムは OS と密に連携し、これらの巨大バッファを VRAM に「ピン」し、しばしば **Sparse Residency**（`VK_KHR_sparse_binding` 経由）で可視タイルだけを読み込みます。
+
+== FP16 と量子化: 帯域の節約
+
+精度を下げることが最適化の第一歩です。Slang で `float4` の代わりに `half4` を使うと、VRAM フットプリントは即座に半減します。ライトフィールド内の隣接光線はしばしば非常に似ており、大きな視覚損失なしに高品質圧縮が可能です。
+
+== Buffer Device Address（BDA）: ポインタベースのアクセス
+
+これほど大きなデータセットでは、標準の Vulkan Descriptor Sets のオーバーヘッドがボトルネックになり得ます。**Buffer Device Address** を使うと、データの生 64 ビットポインタをシェーダーへ直接渡せます。
+
+[source,cpp]
+----
+// Using BDA to get a raw pointer using designated initializers
+vk::BufferDeviceAddressInfo addressInfo{
+    .buffer = *lightFieldBuffer
+};
+uint64_t gpuAddress = device.getBufferAddress(addressInfo);
+
+// Passing the pointer to a Slang shader via Push Constants
+struct PushConstants {
+    uint64_t lightFieldPtr;
+    uint2 stRes;
+    uint2 uvRes;
+};
+commandBuffer.pushConstants<PushConstants>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
+----
+
+== 発展: ニューラル圧縮と 4D キャッシュ局所性
+
+Vulkan は、標準の線形バッファモデルを超えるメモリ最適化を可能にします。
+
+*   **ニューラルライトフィールド圧縮**: Vulkan の **Video Decode** と **Compression** 拡張を使い、カスタムのコンピュートベース展開器を実装できる。同じ VRAM フットプリントにより多くの空間詳細を収められる。
+*   **4D タイリングとスウィズル**: コンピュートシェーダーでカスタムスウィズル（Morton 順インデックスなど）を実装し、高密度ライトフィールド配列のサンプリング時に GPU キャッシュを効率よく保てる。
+
+== キャッシュ局所性: 空間–方向タイリング
+
+標準の 4D 配列レイアウトは GPU キャッシュに不利です。修正のため **4D タイリング** を実装し、小さな空間・方向ブロックが連続するようデータを再構成します。
+
+[source,slang]
+----
+// Tiled 4D indexing example in Slang
+uint getTiledIndex(uint2 st, uint2 uv) {
+    uint2 tileSize = uint2(8, 8);
+    uint2 tileCoord = st / tileSize;
+    uint2 localCoord = st % tileSize;
+
+    // Reorganizing memory to keep spatial neighbors together
+    return (tileCoord.x + tileCoord.y * stResTiles) * (tileSize.x * tileSize.y) +
+           (localCoord.x + localCoord.y * tileSize.x);
+}
+----
+
+TIP: BDA とスパースリソースの詳細については、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#memory-device-address[Vulkan Specification on Device Addresses]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/14_LightField_Theory/02_4d_lightfield_representation.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/14_LightField_Theory/04_incorporating_into_the_engine.adoc[Next]

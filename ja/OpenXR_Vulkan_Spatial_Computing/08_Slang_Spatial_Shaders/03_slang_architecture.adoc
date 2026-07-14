@@ -1,0 +1,87 @@
+:pp: {plus}{plus}
+= N-View シェーダー向け Slang アーキテクチャ
+
+マルチビュー対応シェーダーの記述は独特の課題です。GPU ハードウェアがドローコマンドの複製を処理する一方、ビュー／投影行列のような眼固有データへ効率的にアクセスすることを保証するのは我々の仕事です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+Slang のような現代的シェーダー言語を使い、OpenXR が要求する複数ビューを管理することは、高性能エンジンの標準的実践です。このアーキテクチャにより、単一の統一シェーダーコードベースで任意の数のビュー（モノ、ステレオ、またはクアッド）を扱えます。
+
+== N-View マインドセット: アグノスティックなシェーダー
+
+従来のシェーダーでは単一の `viewMatrix` を渡すかもしれません。XR 対応エンジンでは **N-View マインドセット** を採用し、モノ、ステレオ、さらには「Quad-Views」（4 眼）を動的に扱うようシェーダーを書きます。
+
+Slang の強力な型システムと **StructuredBuffer** により、`SV_ViewID` に基づきシェーダーがインデックスできるビューデータの配列を渡せます。
+
+[source,slang]
+----
+// 1. Defining a View Structure in Slang
+struct SpatialView {
+    float4x4 viewProjection;
+    float4x4 inverseView;
+    float4 eyePosition;
+};
+
+// 2. Accessing N-Views in a Structured Buffer
+StructuredBuffer<SpatialView> eyeViews;
+
+struct VertexOutput {
+    float4 position : SV_Position;
+    uint viewID : SV_ViewID;
+};
+
+VertexOutput main(VertexInput input, uint viewID : SV_ViewID) {
+    VertexOutput output;
+
+    // Index into our views using the hardware-provided viewID
+    SpatialView currentView = eyeViews[viewID];
+
+    output.position = mul(currentView.viewProjection, float4(input.position, 1.0));
+    output.viewID = viewID;
+    return output;
+}
+----
+
+C++ 側では、指定初期化子を使いこれらのバッファをデスクリプタにバインドします。
+
+[source,cpp]
+----
+vk::DescriptorBufferInfo bufferInfo{
+    .buffer = *eyeViewsBuffer,
+    .offset = 0,
+    .range = sizeof(SpatialView) * maxViews
+};
+
+vk::WriteDescriptorSet descriptorWrite{
+    .dstSet = *descriptorSet,
+    .dstBinding = 0,
+    .descriptorCount = 1,
+    .descriptorType = vk::DescriptorType::eStructuredBuffer,
+    .pBufferInfo = &bufferInfo
+};
+----
+
+== フラグメントシェーダーへの伝播
+
+`SV_ViewID` は頂点シェーダーだけのものではありません。**フラグメントシェーダー** へ伝播し、各眼の物理的位置に基づくスペキュラハイライト計算など、眼固有のロジックを行えます。
+
+ランタイムはビューマスクのルーティングとビューポート配列の管理を処理し、各フラグメントシェーダー呼び出しがマルチビューブロードキャストの正しいレイヤーをターゲットにすることを保証します。多くのランタイムは小さなバッファを GPU の「Constant Cache」に保つことで最適化し、ビューごとのインデックス付けを極めて効率的にします。
+
+== 発展: 協調シェーディングと動的投影
+
+Vulkan では「N-View」マインドセットを標準より先へ押し進められます。
+
+*   **協調ビューシェーディング**: `viewID` で分岐できますが、そうすると GPU ダイバージェンスにつながり得ます。Vulkan の **サブグループ演算** を使いビュー間で情報を共有し、高い GPU 占有率を維持できます。
+*   **動的投影モデル**: **Shader Objects**（`VK_EXT_shader_object`）を使うと、パイプライン全体を再作成せずにビュー投影ロジックを動的に切り替えられ、レンズ固有の投影モデルへのリアルタイム調整が可能です。
+
+== モジュラーな空間シェーダー
+
+Slang の **Generics** と **Interfaces** サポートにより、ビュー数に完全に依存しないシェーダーを書けます。空間ロジックを一度定義し、基盤のマルチビュー統合はコンパイラに任せます。
+
+これによりエラーの可能性が大幅に減ります。「Spectator Camera」用に 3 つ目のビューを追加しても、シェーダーコードを変える必要はなく——ビューマスクと `eyeViews` バッファのサイズを更新するだけです。
+
+TIP: Slang と Vulkan 統合の詳細は、公式の link:https://shader-slang.com/slang/user-guide/index.html[Slang User Guide]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/08_Slang_Spatial_Shaders/02_native_multiview.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/08_Slang_Spatial_Shaders/04_incorporating_into_the_engine.adoc[次へ]

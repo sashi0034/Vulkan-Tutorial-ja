@@ -1,0 +1,377 @@
+:pp: {plus}{plus}
+
+= ツール: 堅牢性を高めるための Vulkan 拡張機能
+
+== 堅牢性を高めるための Vulkan 拡張機能
+
+Vulkan の明示的な設計により、開発者はグラフィックス パイプラインをきめ細かく制御できますが、この制御には責任が伴います。アプリケーションが境界外のメモリにアクセスしたり、初期化されていないリソースを使用したりするなどの間違いを犯した場合、未定義の動作が発生する可能性があります。このセクションでは、特に VK_EXT_robustness2 に焦点を当てて、このような問題に対してアプリケーションの堅牢性を高めるのに役立つ Vulkan 拡張機能について説明します。
+
+=== Vulkan の未定義の動作を理解する
+
+堅牢性の拡張に入る前に、Vulkan アプリケーションでどのような種類の未定義の動作が発生する可能性があるかを理解しましょう。
+
+1. *境界外アクセス*: バッファーまたはイメージの境界外のメモリへのアクセス
+2. *Use-after-free*: リソースが破棄された後に使用する
+3. *未初期化メモリ*: 初期化されていないメモリからの読み取り
+4. *無効なディスクリプタ*: 無効なリソースまたは互換性のないリソースを指すディスクリプタの使用
+5. *シェーダー実行エラー*: ゼロ除算、無限ループなど。
+
+標準の Vulkan では、これらのエラーは次のような予期しない動作を引き起こす可能性があります。
+
+* アプリケーションがクラッシュする
+* GPUがハングしてシステムの再起動が必要になる
+* 破損したレンダリング
+* セキュリティの脆弱性
+* 異なるハードウェア間で一貫性のない動作が発生する
+
+ロバストネス拡張機能は、これらのシナリオにおいて、多くの場合、小さなパフォーマンス コストで、より予測可能な動作を提供することを目的としています。
+
+=== VK_EXT_robustness2 拡張機能
+
+VK_EXT_robustness2 拡張機能は、元の VK_EXT_robustness 拡張機能の改良版です。これは、未定義の動作、特に境界外のアクセスに対して、より包括的な保護を提供します。
+
+==== 主な特長
+
+VK_EXT_robustness2 は、いくつかの重要な機能を提供します。
+
+1. *堅牢なバッファ アクセス*: バッファからの範囲外の読み取りは、未定義の動作を引き起こすのではなく、ゼロ値を返します。
+2. *堅牢なイメージ アクセス*: イメージからの境界外の読み取りはゼロまたは透明な黒を返します
+3. *Null ディスクリプタの処理*: Null ディスクリプタからの読み取りはゼロ値を返します
+4. *Robust Buffer Access 2*: 境界外の書き込みも破棄して処理する改良バージョン
+
+==== VK_EXT_robustness2 の有効化
+
+この拡張機能を有効にして使用する方法を見てみましょう。
+
+[source,cpp]
+----
+bool check_robustness2_support(vk::raii::PhysicalDevice& physical_device) {
+    // Check if the extension is supported
+    auto available_extensions = physical_device.enumerateDeviceExtensionProperties();
+
+    for (const auto& extension : available_extensions) {
+        if (strcmp(extension.extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void enable_robustness2(vk::DeviceCreateInfo& device_create_info,
+                       std::vector<const char*>& enabled_extensions) {
+    // Add the extension to the list of enabled extensions
+    enabled_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    device_create_info.setPEnabledExtensionNames(enabled_extensions);
+
+    // Set up the robustness2 features
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2_features{};
+    robustness2_features.setRobustBufferAccess2(VK_TRUE);
+    robustness2_features.setRobustImageAccess2(VK_TRUE);
+    robustness2_features.setNullDescriptor(VK_TRUE);
+
+    // Add to the pNext chain
+    robustness2_features.pNext = device_create_info.pNext;
+    device_create_info.pNext = &robustness2_features;
+}
+
+vk::raii::Device create_robust_device(vk::raii::PhysicalDevice& physical_device,
+                                     vk::raii::Instance& instance) {
+    // Check for support
+    if (!check_robustness2_support(physical_device)) {
+        std::cerr << "VK_EXT_robustness2 is not supported on this device" << std::endl;
+        // Fall back to less robust behavior or abort
+    }
+
+    // Set up device creation
+    std::vector<const char*> enabled_extensions;
+    // Add your other required extensions here
+
+    vk::DeviceCreateInfo create_info{};
+    // Set up your queues, features, etc.
+
+    // Enable robustness2
+    enable_robustness2(create_info, enabled_extensions);
+
+    // Create the device
+    return vk::raii::Device(physical_device, create_info);
+}
+----
+
+==== 実際に堅牢なアクセスを使用する
+
+拡張機能を有効にすると、堅牢なバッファーと画像アクセスが自動的に適用されます。ただし、次のような考慮事項に注意する必要があります。
+
+1. *パフォーマンスへの影響*: GPU は境界チェックを実行する必要があるため、堅牢なアクセスにはパフォーマンス コストがかかる可能性があります。
+2. *正確さの代替品ではありません*: 堅牢性拡張機能はアプリケーションの回復力を高めますが、根本的なバグは修正しません。
+3. *デバッグとリリース*: 開発およびテスト用のデバッグ ビルドで堅牢性を有効にすることを検討しますが、リリース ビルドのパフォーマンスへの影響を評価します。
+
+以下に、堅牢なバッファ アクセスによってクラッシュが防止される例を示します。
+
+[source,cpp]
+----
+// Without robust buffer access, this could crash or produce undefined results
+void potentially_dangerous_operation(vk::raii::CommandBuffer& cmd_buffer,
+                                    vk::raii::Buffer& buffer,
+                                    vk::raii::DescriptorSet& descriptor_set,
+                                    uint32_t dynamic_offset,
+                                    uint32_t buffer_size) {
+    // If dynamic_offset is too large, this would normally cause undefined behavior
+    // With robust buffer access, out-of-bounds reads will return zero
+    cmd_buffer.bindDescriptorSets(
+        vk::PipelineBindPoint::eCompute,
+        pipeline_layout,
+        0,
+        1,
+        &(*descriptor_set),
+        1,
+        &dynamic_offset
+    );
+
+    // Dispatch compute work that might read out of bounds
+    cmd_buffer.dispatch(buffer_size / 64 + 1, 1, 1);  // Potentially too many workgroups
+}
+----
+
+=== その他の堅牢性拡張機能
+
+このセクションの焦点は VK_EXT_robustness2 ですが、アプリケーションの堅牢性の向上に役立つ拡張機能は他にもあります。
+
+==== VK_KHR_buffer_device_address
+
+この拡張機能を使用すると、バッファに物理デバイス アドレスを使用できるようになり、高度なテクニックに役立ちます。これには、無効なアドレスを処理するための堅牢性機能が含まれています (VK_EXT_robustness2 またはコアの robotics.BufferAccess などの堅牢なアクセス機能と組み合わせた場合)。
+
+[source,cpp]
+----
+void enable_buffer_device_address(vk::DeviceCreateInfo& device_create_info,
+                                 std::vector<const char*>& enabled_extensions) {
+    enabled_extensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    device_create_info.setPEnabledExtensionNames(enabled_extensions);
+
+    // Enable Buffer Device Address features
+    vk::PhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features{};
+    buffer_device_address_features.setBufferDeviceAddress(VK_TRUE);
+    buffer_device_address_features.setBufferDeviceAddressCaptureReplay(VK_TRUE);
+
+    // Optionally chain robustness features to ensure invalid addresses read as zero and writes are discarded
+    // (If you've already enabled VK_EXT_robustness2 elsewhere, this is not required here.)
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2_features{};
+    robustness2_features.setRobustBufferAccess2(VK_TRUE);
+    robustness2_features.setRobustImageAccess2(VK_TRUE);
+    robustness2_features.setNullDescriptor(VK_TRUE);
+
+    // Chain features: robustness2 -> BDA -> existing pNext
+    robustness2_features.pNext = &buffer_device_address_features;
+    buffer_device_address_features.pNext = device_create_info.pNext;
+    device_create_info.pNext = &robustness2_features;
+}
+----
+
+==== VK_EXT_descriptor_indexing
+
+この拡張機能により、境界外のインデックスの許容 (堅牢なアクセスが有効になると読み取りがゼロになる)、部分的にバインドされたディスクリプタセット、バインド後の更新などの堅牢性関連の機能を含む、より柔軟なディスクリプタのインデックス作成が可能になります。これらの動作を実際に利用するには、デバイス機能とディスクリプタセットのレイアウト バインディング フラグの両方を有効にする必要があります。
+
+[source,cpp]
+----
+void enable_descriptor_indexing(vk::DeviceCreateInfo& device_create_info,
+                               std::vector<const char*>& enabled_extensions) {
+    enabled_extensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+    device_create_info.setPEnabledExtensionNames(enabled_extensions);
+
+    vk::PhysicalDeviceDescriptorIndexingFeatures indexing_features{};
+    // Shader indexing capabilities (commonly needed alongside robustness)
+    indexing_features.setShaderSampledImageArrayNonUniformIndexing(VK_TRUE);
+    indexing_features.setShaderStorageBufferArrayNonUniformIndexing(VK_TRUE);
+
+    // Robustness-enabling behaviors
+    indexing_features.setRuntimeDescriptorArray(VK_TRUE);
+    indexing_features.setDescriptorBindingPartiallyBound(VK_TRUE);
+    indexing_features.setDescriptorBindingSampledImageUpdateAfterBind(VK_TRUE);
+    indexing_features.setDescriptorBindingStorageBufferUpdateAfterBind(VK_TRUE);
+    indexing_features.setDescriptorBindingUpdateUnusedWhilePending(VK_TRUE);
+
+    // Add to the pNext chain (can be chained together with VK_EXT_robustness2)
+    indexing_features.pNext = device_create_info.pNext;
+    device_create_info.pNext = &indexing_features;
+}
+----
+
+ディスクリプタ配列の場合、レイアウトの作成時にバインディング フラグも指定する必要があります。
+
+[source,cpp]
+----
+// Example: descriptor set layout with a runtime-sized array that can be partially bound
+vk::DescriptorSetLayoutBinding binding{};
+binding.binding = 0;
+binding.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+binding.descriptorCount = 128; // example array size; for true runtime arrays also enable variable descriptor counts
+binding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+vk::DescriptorBindingFlags binding_flags =
+    vk::DescriptorBindingFlagBits::ePartiallyBound |
+    vk::DescriptorBindingFlagBits::eUpdateAfterBind;
+
+vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_ci{};
+flags_ci.setBindingCount(1);
+flags_ci.setPBindingFlags(&binding_flags);
+
+vk::DescriptorSetLayoutCreateInfo dsl_ci{};
+dsl_ci.setPBindings(&binding);
+dsl_ci.setBindingCount(1);
+// Required when using update-after-bind flags
+// (some descriptor types require pool and layout flags to match update-after-bind usage)
+dsl_ci.flags |= vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
+
+dsl_ci.pNext = &flags_ci;
+
+vk::raii::DescriptorSetLayout set_layout{device, dsl_ci};
+----
+
+実行時に真に可変長のディスクリプタ配列が必要な場合は、変数ディスクリプタの数も有効にし、対応する割り当て情報を使用します。
+
+[source,cpp]
+----
+// Enable the device feature
+// indexing_features.setDescriptorBindingVariableDescriptorCount(VK_TRUE); // do this where features are enabled
+
+uint32_t max_descriptors_for_set0 = 1024; // requested at allocation time
+
+vk::DescriptorSetVariableDescriptorCountAllocateInfo variable_counts_info{};
+variable_counts_info.setDescriptorSetCount(1);
+variable_counts_info.setPDescriptorCounts(&max_descriptors_for_set0);
+
+vk::DescriptorSetAllocateInfo alloc_info{};
+alloc_info.setDescriptorPool(descriptor_pool);
+alloc_info.setDescriptorSetCount(1);
+alloc_info.setPSetLayouts(&*set_layout);
+alloc_info.pNext = &variable_counts_info;
+
+auto descriptor_sets = vk::raii::DescriptorSets{device, alloc_info};
+----
+
+注: VK_EXT_robustness2 の nullDescriptor = VK_TRUE とディスクリプタのインデックス付けの部分バインド動作では、バインドされていない配列要素は未定義の動作を呼び出すのではなく、ゼロとして読み取られます。
+
+=== ロバストネス拡張機能とデバッグ ツールの組み合わせ
+
+最大限の効果を得るには、堅牢性拡張機能と前のセクションで説明したデバッグ ツールを組み合わせます。
+
+[source,cpp]
+----
+class RobustVulkanApplication {
+public:
+    RobustVulkanApplication() {
+        initialize_vulkan();
+    }
+
+    void run() {
+        // Main application loop
+        while (!should_close()) {
+            try {
+                update();
+                render();
+            } catch (const vk::SystemError& e) {
+                // Handle recoverable Vulkan errors
+                std::cerr << "Vulkan error: " << e.what() << std::endl;
+                // Attempt recovery
+                if (!recover_from_error()) {
+                    break;
+                }
+            }
+        }
+
+        cleanup();
+    }
+
+private:
+    void initialize_vulkan() {
+        // Create instance with validation layers in debug builds
+        #ifdef _DEBUG
+        enable_validation_layers = true;
+        #else
+        enable_validation_layers = false;
+        #endif
+
+        instance = create_instance();
+
+        // Set up debug messenger if validation is enabled
+        if (enable_validation_layers) {
+            debug_messenger = create_debug_messenger(instance);
+        }
+
+        // Select physical device
+        physical_device = select_physical_device(instance);
+
+        // Check for robustness support
+        has_robustness2 = check_robustness2_support(physical_device);
+
+        // Create logical device with robustness if available
+        device = create_device(physical_device);
+
+        // Initialize other Vulkan resources
+        // ...
+    }
+
+    vk::raii::Device create_device(vk::raii::PhysicalDevice& physical_device) {
+        std::vector<const char*> extensions;
+        // Add required extensions
+
+        vk::DeviceCreateInfo create_info{};
+        // Set up queues, etc.
+
+        // Enable robustness if available
+        if (has_robustness2) {
+            enable_robustness2(create_info, extensions);
+        }
+
+        // Enable other robustness-related extensions
+        enable_buffer_device_address(create_info, extensions);
+        enable_descriptor_indexing(create_info, extensions);
+
+        return vk::raii::Device(physical_device, create_info);
+    }
+
+    bool recover_from_error() {
+        // Attempt to recover from errors
+        // This might involve recreating swapchain, command buffers, etc.
+        try {
+            // Reset command buffers
+            // Recreate swapchain if needed
+            // ...
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to recover: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+    // Vulkan objects
+    vk::raii::Context context;
+    vk::raii::Instance instance{nullptr};
+    vk::raii::DebugUtilsMessengerEXT debug_messenger{nullptr};
+    vk::raii::PhysicalDevice physical_device{nullptr};
+    vk::raii::Device device{nullptr};
+
+    // Flags
+    bool enable_validation_layers = false;
+    bool has_robustness2 = false;
+};
+----
+
+=== ロバストネス拡張機能を使用するためのベスト プラクティス
+
+堅牢性拡張機能を最大限に活用するには:
+
+1. *サポートの確認*: 拡張機能を使用する前に、その拡張機能がサポートされているかどうかを必ず確認してください。
+2. *フォールバック動作*: 拡張機能をサポートしていないデバイスに対するフォールバック動作を実装します。
+3. *パフォーマンス テスト*: 堅牢性機能を有効にした場合のパフォーマンスへの影響を測定します。
+4. *検証と組み合わせる*: 開発中に検証レイヤーを使用して問題を早期に発見します
+5. *堅牢性に依存しない*: 根本的な問題を隠すために堅牢性の拡張機能に依存するのではなく、根本的な問題を修正します。
+6. *ドキュメントの使用法*: アプリケーションに必要な拡張機能とその理由を明確に文書化します。
+
+=== 結論
+
+Vulkan の堅牢性拡張機能、特に VK_EXT_robustness2 は、アプリケーションの未定義の動作に対する耐性を高めるための貴重なツールを提供します。これらの拡張機能を適切なエラー処理、検証レイヤー、デバッグ ツールと組み合わせることで、より安定した信頼性の高い Vulkan アプリケーションを作成できます。
+
+次の最後のセクションでは、Vulkan アプリケーションのツールについて学んだことを要約し、これらのテクニックを独自のプロジェクトに適用する方法について説明します。
+
+xref:Building_a_Simple_Engine/Tooling/04_crash_minidump.adoc[前: クラッシュ処理とミニダンプ] | xref:Building_a_Simple_Engine/Tooling/06_packaging_and_distribution.adoc[次へ: パッケージングと流通]

@@ -1,0 +1,103 @@
+:pp: {plus}{plus}
+
+= イメージビュー
+
+スワップチェーン内のものを含む任意の `vk::Image` をレンダーパイプラインで使うには、`vk::raii::ImageView` オブジェクトを作成する必要があります。イメージビューは文字どおりイメージへのビューです。イメージへのアクセス方法と、イメージのどの部分にアクセスするかを記述します。たとえば、ミップマッピングレベルなしの 2D テクスチャ深度テクスチャとして扱うべきか、などです。
+
+この章では、後でカラーターゲットとして使えるよう、スワップチェーン内の各イメージに基本的なイメージビューを作成する `createImageViews` 関数を書きます。
+
+まず、イメージビューを格納するクラスメンバを追加します。
+
+[,c++]
+----
+std::vector<vk::raii::ImageView> swapChainImageViews;
+----
+
+`createImageViews` 関数を作成し、スワップチェーン作成の直後に呼び出します。
+
+[,c++]
+----
+void initVulkan()
+{
+    createInstance();
+    setupDebugMessenger();
+    createSurface();
+    pickPhysicalDevice();
+    createLogicalDevice();
+    createSwapChain();
+    createImageViews();
+}
+
+void createImageViews()
+{
+}
+----
+
+イメージビュー作成のパラメータは `vk::ImageViewCreateInfo` 構造体で指定します。`viewType`、`format`、`subresourceRange` は各イメージビューで同一です。
+
+`viewType` では 2D 画面へレンダリングすることを指定します。3D 画面やキューブマップへレンダリングしたい場合も選択肢にあり、1D 画面もあります。おそらくお察しのとおり、画面へレンダリングする場合の多くは 2D レンダーターゲットが欲しいでしょう。
+
+次にイメージフォーマットを指定します。これは色空間コンポーネントの構成方法で、レンダリングで正しい色フォーマットを得るためです。
+
+次に、スワップチェーンでは components は不要です。ただし少し後で触れます。
+
+最後のメンバは SubResource range で、これは必要で、すぐ後で述べます。
+
+[,c++]
+----
+void createImageViews()
+{
+    assert(swapChainImageViews.empty());
+
+    vk::ImageViewCreateInfo imageViewCreateInfo{ .viewType         = vk::ImageViewType::e2D,
+                                                 .format           = swapChainSurfaceFormat.format,
+                                                 .subresourceRange = { vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 } };
+}
+----
+
+`components` フィールドでは色チャネルをスウィズルできます。たとえば、モノクロテクスチャのためにすべてのチャネルを赤チャネルにマップできます。チャネルに定数値 `0` と `1` をマップすることもできます。私たちの場合は構築時のデフォルトを受け入れてデフォルトマッピングのままにしますが、明示的に行う場合は次のとおりです。
+
+[,c++]
+----
+imageViewCreateInfo.components = {
+    vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity};
+----
+
+`subresourceRange` フィールドは、イメージの目的とイメージのどの部分にアクセスすべきかを記述します。私たちのイメージは、ミップマッピングレベルも複数レイヤもなく、カラーターゲットとして使います。
+注意: 上記のコード断片のように `subresourceRange` の全要素を列挙するか、デフォルト値と異なるメンバだけを指定初期化子で初期化できます。次のようにです。
+
+[,c++]
+----
+imageViewCreateInfo.subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1};
+----
+
+ステレオグラフィック 3D アプリケーションに取り組んでいる場合は、複数レイヤを持つスワップチェーンを作成します。その後、異なるレイヤにアクセスすることで、左右の目のビューを表す各イメージ用に複数のイメージビューを作成できます。
+
+グラフィックスカードが扱えると期待すべき複数イメージビューの最大数は 16 です。この構成はほとんどの標準的なユースケースをカバーし、VR/AR ヘッドセットは通常同時ビューが 4 つ以下で足ります。ただしライトフィールドディスプレイや CAVE ディスプレイは、同時ビューが数千に及ぶ要件のため別の解決策が必要かもしれません。そうした特殊なレンダリング要件はこのチュートリアルの範囲外ですが、そうしたユースケースでもここで述べる同じ構造体と手法でレンダリングできます。
+
+次に、すべてのスワップチェーンイメージを走査するループを設定し、構造体に追加します。
+
+[,c++]
+----
+for (auto &image : swapChainImages)
+{
+    imageViewCreateInfo.image = image;
+}
+----
+
+イメージビューの作成は、`vk::raii::CreateImageView` のコンストラクタを使うことです。ここでは `std::vector::emplace_back` 経由です。
+
+[,c++]
+----
+for (auto &image : swapChainImages)
+{
+    imageViewCreateInfo.image = image;
+    swapChainImageViews.emplace_back( device, imageViewCreateInfo );
+}
+----
+
+イメージビューがあればイメージをテクスチャとして使い始められますが、レンダーターゲットとして使う準備はまだ完全には整っていません。
+それにはフレームバッファと呼ばれるもう 1 つのステップが必要です。
+xref:/03_Drawing_a_triangle/02_Graphics_pipeline_basics/00_Introduction.adoc[次の章] では、グラフィックスパイプラインを設定する必要があります。
+
+link:/attachments/07_image_views.cpp[C{pp} code]

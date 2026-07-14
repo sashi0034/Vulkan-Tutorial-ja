@@ -1,0 +1,182 @@
+= 最適化技法: シリコンを絞り出す
+:pp: ++
+:stem: latexmath
+
+プロファイルでボトルネックを特定しました。どのレイヤが遅く、メモリ帯域幅かコンピュートスループットに縛られているか分かっています。ここではプロトタイプを本番級推論エンジンに変える **最適化レシピ** を適用します。
+
+本章では GPU 最適化の 3 本柱——**データ再利用**（タイリング）、**命令効率**（融合）、**ハードウェア加速**（FP16/量子化）——をマスターします。単なるマイクロ最適化ではなく、正しく適用すれば素朴な実装に対し **10 倍から 50 倍** の高速化が得られます。
+
+== GPU メモリ階層: 光速のコスト
+
+最適化には「距離のコスト」を理解する必要があります。
+
+[cols="1,2,2"]
+|===
+| メモリ種別 | レイテンシ（概算） | 帯域幅
+
+| **レジスタ**
+| 1 サイクル
+| > 100 TB/s
+
+| **共有メモリ（L1）**
+| 20–30 サイクル
+| 10–20 TB/s
+
+| **VRAM（DRAM）**
+| 400–800 サイクル
+| 0.5–2 TB/s
+|===
+
+シェーダが VRAM から読むたび、国中を横断して水を取りに行くようなものです。**最適化は、その水をキッチン（共有メモリ）か手元（レジスタ）に置く技術です。**
+
+== 共有メモリタイリング: ソフトウェアキャッシュ
+
+多くの ML カーネル（畳み込み、行列積）は **メモリバウンド** です。コンピュートユニットはデータを欲しがるがメモリバスが遅すぎます。解は **共有メモリ**——コンピュートユニット上の高速メモリプール——です。
+
+=== 概念: タイルとハロー
+3×3 畳み込みを考えます。各出力ピクセルは 3×3 入力パッチが必要です。256 出力ピクセル（16×16 ワークグループ）を素朴に計算すると:
+*   各スレッドが 9 ピクセル読み込み。
+*   総読み込み: latexmath:[256 \times 9 = 2,304].
+
+**タイリング** では、スレッドが協調して 1 つの 18×18「タイル」を共有メモリに読み込みます。
+*   総読み込み: latexmath:[18 \times 18 = 324].
+*   **利得**: VRAM トラフィック latexmath:[7\times] 削減。
+
+=== タイルの実装
+**ローカル ID**（タイル内位置）を計算し、端に必要な **ハロー**（余分ピクセル）を扱います。
+
+[source,glsl]
+----
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// 16x16 output + 1 pixel halo on each side = 18x18
+shared float tile[18][18];
+
+void main() {
+    ivec2 localPos = ivec2(gl_LocalInvocationID.xy);
+    ivec2 globalPos = ivec2(gl_GlobalInvocationID.xy);
+
+    // 1. Cooperative Load: Each thread loads its 'center' pixel
+    // Shift by 1 to leave room for the top/left halo
+    tile[localPos.y + 1][localPos.x + 1] = inputData[globalPos];
+
+    // 2. Halo Load: Specific threads load the edges
+    if (localPos.x == 0) tile[localPos.y + 1][0] = inputData[globalPos - ivec2(1, 0)];
+    if (localPos.x == 15) tile[localPos.y + 1][17] = inputData[globalPos + ivec2(1, 0)];
+    if (localPos.y == 0) tile[0][localPos.x + 1] = inputData[globalPos - ivec2(0, 1)];
+    if (localPos.y == 15) tile[17][localPos.x + 1] = inputData[globalPos + ivec2(0, 1)];
+
+    // 3. Memory Handshake
+    memoryBarrierShared();
+    barrier();
+
+    // 4. Compute: Every read now comes from fast shared memory!
+    float sum = 0.0;
+    for(int m = -1; m <= 1; m++) {
+        for(int n = -1; n <= 1; n++) {
+            sum += tile[localPos.y + 1 + m][localPos.x + 1 + n] * weights[...];
+        }
+    }
+}
+----
+
+=== バンク競合の回避
+共有メモリは **バンク** に分割されています。warp 内 2 スレッドが同時に *同じ* バンクの異なる番地にアクセスすると GPU がストールします。これが **バンク競合** です。
+
+**Pro Tip**: タイル幅がバンク数（通常 32）の倍数なら幅に 1 を足す: `shared float tile[18][19]`。メモリレイアウトを「スウィズル」し、縦列が同じバンクに落ちなくなります。
+
+== カーネル融合: メモリウォールとの戦い
+
+典型ネットワークでは **畳み込み latexmath:[\to] バイアス加算 latexmath:[\to] Batch Norm latexmath:[\to] ReLU** のような列があります。
+
+4 つを別カーネルにすると VRAM への読み書きが 4 回起きます。
+[latexmath]
+++++
+\text{Naive Traffic} = \text{Read(In)} + \text{Write(Conv)} + \text{Read(Conv)} + \text{Write(Bias)} + \dots
+++++
+
+**カーネル融合** はこれを 1 回のコンピュートディスパッチにまとめます。中間値は GPU の **レジスタ** に留まります。
+
+=== 融合レシピ
+プロ向け「融合畳み込み」カーネルは次のようになります。
+
+[source,glsl]
+----
+void main() {
+    // 1. The Heavy Work
+    float sum = performConvolution(); // Stays in registers!
+
+    // 2. The 'Free' Operations
+    // These take 0.001ms because the GPU was already waiting for memory
+    sum += bias[channel];
+    sum = (sum - mean) * invStdDev;
+    sum = max(0.0, sum);
+
+    // 3. ONE write to VRAM
+    outputData[idx] = sum;
+}
+----
+
+融合は MobileNet や ResNet のように多くのレイヤが小さく帯域幅制限の深いネットワークで最も効果的です。
+
+== ベクトル化: NC/4HW4 レイアウト
+
+多くの GPU は 128 ビット幅メモリバスを持ちます。単一 `float`（32 ビット）を読むと潜在帯域幅の 25% しか使いません。
+
+高度 ML エンジンは **NC/4HW4** レイアウトを使います。4 チャンネルを 1 つの `vec4` にまとめます。
+
+*   `float data[]` の代わりにバッファは `vec4 data[]`。
+*   1 ロード命令で 4 チャンネルを取得。
+*   GPU ハードウェアは `vec4` 内積に最適化されています。
+
+[latexmath]
+++++
+\text{Throughput Gain} \approx 4\times
+++++
+
+シェーダの内側ループは次のようになります。
+[source,glsl]
+----
+vec4 input_v = inputBuffer[idx];
+vec4 weight_v = weightBuffer[idx];
+sum += dot(input_v, weight_v);
+----
+
+== サブグループシャッフル: メモリなし通信
+
+スレッド間でデータ共有が必要なとき（Max-Pool や Softmax など）、すぐ共有メモリに行かず **サブグループシャッフル**（`GL_KHR_shader_subgroup_basic` が必要）を検討します。
+
+シャッフルはスレッド 0 がスレッド 1 のレジスタを直接「伸ばして」読めます。
+
+[source,glsl]
+----
+float myValue = ...;
+// Find the maximum value across all 32 threads in the warp
+float maxVal = subgroupMax(myValue);
+----
+
+共有メモリより **10 倍速い** ことが多いです。メモリコントローラに触れず、実行ユニットのレジスタファイル内で完結するからです。
+
+== 非同期コンピュート: 世界の重ね合わせ
+
+Vulkan は複数 **キュー** への submit を許します。ML 推論が **コンピュートキュー** で走っている間、**グラフィックスキュー** の UI レンダリングと同時実行できます。
+
+*   **秘訣**: 影のラスタ化で GPU が忙しいときアイドルなコンピュートユニットがあれば、コンピュートキューが「隙間を埋め」、ML 推論コストがフレーム時間 **0 ミリ秒** に近づくことがあります。
+
+=== マルチキューハンドシェイク
+**タイムラインセマフォ** で調整:
+1.  グラフィックスキューが「フレーム準備完了」をシグナル。
+2.  コンピュートキューが待機し、前処理＋推論を実行、「結果準備完了」をシグナル。
+3.  グラフィックスキューが待機し、次フレームで AI ラベルを描画。
+
+== まとめ: 最適化ワークフロー
+
+1.  **融合** する。中間結果を VRAM に書かない。
+2.  データを `vec4`（NC/4HW4）に **ベクトル化** しメモリバスを飽和させる。
+3.  演算強度の高い畳み込みは共有メモリで **タイリング** する。
+4.  リダクション（Max、Sum）には **サブグループ** を使い共有メモリストールを避ける。
+5.  非同期コンピュートですべて **重ね合わせ** る。
+
+これらの技法により、Vulkan 実装を機能プロトタイプから、最も要求の厳しい環境でもリアルタイム AI が可能な高性能エンジンへ変えられます。
+
+xref:ML_Inference/Debugging_and_Performance/04_performance_profiling.adoc[前へ: 性能プロファイル] | xref:ML_Inference/Desktop_Applications/01_introduction.adoc[次へ: デスクトップアプリケーション]

@@ -1,0 +1,65 @@
+:pp: {plus}{plus}
+= グローバルバリアとローカルバリア: 精密さと性能
+
+== 選択のジレンマ
+
+Vulkan はメモリを同期する方法を二つ与えます。**グローバルメモリバリア** と **特定リソースバリア**（イメージバリアとバッファバリア）です。すべてにグローバルバリアを使いたくなることがよくあります——書くのが簡単で、簿記が少なく、すべてをカバーするからです。しかしこの便利さには代償があります。
+
+グローバルバリアは、指定されたタイプの *すべての* メモリアクセスに GPU 全体にわたって影響します。単一のテクスチャだけを遷移させたいのにグローバルメモリバリアを使うと、GPU は L1 と L2 キャッシュ全体をフラッシュし、問題なく動いていた無関係な他の作業までストールさせるかもしれません。
+
+== グローバルバリアを使うべきとき
+
+グローバルバリアは「悪」ではありません。単に広い道具です。多くのリソースに同時に影響する大きな状態変化をまさに行おうとしている場面に優れています。
+
+例えば、G-Buffer パスから複数のテクスチャとバッファを読む複雑なライティングパスへ移るとき、個別のイメージ／バッファバリアを十個記録するより、単一のグローバルバリアの方が効率的かもしれません。一つのグローバルバリアにまとめると、`vk::DependencyInfo` を処理するドライバオーバーヘッドが減り、多くのリソースが似たステージ間を遷移する場合には、ハードウェア利用率が良くなることもあります。
+
+[,cpp]
+----
+auto globalBarrier = vk::MemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead
+};
+
+commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &globalBarrier});
+----
+
+== リソースバリアを使うべきとき
+
+リソース固有のバリア（`vk::ImageMemoryBarrier2` と `vk::BufferMemoryBarrier2`）は「外科的」な道具です。依存が特定リソースに限られるとき、特にそのリソースがレイアウト間を遷移しているときは、これらを使うべきです。
+
+イメージバリアの主な利点は、ドライバがレイアウト固有の最適化を行えることです。グローバルメモリバリアはイメージレイアウトを遷移 *できません*。イメージを `eColorAttachmentOptimal` から `eShaderReadOnlyOptimal` へ変える必要があるなら、イメージメモリバリアを *使わなければなりません*。
+
+== 黄金律: バッチ化
+
+グローバルかローカルかを問わず、Vulkan 同期性能で最も重要なルールは **バッチ化** です。
+
+`pipelineBarrier2` を連続して何度も呼ばないでください。`pipelineBarrier2` の呼び出し一つひとつに無視できないオーバーヘッドがあります。代わりに、すべてのバリア（グローバル、イメージ、バッファ）を一つの `vk::DependencyInfo` に集め、一度にサブミットします。
+
+[,cpp]
+----
+std::vector<vk::ImageMemoryBarrier2> imageBarriers = { /* ... */ };
+vk::MemoryBarrier2 globalBarrier = { /* ... */ };
+
+auto dependencyInfo = vk::DependencyInfo{
+    .memoryBarrierCount = 1,
+    .pMemoryBarriers = &globalBarrier,
+    .imageMemoryBarrierCount = static_cast<uint32_t>(imageBarriers.size()),
+    .pImageMemoryBarriers = imageBarriers.data()
+};
+
+commandBuffer.pipelineBarrier2(dependencyInfo);
+----
+
+バリアをバッチすることで、ドライバはキャッシュフラッシュとステージストールを集約する機会を得、GPU が待つ時間をできるだけ短く、レンダリングする時間をできるだけ長くできます。
+
+== Simple Engine: 最適化
+
+`Simple Engine` では、主に **イメージメモリバリア** を使います。同期の多くがレイアウト遷移（例えば `eColorAttachmentOptimal` から `eShaderReadOnlyOptimal`）を伴うからです。ただし、`ComputeSystem`（例えば `physics_system.cpp`）では、任意のストレージバッファへの先行コンピュート書き込みがすべて後続のシェーダステージから見えることを保証する必要があるとき、**グローバルメモリバリア** も使います。
+
+`Simple Engine` をさらに最適化できる領域の一つが、これらのバリアの集約です。現在、一部のシステムは独自のバリアを独立に出しています。将来の更新では、**レンダーグラフ** アーキテクチャへ移る予定です。これにより、エンジンはフレーム全体ですべてのシステムから必要なバリアを集め、単一の高度に最適化された `vkCmdPipelineBarrier2` 呼び出しにバッチでき、ドライバオーバーヘッドをさらに減らし、GPU 占有率を向上できます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Pipeline_Barriers_Transitions/03_queue_family_ownership.adoc[キューファミリー所有権] | 次へ: xref:Synchronization/Timeline_Semaphores/01_introduction.adoc[タイムラインセマフォ: マスタークロック]

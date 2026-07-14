@@ -1,0 +1,73 @@
+:pp: {plus}{plus}
+= 同期の統一: フェンスとバイナリセマフォの置き換え
+
+== 簡素化
+
+タイムラインセマフォへ移る最も即時の利点は、フェンスとバイナリセマフォを扱うコードを実質的に削除できることです。別々のプリミティブのセットを維持する代わりに、単一の `vk::raii::Semaphore` を作成し、**Timeline** タイプとして設定します。
+
+RAII の文脈では、この設定は標準の `vk::SemaphoreCreateInfo` の `pNext` として渡す `vk::SemaphoreTypeCreateInfo` を通じて行われます。
+
+[,cpp]
+----
+auto typeCreateInfo = vk::SemaphoreTypeCreateInfo{
+    .semaphoreType = vk::SemaphoreType::eTimeline,
+    .initialValue = 0
+};
+
+auto createInfo = vk::SemaphoreCreateInfo{
+    .pNext = &typeCreateInfo
+};
+
+auto timelineSemaphore = vk::raii::Semaphore(device, createInfo);
+----
+
+== CPU 待ちの扱い
+
+以前は `vk::Fence` が必要だった CPU 側の待ち操作は、今は `vk::Device::waitSemaphores` 関数を使います。この関数は複数のセマフォを同時に待て、指定された値がすべて到達するとすぐに返ります。
+
+[,cpp]
+----
+auto waitInfo = vk::SemaphoreWaitInfo{
+    .semaphoreCount = 1,
+    .pSemaphores = &(*timelineSemaphore),
+    .pValues = &targetValue
+};
+
+// Wait for the GPU to reach targetValue (equivalent to vkWaitForFences)
+auto result = device.waitSemaphores(waitInfo, timeoutInNanoseconds);
+----
+
+ここでの美しさは、`device.getSemaphoreCounterValue` を使っていつでもセマフォの現在値を問い合わせられることです。フェンスのバイナリな「もう終わったか？」状態より、はるかに柔軟なエンジン論理が可能になります。
+
+== GPU 待ちの扱い
+
+以前はバイナリセマフォが必要だった GPU 間同期は、今は `vk::SubmitInfo2`（Synchronization 2 の一部）の中で行われます。タイムラインセマフォと、実行開始前にキューが待たなければならない特定の値を指定します。
+
+[,cpp]
+----
+auto waitSemaphoreInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *timelineSemaphore,
+    .value = requiredValue,
+    .stageMask = vk::PipelineStageFlagBits2::eAllCommands
+};
+
+auto submitInfo = vk::SubmitInfo2{
+    .waitSemaphoreInfoCount = 1,
+    .pWaitSemaphoreInfos = &waitSemaphoreInfo,
+    // ...
+};
+
+queue.submit2(submitInfo);
+----
+
+両方に同じプリミティブを使うことで、フェンスとセマフォの間を同期する必要がなくなります。GPU がタイムラインをシグナルし、CPU も他の GPU キューも、適切な値を待つことで同じ信号に応答できます。
+
+== Simple Engine: タイムラインへのロードマップ
+
+現在、`Simple Engine` はレガシーな組み合わせ——CPU から GPU への同期用の `inFlightFences` と、GPU 間同期用の `imageAvailableSemaphores` / `renderFinishedSemaphores`——を使っています。各プリミティブの `MAX_FRAMES_IN_FLIGHT` セットを慎重に管理する必要があり、`Renderer::Render` でよく見かける「ピンポン」論理につながっています。
+
+次の大きなアーキテクチャ更新では、これらを単一の `Renderer::frameTimeline` セマフォに置き換えます。待ち論理を統一できます。`device.waitForFences` の代わりに、特定のフレームインデックス値を待つために `device.waitSemaphores` を使います。これにより `Renderer::Render` 関数が大幅に簡素化され、特に複雑な非同期タスクを導入するにつれて、フレームループの理解がはるかに容易になります。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Timeline_Semaphores/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Timeline_Semaphores/03_monotonic_counter.adoc[単調カウンタ]

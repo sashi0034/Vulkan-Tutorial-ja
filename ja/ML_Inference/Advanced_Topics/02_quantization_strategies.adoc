@@ -1,0 +1,446 @@
+= 量子化戦略: ビット予算の習得
+:pp: ++
+:stem: latexmath
+
+標準 ResNet-50 モデルは FP32 でおおよそ 100MB のメモリと 20〜30ms の GPU 時間を要します。ハイエンドデスクトップでは問題ありません。バッテリ駆動 VR ヘッドセットやスマートフォンでは災難です。
+
+**量子化** はモデルの重みと活性化の精度を下げるプロセスです。32 ビット浮動小数から 8 ビット（さらには 4 ビット）整数へ移行することで、**4 倍のサイズ削減** と専用整数ユニットを持つハードウェア上で最大 **10 倍の高速化** を達成できます。
+
+本章では基礎を超え、量子化の厳密な数学を見て、「知能」を壊さずモデルを縮小する方法を学びます。
+
+== 量子化の成熟: 浮動小数からビットへ
+
+推論エンジンを構築し、FP32 で正しさを検証し、ループを最適化しました。しかしバイナリサイズを見ると、単一 ResNet-50 で 100MB。モバイルデバイスのフレーム時間: 100ms。バッテリ消費: 巨大。
+
+**量子化** はモデルの重みと活性化の精度を下げるプロセスです。32 ビット浮動小数から 8 ビット（さらには 4 ビット）整数へ移行すると、3 つの重要な本番目標を達成します:
+1.  **4 倍メモリ削減**: 100MB モデルが 25MB に。
+2.  **4 倍帯域節約**: 演算あたり移動バイトが減り「メモリウォール」が後退。
+3.  **10 倍高速化**: 専用ハードウェア（DP4A や Tensor Core など）が 1 浮動小数処理時間で複数整数を処理。
+
+本章では「量子化の理解」から「量子化の実行」へ。**実用経路**（ONNX Runtime ツールチェーン）と **学習経路**（Vulkan でカスタム整数シェーダ実装）の両方を探ります。
+
+== 直感: 信号 vs ノイズ
+
+なぜ量子化は機能するのか？ 数値精度の 75% を捨ててもニューラルネットワークは止まらないのは？
+
+ニューラルネットワークは本質的に **ノイズに頑健** です。学習中、Dropout や Weight Decay などデータを意図的に「弄る」技法を使います。ネットワークは高レベルパターン（信号）を見つけ、微小詳細（ノイズ）を無視するよう学習します。量子化は本質的に非常に特定の種類の「丸めノイズ」を追加。ノイズが「犬」と「猫」を区別するのに必要な信号より小さければ、ネットワークは完璧に機能します。
+
+デジタル写真のように考えてください。非圧縮 RAW（FP32）は見えない数百万色。JPEG（INT8）は詳細を削減するが、人間の目には同一に見えます。
+
+== 数学的基盤: 浮動小数から整数へ
+
+量子化は、連続無限の実数範囲を小さな離散整数集合に押し込む写像関数 latexmath:[f(x)] です。
+
+.Quantization Mapping: FP32 to INT8
+image::images/ML_Inference/Advanced_Topics/quantization_mapping.svg[Diagram showing mapping from continuous float range to discrete integer points, 600]
+
+=== 1. 対称量子化（速度の王）
+
+最も単純で高速な形式。データがゼロ中心と仮定。範囲 latexmath:[[-max, max]] を整数範囲 latexmath:[[-127, 127]]（符号付き 8 ビット）にマップ。
+
+[latexmath]
+++++
+\text{Scale} (S) = \frac{\max(|x|)}{127}
+++++
+[latexmath]
+++++
+x_{int} = \text{clamp}(\text{round}(x_{float} / S), -127, 127)
+++++
+
+*   **利点**: 極めて高速な数学。「オフセット」がないため、ハードウェアは純粋な整数ドット積（latexmath:[A \times B]）を実行可能。
+*   **欠点**: データが大きく偏斜（例: すべて 10〜20 の間）なら対称量子化は無駄。利用可能整数範囲のごく一部しか使わない。
+
+=== 2. 非対称量子化（精度の王）
+
+データがシフトまたは主に正（ReLU 活性化など）のときに使用。範囲 latexmath:[[min, max]] を符号なし整数範囲 latexmath:[[0, 255]] にマップ。
+
+[latexmath]
+++++
+S = \frac{max - min}{255}
+++++
+[latexmath]
+++++
+Z = \text{round}\left(-\frac{min}{S}\right)
+++++
+[latexmath]
+++++
+x_{int} = \text{clamp}(\text{round}(x_{float} / S + Z), 0, 255)
+++++
+
+latexmath:[Z] は **Zero-Point（ゼロ点）**。浮動小数値 `0.0` が整数に完全マップされることを保証。ニューラルネットワークは「ゼロ」で欠損データやパディング端を表すため重要。`0.0` が `0.3` になると、「沈黙」であるべき場所に「信号」を見る。
+
+== 固定小数点演算: 8 ビットで数学
+
+秘密: 整数を得たら、数学のために **浮動小数に戻さない**。整数で数学を行い、レイヤの最後にのみ「リスケール」。整数最適化ハードウェアで latexmath:[10\times] 高速化を達成する方法です。
+
+行列乗算 latexmath:[Y = W \times X] を想像。
+量子化空間では:
+
+[latexmath]
+++++
+Y_{float} = (S_w \cdot W_{int}) \times (S_x \cdot (X_{int} - Z_x))
+++++
+[latexmath]
+++++
+Y_{float} = (S_w \cdot S_x) \cdot \sum (W_{int} \cdot (X_{int} - Z_x))
+++++
+
+=== 整数リスケールのトリック
+Vulkan シェーダでは latexmath:[\sum (W \cdot X)] をオーバーフロー防止の 32 ビット整数アキュムレータで実行。次レイヤ向け最終 INT8 結果のため、32 ビット和を再スケールダウンする必要があります。
+
+数学的に計算したいのは:
+[latexmath]
+++++
+Output_{int} = \text{round}\left( \text{Sum}_{int32} \cdot \frac{S_{in} \cdot S_{w}}{S_{out}} \right)
+++++
+
+浮動小数乗算は遅いため、定数 latexmath:[M = \frac{S_{in} S_{w}}{S_{out}}] を事前計算し **固定小数点乗数**（大整数）と **ビットシフト** で表現。シェーダでは「リスケール」が単一整数乗算と右シフト（latexmath:[>>]）になり、任意の浮動小数演算より大幅に高速。
+
+== ONNX Runtime 量子化ワークフロー（実用経路）
+
+Vulkan アプリで ONNX Runtime を使う場合（Third-Party Libraries 章で教えた通り）、数学を自分で書く必要はありません。**ONNX Runtime Quantization Toolchain** を使います。
+
+=== ステップ 1: 戦略の選択
+
+**Dynamic** と **Static** 量子化の選択が必要。
+
+1.  **Dynamic Quantization**:
+    *   **方法**: 重みはオフライン量子化。活性化はエンジンが *ランタイム* で量子化。
+    *   **利点**: データセット不要。使いやすい。
+    *   **最適**: LSTM、Transformer、CPU バウンド推論。
+2.  **Static Quantization（PTQ）**:
+    *   **方法**: 重みと活性化の両方をオフライン量子化。
+    *   **利点**: 可能な限り最高性能。GPU が専用 INT8 命令を使用可能。
+    *   **要件**: 活性化範囲を「学習」する小さな **キャリブレーションデータセット**（100〜500 画像）が必要。
+
+=== ステップ 2: キャリブレーションデータリーダーの実装
+
+Static Quantization では、最適スケール係数を見つけるため「正常」データの見え方をツールが知る必要があります。`CalibrationDataReader` で提供。
+
+[source,python]
+----
+import numpy as np
+import onnxruntime
+from onnxruntime.quantization import CalibrationDataReader
+
+class ImageNetDataReader(CalibrationDataReader):
+    def __init__(self, calibration_image_folder, input_name):
+        self.image_folder = calibration_image_folder
+        self.input_name = input_name
+        self.data_iter = None
+        self.preprocessed_data = []
+        self.preprocess_images()
+
+    def preprocess_images(self):
+        # Load 100-200 images for a good statistical sample.
+        # CRITICAL: This MUST match your C++ preprocessing (Mean/StdDev) exactly!
+        for img_path in list_images(self.image_folder)[:100]:
+            img = load_image(img_path)
+            img = resize_aspect_aware(img, (224, 224))
+            # ImageNet Normalization
+            img = (img / 255.0 - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+            img = img.transpose(2, 0, 1) # HWC to NCHW
+            img = np.expand_dims(img, axis=0).astype(np.float32)
+            self.preprocessed_data.append({self.input_name: img})
+
+    def get_next(self):
+        if self.data_iter is None:
+            self.data_iter = iter(self.preprocessed_data)
+        return next(self.data_iter, None)
+----
+
+=== ステップ 3: 量子化スクリプト
+
+リーダー準備後、量子化プロセスを実行。このスクリプトは元より 4 倍小さい `.quant.onnx` を生成。
+
+[source,python]
+----
+from onnxruntime.quantization import quantize_static, QuantType, QuantFormat
+
+model_fp32 = "models/mobilenetv2.onnx"
+model_int8 = "models/mobilenetv2.quant.onnx"
+
+# Create our data reader
+dr = ImageNetDataReader("data/calibration_images", "input")
+
+# Run the quantization
+quantize_static(
+    model_fp32,
+    model_int8,
+    dr,
+    quant_format=QuantFormat.QDQ, # Quantize-Dequantize format (modern ORT standard)
+    per_channel=True,             # High precision for depthwise convs
+    weight_type=QuantType.QInt8,
+    activation_type=QuantType.QInt8,
+    nodes_to_exclude=[]           # Add names of sensitive layers here if needed
+)
+print(f"Quantized model saved to {model_int8}")
+----
+
+=== ステップ 4: C++ でのロードと加速の有効化
+
+Vulkan C++ アプリでの量子化モデルロードは FP32 モデルと同一。ただし高速化のため、`SessionOptions` が INT8 ハードウェア命令をサポートするプロバイダを使うよう設定されている必要があります。
+
+[source,cpp]
+----
+Ort::SessionOptions sessionOptions;
+
+// 1. Enable Graph Optimizations
+sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+// 2. Append the WebGPU or DirectML provider
+// These providers will detect the INT8 nodes and map them to DP4A/Tensor Core instructions
+sessionOptions.AppendExecutionProvider("webgpu");
+
+// 3. Load the quantized model
+Ort::Session session(env, L"models/mobilenetv2.quant.onnx", sessionOptions);
+----
+
+**動作確認の方法**
+ONNX Runtime ログ（`ORT_LOGGING_LEVEL_VERBOSE` 設定）を見ると `Placing node ... on DML_Execution_Provider` のようなメッセージがあるはず。ノードが `CPU_Execution_Provider` に留まるなら、ハードウェアが必要 INT8 演算をサポートしていないか、ドライバが古い。
+
+== 移行: 混合精度推論
+
+量子化はオールオアナッシングではありません。*全体* を量子化すると精度損失が大きすぎる場合、プロエンジンは **混合精度** を使います。
+
+*   **敏感レイヤ**: 初期レイヤ（生ピクセルを見る）や後期レイヤ（確率を出力）は精度保持のため **FP16** または **FP32** に留めることが多い。
+*   **ボトルネックレイヤ**: ネットワーク中間 80%（高コスト畳み込み）を **INT8** に量子化。
+
+=== 脆弱ノードの除外
+`quantize_static` 呼び出しで `nodes_to_exclude` パラメータを使用。ノード名は **Netron** などのツールで確認。
+
+[source,python]
+----
+# Example: Keep the final classifier head in FP32
+quantize_static(..., nodes_to_exclude=['Classifier_Head_FC'])
+----
+
+精度が 95% から 70% に落ちたら、最終レイヤを除外——失われた精度の 90% をほぼ性能ペナルティなしで回復することが多いです。
+
+== 量子化モデルのデバッグ: 誤差の狩り
+
+量子化モデルが失敗するとクラッシュせず、誤った答えを返すだけ。「静かな精度バグ」です。
+
+1.  **コサイン類似度**: FP32 モデルと INT8 モデルの活性化をレイヤごとに比較。
+    *   latexmath:[Similarity = 1.0]: 完璧な量子化。
+    *   latexmath:[Similarity < 0.8]: 高歪み。このレイヤは除外候補。
+2.  **感度分析**: `onnxruntime.quantization.api.quantize` 感度分析ツールで精度損失に最も寄与するレイヤを自動特定。
+3.  **クリッピングの可視化**: キャリブレーションヒストグラムで 10% のデータが「クリップ」（127 に押し込み）されているなら、スケール係数が小さすぎ。**キャリブレーション方法**（`MinMax` の代わりに `Entropy` や `Percentile` など）を変更。
+
+== ハードウェア互換性: INT8 が常に速いわけではない
+
+量子化モデルを出荷する前に、ユーザーのハードウェア能力を検証。
+
+*   **現代 GPU（NVIDIA Turing+、AMD RDNA3+、Intel Xe）**: 専用 INT8 ユニット。量子化は latexmath:[4\times \text{--} 10\times] ブースト。
+*   **旧 GPU**: 専用整数数学が欠如。これらのチップでは GPU が FP32 で INT8 を「エミュレート」し、パック/アンパックオーバーヘッドで実際 **遅く** なる可能性。
+*   **プロの手**: FP32 と INT8 モデルの両方を出荷。Vulkan でランタイムに `VkPhysicalDeviceFeatures` をクエリ。`shaderInt8` サポートなら量子化モデルをロード、さもなければ float 版にフォールバック。
+
+== キャリブレーション: クリッピング閾値の発見
+
+重みの絶対 latexmath:[min/max] だけでスケールを見つけられません。99.9% の重みが -1〜1 でも 1 つの外れ値が 50 なら、スケール latexmath:[S] が巨大になり、重要な 99.9% の精度をすべて失います。
+
+=== K-L ダイバージェンス戦略
+
+プロエンジンは **K-L ダイバージェンス**（クルバック・ライブラー）で最適クリッピング閾値を発見。
+
+1.  **収集**: 100〜500 枚の実画像をモデルに通し、各レイヤの活性化分布（ヒストグラム）を記録。
+2.  **探索**: 異なるクリッピング値を試す（例: 2.0、2.5、3.0 で範囲クリップ）。
+3.  **比較**: クリップデータを量子化し逆量子化。「歪んだ」分布を元 FP32 分布と比較。
+4.  **選択**: **情報損失** を最小化する閾値を選択。外れ値 0.1% を捨てると残り 99.9% の精度が 10 倍良くなることが多い。
+
+== PTQ vs QAT: デプロイの選択
+
+量子化を決めるとき 2 つのワークフローから選択:
+
+1.  **Post-Training Quantization（PTQ）**:
+    *   **プロセス**: 既存 FP32 モデルにキャリブレーション適用。
+    *   **利点**: 高速（数分）、使いやすい、再学習不要。
+    *   **欠点**: 「敏感」モデル（物体検出など）で大幅精度損失の可能性。
+
+2.  **Quantization-Aware Training（QAT）**:
+    *   **プロセス**: PyTorch グラフに「Fake Quantization」ノードを注入し数エポック学習継続。ネットワークは丸め誤差に頑健になるよう重み調整。
+    *   **利点**: 高精度（多くの場合 FP32 と完全一致）。
+    *   **欠点**: 遅い（学習セットアップ、GPU 時間、ラベル付きデータセット必要）。
+
+**エキスパート推奨**: PTQ から始める。精度低下が 1% 超の場合のみ QAT に投資。
+
+== 粒度: テンソル単位 vs チャネル単位
+
+「スケール」latexmath:[S] は量子化で最も重要な数です。計算方法が精度を決定。
+
+1.  **Per-Tensor（グローバル）**:
+    *   レイヤの重みバッファ全体に 1 つのスケール latexmath:[S] を計算。
+    *   **利点**: 実装最も単純。メモリオーバーヘッド最小（レイヤあたり 1 float）。
+    *   **欠点**: 1 出力フィルタが [-10, 10]、別が [-0.1, 0.1] ならグローバルスケールは大フィルタに偏り、小フィルタはゼロに潰れ特徴検出力を失う。
+2.  **Per-Channel（標準）**:
+    *   各出力フィルタ（チャネル）に固有スケール latexmath:[S_c] を計算。
+    *   **利点**: 各特徴の固有ダイナミックレンジを保持。Depthwise Convolution を使う MobileNetV2 など現代アーキテクチャでは **必須**。
+    *   **欠点**: やや複雑なシェーダ数学（スケールバッファへインデックス必要）。
+
+== ハードウェア加速: DP4A と dotProduct 拡張
+
+INT8 が実際に速い理由は数字が小さいだけではなく **ベクトルスループット** です。
+
+現代 GPU には「水平」数学向け命令があります。標準乗算加算では 1 スレッド 1 演算。**DP4A**（Dot Product 4-way Accumulate）では 1 スレッドが 1 クロックサイクルで 4 ペアの 8 ビット整数を処理。
+
+=== 命令: `dotProduct4x8bitPackedEXT`
+
+2 つの 32 ビットレジスタを取り、各を 4 つの 8 ビット整数として扱い、乗算し結果をアキュムレータに加算。
+
+[source,glsl]
+----
+// Logic of the instruction
+int dotProduct4x8bitPackedEXT(uint a, uint b, int acc) {
+    int res = acc;
+    res += int8_t(a & 0xFF) * int8_t(b & 0xFF);
+    res += int8_t((a >> 8) & 0xFF) * int8_t((b >> 8) & 0xFF);
+    res += int8_t((a >> 16) & 0xFF) * int8_t((b >> 16) & 0xFF);
+    res += int8_t((a >> 24) & 0xFF) * int8_t((b >> 24) & 0xFF);
+    return res;
+}
+----
+
+これによりコンピュートシェーダは「1 つずつ」計算機から「バッチプロセッサ」へ移行し、算術スループットを latexmath:[4\times] 即座に増加可能。
+
+== 上級: 4 ビット量子化（INT4）とグループ統計
+
+大規模言語モデル（LLM）時代では 8 ビットでも大きすぎることがある。**INT4** へのシフトが見られます。
+
+*   **Grouped Quantization**: チャネルあたり 1 スケールではなく 32 または 64 重みごとに 1 スケール。巨大モデルの重み「局所性」を扱う。
+*   **ストレージ**: 2 つの 4 ビット重みを 1 バイトにパック。
+*   **数学**: 多くの GPU にネイティブ 4 ビット数学ユニットがまだないため **De-quantize on Load** を使用。
+    *   GPU が VRAM から 4 ビット重みを読む（帯域節約）。
+    *   シェーダが即座に `float16` または `int8` に変換。
+    *   数学は通常通り。
+*   **利点**: LLM ではほぼ常に「メモリバウンド」です。FP32 比で重みサイズ latexmath:[8\times] 削減は、数学自体が速くなくても latexmath:[8\times] 高速化。
+
+== 次のフロンティア: 重みスパース性
+
+量子化は重みの **精度** を削減。**スパース性** は重みの **数** を削減。
+
+ニューラルネットワークはしばしば「過剰パラメータ化」されています。多くの重みはゼロに近く出力に影響なし。
+
+1.  **非構造化スパース性**: 個別小重みをゼロに。
+    *   **問題**: GPU は「ランダム」ゼロを嫌う。分岐 divergence と非 coalesced メモリアクセス。
+2.  **構造化スパース性（2:4）**: NVIDIA Ampere GPU は **2:4 Sparsity** のハードウェアサポートを導入。
+    *   **ルール**: 4 重みブロックごとに少なくとも 2 つはゼロ。
+    *   **利点**: GPU ハードウェアがゼロ乗算を「スキップ」、量子化利得に加え latexmath:[2\times] スループット。
+
+**INT8 量子化** と **2:4 Sparsity** を組み合わせると、素朴 FP32 実装比 latexmath:[20\times] 高速化を達成可能。
+
+== ハンズオン: 最初の量子化レイヤ実装（学習経路）
+
+**対称 Per-Channel 量子化畳み込み** パイプラインをゼロから構築。Vulkan 推論エンジンへの完全制御を望む経路です。
+
+=== フェーズ 1: オフライン重み準備（C++）
+
+アプリ開始前に `float32` 重みを変換。スケール係数を計算し重みをバイト配列にパック。
+
+[source,cpp]
+----
+struct QuantizedLayer {
+    std::vector<int8_t> weights; // INT8 weights
+    std::vector<float> rescaleFactors; // Pre-calculated (S_in * S_w) / S_out
+    int32_t bias_scale; // Usually quantized to 32-bit
+};
+
+QuantizedLayer quantizeWeights(const float* fp32Weights, uint32_t outC, uint32_t inC, uint32_t kSize, float inputScale, float outputScale) {
+    QuantizedLayer layer;
+    uint32_t filterSize = inC * kSize * kSize;
+    layer.weights.resize(outC * filterSize);
+    layer.rescaleFactors.resize(outC);
+
+    for (uint32_t oc = 0; oc < outC; ++oc) {
+        // 1. Find max for this channel
+        float maxW = 0.0f;
+        for (uint32_t i = 0; i < filterSize; ++i) {
+            maxW = std::max(maxW, std::abs(fp32Weights[oc * filterSize + i]));
+        }
+
+        // 2. Calculate Weight Scale
+        float weightScale = maxW / 127.0f;
+
+        // 3. Pre-calculate the Rescale Factor for the shader
+        // This moves the floating point division out of the hot loop
+        layer.rescaleFactors[oc] = (inputScale * weightScale) / outputScale;
+
+        // 4. Quantize Weights
+        for (uint32_t i = 0; i < filterSize; ++i) {
+            float v = fp32Weights[oc * filterSize + i] / weightScale;
+            layer.weights[oc * filterSize + i] = static_cast<int8_t>(std::clamp(std::round(v), -127.0f, 127.0f));
+        }
+    }
+    return layer;
+}
+----
+
+=== フェーズ 2: Vulkan パイプライン設定
+
+量子化シェーダは特定バッファレイアウトが必要。`float` 配列ではなく `uint8_t`（パック）配列を移動。
+
+1.  **バッファストレージ**: `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` を使用。
+2.  **ディスクリプタセット**:
+    *   `Binding 0`: 入力活性化（INT8）
+    *   `Binding 1`: 重み（INT8）
+    *   `Binding 2`: リスケール係数（FP32 - チャネルあたり 1 つ）
+    *   `Binding 3`: 出力活性化（INT8）
+
+=== フェーズ 3: 最適化 INT8 シェーダ
+
+`dotProduct4x8bitPackedEXT` 命令を使用。`GL_EXT_shader_dot_product` 拡張が必要。
+
+[source,glsl]
+----
+#version 450
+#extension GL_EXT_shader_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) buffer Input  { uint  inData[]; };
+layout(std430, set = 0, binding = 1) buffer Weight { uint  wData[];  };
+layout(std430, set = 0, binding = 2) buffer Factors { float rescale[]; };
+layout(std430, set = 0, binding = 3) buffer Output { uint  outData[]; };
+
+void main() {
+    uint outC = gl_GlobalInvocationID.z;
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+
+    // 1. Initialize 32-bit Accumulator
+    int sum = 0;
+
+    // 2. The Vectorized Hot Loop
+    // We process 4 channels at a time using a single instruction
+    for(uint i = 0; i < (inputChannels / 4); ++i) {
+        uint a = inData[idx_in + i];
+        uint b = wData[idx_w + i];
+        sum = dotProduct4x8bitPackedEXT(a, b, sum);
+    }
+
+    // 3. The Fixed-Point Rescale
+    // We bring the high-precision sum back to the 8-bit range of the next layer
+    float result = float(sum) * rescale[outC];
+
+    // 4. Re-pack into the output buffer
+    // Note: In a real shader, you would collect 4 results and write one 'uint'
+    store_packed_result(pos, outC, int8_t(clamp(round(result), -128, 127)));
+}
+----
+
+=== 実装チェックリスト: 「落とし穴」
+
+1.  **アライメント**: `dp4a` 使用には入力チャネル **4 の倍数** 必須。そうでなければテンソルをゼロでパディング。
+2.  **Zero-Point**: 本例は **対称** 量子化（zero-point = 0）。**非対称**（ReLU 必要）なら数学は latexmath:[\sum (W \cdot (X - Z))]——ループに余分な減算、性能低下の可能性。
+3.  **中間オーバーフロー**: `sum` が latexmath:[2^{31}-1] を超えないこと。多くの 8 ビットモデルでは 16,384 チャネルまで安全。
+
+== まとめ: 量子化ロードマップ
+
+量子化は ML デプロイの「超能力」です。これまで不可能だったハードウェアでモデルを動かせます。
+
+1.  **実用経路**: **ONNX Runtime Quantization Toolchain** を使用。`CalibrationDataReader` で活性化範囲を捕捉、`quantize_static` 実行、アプリで `.quant.onnx` をロード。数学、ハードウェアマッピング、最適化を処理。
+2.  **学習経路**: `dotProduct4x8bitPackedEXT` を使うカスタム **INT8 シェーダ** を構築。**固定小数点リスケール** トリックを習得し、可能な限り整数で数学を維持。
+3.  **洗練**: **混合精度** で脆弱レイヤを保護、**コサイン類似度** で精度低下をデバッグ。
+
+ライブラリかシェーダかを選んでも、モデルを縮小しシリコンを飽和させる装備ができました。次章では、これらの量子化モデルを NVIDIA、AMD、Intel の特定行列ハードウェア向けにチューニングします。
+
+xref:ML_Inference/Advanced_Topics/01_introduction.adoc[前へ: はじめに] | xref:ML_Inference/Advanced_Topics/03_vendor_optimizations.adoc[次へ: ベンダー固有最適化]

@@ -1,0 +1,318 @@
+:pp: {plus}{plus}
+
+= Vulkan プロファイル: 機能検出の単純化
+
+== はじめに
+
+この章では、前章で議論したエコシステムユーティリティの上に構築される強力な機能である Vulkan プロファイルを探ります。Vulkan プロファイルは次のことを標準化された方法で提供します。
+
+1. アプリケーションが必要とする機能、拡張、制限のセットを定義する
+2. ユーザーのハードウェアとの互換性を自動的に確認する
+3. 手動の機能検出とフォールバックパスの必要性をなくす
+4. ボイラープレートコードを大幅に削減する
+
+Vulkan プロファイルは、手動で機能サポートを確認する複雑さなしに、幅広いハードウェアでアプリケーションが一貫して動くことを保証したい開発者にとって特に価値があります。
+
+== Vulkan プロファイルの理解
+
+=== Vulkan プロファイルとは？
+
+Vulkan プロファイルは、特定のターゲット環境またはベストプラクティスのセットを表す、機能、拡張、制限、フォーマットの事前定義された集合です。低レベルな Vulkan API の上に高い抽象化を提供し、次のことを容易にします。
+
+* 特定のハードウェア能力をターゲットにする
+* 異なる GPU 間での互換性を確保する
+* ベストプラクティスを一貫して実装する
+* 機能検出のボイラープレートコードを削減する
+
+各機能と拡張を手動で確認してフォールバックパスを実装する代わりに、アプリケーションが必要とするプロファイルを指定するだけです。Vulkan プロファイルライブラリが互換性チェックを処理し、ユーザーのハードウェアが要件を満たさない場合は適切なエラーメッセージを提供します。
+
+=== Vulkan プロファイルの種類
+
+いくつかの種類のプロファイルが利用可能です。
+
+1. *API プロファイル*: 特定の Vulkan API バージョンを表す（例: Vulkan 1.1、1.2、1.3）
+2. *ベンダープロファイル*: 特定のハードウェアベンダーをターゲットにする（例: NVIDIA、AMD、Intel）
+3. *プラットフォームプロファイル*: 特定のプラットフォームをターゲットにする（例: Windows、Linux、Android）
+4. *ベストプラクティスプロファイル*: Vulkan 開発の推奨プラクティスを実装する
+
+この章ではベストプラクティスプロファイルを例として使い、さらにプロファイルが手動の機能検出の必要性をなくすことでコードをどう単純化できるかを示します。
+
+== プロファイルがコードを単純化する仕組み
+
+=== 手動の機能検出の排除
+
+これまで、機能サポートを手動で確認し、フォールバックパスを実装する必要がありました。
+
+1. デバイスが Vulkan 1.3 をサポートするか確認する
+2. そうでなければ、ダイナミックレンダリング拡張をサポートするか確認する
+3. どちらもサポートされていなければ、伝統的なレンダーパスにフォールバックする
+4. すべての機能（タイムラインセマフォ、synchronization2 など）についてこのプロセスを繰り返す
+5. 各機能用に別々のコードパスを維持する
+
+このアプローチは、複数の条件分岐を持つ複雑で保守しにくいコードにつながります。
+
+プロファイルを使うと、このプロセス全体が次のように単純化されます。
+
+1. プロファイルがサポートされているか確認する
+2. サポートされていれば、プロファイルが保証するすべての機能を使う
+3. そうでなければ、任意でより基本的なアプローチにフォールバックする
+
+=== プロファイルを使う利点
+
+プロファイルの利用にはいくつかの利点があります。
+
+1. *コードの複雑さの大幅な削減*: 複数の機能チェックと条件分岐が不要
+2. *保守性の向上*: テストとデバッグするコードパスが少ない
+3. *将来への備え*: 新しい Vulkan バージョンがリリースされても、コードを変えずにプロファイルを更新できる
+4. *より明確な要件*: プロファイルはアプリケーションが何を必要とするかの明確な仕様を提供する
+5. *エラー処理の単純化*: 多数のチェックではなく 1 つのチェック
+
+== アプリケーションへのプロファイルの実装
+
+Vulkan アプリケーションにプロファイルを実装する方法を見てみましょう。前章で行っていた手動の機能検出をプロファイルがどう置き換えられるかを示す例として、ベストプラクティスプロファイルを使います。
+
+=== Vulkan プロファイルライブラリの追加
+
+まず、Vulkan プロファイルヘッダをインクルードする必要があります。
+
+[,c++]
+----
+#include <vulkan/vulkan_profiles.hpp>
+----
+
+このヘッダは、Vulkan プロファイルを扱うために必要な関数と構造体を提供します。
+
+Vulkan Profiles ヘッダは標準の Vulkan ヘッダの一部ではありません。
+Vulkan SDK を使う場合にのみ利用可能です。Vulkan SDK がインストールされ、開発環境で適切に構成されていることを確認してください。
+
+=== プロファイル要件の定義
+
+機能と拡張を手動で確認する代わりに、プロファイル要件を定義できます。
+
+[,c++]
+----
+// Define the profile we want to use
+const VpProfileProperties profile = {
+    VP_KHR_ROADMAP_2022_NAME,
+    VP_KHR_ROADMAP_2022_SPEC_VERSION
+};
+
+// Check if the profile is supported
+VkBool32 supported = false;
+vpGetPhysicalDeviceProfileSupport(instance, physicalDevice, &profile, &supported);
+
+if (!supported) {
+    throw std::runtime_error("Roadmap 2022 profile is not supported on this device");
+}
+----
+
+=== プロファイルでのデバイス作成
+
+論理デバイスを作成するとき、プロファイルを使って必要な機能と拡張を自動的に有効にできます。
+
+[,c++]
+----
+// Create device with Best Practices profile
+VkDeviceCreateInfo deviceCreateInfo = {};
+deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+
+// Set up queue create infos
+// ...
+
+// Apply the Best Practices profile to the device creation
+vpCreateDevice(physicalDevice, &deviceCreateInfo, &bestPracticesProfile, nullptr, &device);
+----
+
+これにより、手動で指定することなく、ベストプラクティスプロファイルが要求するすべての機能と拡張が自動的に有効になります。
+
+=== プロファイル固有の機能の使用
+
+ベストプラクティスプロファイルは、アプリケーションで使える特定の機能を有効にしている場合があります。
+
+[,c++]
+----
+// The profile guarantees these features are available
+// No need to check for support or provide fallback paths
+
+// Example: Using dynamic rendering (guaranteed by the profile)
+vk::RenderingAttachmentInfo colorAttachment{
+    .imageView = swapChainImageViews[imageIndex],
+    .imageLayout = vk::ImageLayout::eAttachmentOptimal,
+    .loadOp = vk::AttachmentLoadOp::eClear,
+    .storeOp = vk::AttachmentStoreOp::eStore,
+    .clearValue = clearColor
+};
+
+vk::RenderingInfo renderingInfo{
+    .renderArea = {{0, 0}, swapChainExtent},
+    .layerCount = 1,
+    .colorAttachmentCount = 1,
+    .pColorAttachments = &colorAttachment
+};
+
+commandBuffer.beginRendering(renderingInfo);
+// ... draw commands ...
+commandBuffer.endRendering();
+----
+
+=== プロファイルでのエラー処理
+
+プロファイルを使うと、エラー処理がより素直になります。
+
+[,c++]
+----
+try {
+    // Try to create a device with the Best Practices profile
+    vpCreateDevice(physicalDevice, &deviceCreateInfo, &bestPracticesProfile, nullptr, &device);
+} catch (const std::exception& e) {
+    // Profile is not supported, provide user-friendly error message
+    std::cerr << "Your GPU does not support the required Vulkan features for optimal performance." << std::endl;
+    std::cerr << "Error: " << e.what() << std::endl;
+
+    // Optionally, try with a more basic profile or exit gracefully
+    // ...
+}
+----
+
+== 手動の機能検出とプロファイルの比較
+
+プロファイルがどれだけのコードと複雑さを排除できるかを理解するために、2 つのアプローチを比較してみましょう。
+
+=== 手動の機能検出（前章）
+
+前章では、使いたい*各機能*について次のようなコードを書く必要がありました。
+
+[,c++]
+----
+// Check if dynamic rendering is supported
+bool dynamicRenderingSupported = false;
+
+// Check for Vulkan 1.3 support
+if (deviceProperties.apiVersion >= VK_API_VERSION_1_3) {
+    dynamicRenderingSupported = true;
+} else {
+    // Check for the extension on older Vulkan versions
+    for (const auto& extension : availableExtensions) {
+        if (strcmp(extension.extensionName, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) == 0) {
+            dynamicRenderingSupported = true;
+            break;
+        }
+    }
+}
+
+// Store this information for later use
+appInfo.dynamicRenderingSupported = dynamicRenderingSupported;
+----
+
+そしてアプリケーション全体で条件付きコードパスを作成する必要がありました。
+
+[,c++]
+----
+// When creating the pipeline
+if (appInfo.dynamicRenderingSupported) {
+    // Use dynamic rendering
+    vk::PipelineRenderingCreateInfo renderingInfo{
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &swapChainImageFormat
+    };
+    pipelineInfo.pNext = &renderingInfo;
+    pipelineInfo.renderPass = nullptr;
+} else {
+    // Use traditional render pass
+    pipelineInfo.pNext = nullptr;
+    pipelineInfo.renderPass = renderPass;
+    pipelineInfo.subpass = 0;
+}
+
+// When recording command buffers
+if (appInfo.dynamicRenderingSupported) {
+    // Begin dynamic rendering
+    vk::RenderingAttachmentInfo colorAttachment{/*...*/};
+    vk::RenderingInfo renderingInfo{/*...*/};
+    commandBuffer.beginRendering(renderingInfo);
+} else {
+    // Begin traditional render pass
+    vk::RenderPassBeginInfo renderPassInfo{/*...*/};
+    commandBuffer.beginRenderPass(renderPassInfo, vk::SubpassContents::eInline);
+}
+
+// And again at the end of the command buffer
+if (appInfo.dynamicRenderingSupported) {
+    commandBuffer.endRendering();
+} else {
+    commandBuffer.endRenderPass();
+}
+----
+
+条件付きで使いたい*すべての機能*（タイムラインセマフォ、synchronization2 など）についてこのパターンを繰り返す必要があり、保守が難しい複雑で分岐の多いコードになっていました。
+
+=== プロファイルの使用（本章）
+
+プロファイルを使うと、その複雑さはすべて次のように削減されます。
+
+[,c++]
+----
+// Define the profile
+const VpProfileProperties profile = {
+    VP_KHR_ROADMAP_2022_NAME,
+    VP_KHR_ROADMAP_2022_SPEC_VERSION
+};
+
+// Check if the profile is supported
+VkBool32 supported = false;
+vpGetPhysicalDeviceProfileSupport(instance, physicalDevice, &profile, &supported);
+
+if (supported) {
+    // Create device with the profile - all features enabled automatically
+    vpCreateDevice(physicalDevice, &deviceCreateInfo, &profile, nullptr, &device);
+
+    // Now we can use any feature guaranteed by the profile without checks
+    // For example, dynamic rendering is always available:
+    vk::RenderingAttachmentInfo colorAttachment{/*...*/};
+    vk::RenderingInfo renderingInfo{/*...*/};
+    commandBuffer.beginRendering(renderingInfo);
+    // ... draw commands ...
+    commandBuffer.endRendering();
+}
+----
+
+プロファイルアプローチが排除するものは次のとおりです。
+
+1. 複数の機能検出チェック
+2. アプリケーション全体の条件付きコードパス
+3. アプリケーション状態で機能サポートを追跡する必要性
+4. 複数のコードパスを維持・テストする複雑さ
+
+その結果、コードは次のようになります。
+
+1. 大幅に短くなる
+2. 読みやすく理解しやすくなる
+3. エラーが起きにくくなる
+4. 保守と更新が容易になる
+
+== プロファイル使用のベストプラクティス
+
+Vulkan プロファイルを使うときは、次のベストプラクティスを検討してください。
+
+1. *適切なプロファイルを選ぶ*: 過度に制限的にならず、アプリケーションの要件に合うプロファイルを選ぶ。
+
+2. *フォールバックオプションを用意する*: ベストプラクティスプロファイルがサポートされない場合は、より基本的なプロファイルへのフォールバックを検討する。
+
+3. *要件を明確に伝える*: サポートするプロファイルに基づくハードウェア要件をユーザーに知らせる。
+
+4. *さまざまなハードウェアでテストする*: プロファイルを使っても、異なる GPU でアプリケーションをテストすることが重要である。
+
+5. *最新を保つ*: プロファイルは新しい Vulkan バージョンとともに進化するため、実装を最新に保つ。
+
+== まとめ
+
+Vulkan プロファイルは、手動の機能検出と条件付きコードパスの必要性をなくすことで、Vulkan コードを単純化する強力な方法を提供します。この章で見てきたように、プロファイルは書いて保守するコード量を劇的に削減し、アプリケーションを次のようにします。
+
+1. より簡潔で読みやすい
+2. 保守と更新が容易
+3. エラーが起きにくい
+4. 異なるハードウェア間でより一貫している
+
+この章で探った例は、前章で実装しなければならなかった複雑な機能検出とフォールバックパスを、プロファイルがどう置き換えられるかを示しています。プロファイルを使うことで、ハードウェア互換性の細かい点より、アプリケーションのコア機能に集中できます。
+
+link:/attachments/33_vulkan_profiles.cpp[C{pp} コード]

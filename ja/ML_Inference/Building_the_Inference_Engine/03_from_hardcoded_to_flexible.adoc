@@ -1,0 +1,232 @@
+:pp: {plus}{plus}
+
+= ハードコードから柔軟性へ
+
+前章のハードコード実装を見てください。3 つの dense レイヤ、ほぼ同一のコードが 3 回繰り返されています。ディスクリプタを変え、プッシュ定数を更新し、ディスパッチ。barrier。繰り返し。
+
+これは動きますが、脆いです。第 4 レイヤを追加したい？ コードをコピペします。別アーキテクチャを試したい？ すべて書き直します。畳み込みレイヤをサポートしたい？ ハードコードされた順序のどこに挿入するか考えます。
+
+コードは叫んでいます: ここにパターンがある、と。
+
+== 同じ部分と異なる部分
+
+各レイヤの実行は次の構造に従います。
+
+1. パイプライン（コンピュートシェーダ）をバインド
+2. ディスクリプタセットをバインド（入出力バッファ、重み）
+3. プッシュ定数を設定（次元、パラメータ）
+4. ディスパッチ（ワークグループ数）
+5. 次レイヤ用に barrier を挿入
+
+構造は同一です。何が変わるのでしょうか？
+
+**パイプライン**: dense レイヤは dense.spv シェーダを使います。畳み込みは conv2d.spv を使います。ReLU は relu.spv を使います。
+
+**ディスクリプタ**: 入出力用の異なるバッファ、異なる重みテンソル。しかしバインドパターンは同じ——入力、重み、出力です。
+
+**プッシュ定数**: 次元は変わります（128 出力 vs 64 出力）が、仕組みは同一です。
+
+**ディスパッチサイズ**: 出力サイズから計算されますが、式は予測可能です。
+
+これらの差をパラメータ化できれば、実行コードを 1 回書いてすべてのレイヤで再利用できます。
+
+== レイヤ抽象化
+
+各レイヤが自分自身の実行方法を知るオブジェクトだったらどうでしょう。例えば次のようなものです。
+
+[source,cpp]
+----
+class Layer {
+public:
+    virtual void execute(
+        vk::raii::CommandBuffer& cmdBuffer,
+        const vk::raii::Buffer& inputBuffer,
+        const vk::raii::Buffer& outputBuffer
+    ) = 0;
+};
+----
+
+順伝播は次のようになります。
+
+[source,cpp]
+----
+for (auto& layer : layers) {
+    layer->execute(cmdBuffer, currentBuffer, nextBuffer);
+    insertBarrier(cmdBuffer);
+    std::swap(currentBuffer, nextBuffer);
+}
+----
+
+ずっとすっきりしました。各レイヤが固有の振る舞い——どのシェーダを使うか、ディスパッチサイズの計算、どのパラメータを設定するか——をカプセル化します。実行ループはそれらの詳細を気にしません。
+
+== 具体例: DenseLayer
+
+dense レイヤで具体化しましょう。
+
+[source,cpp]
+----
+class DenseLayer : public Layer {
+public:
+    DenseLayer(
+        vk::raii::Device& device,
+        uint32_t inputSize,
+        uint32_t outputSize,
+        const std::vector<float>& weights,
+        const std::vector<float>& bias
+    ) : inputSize_(inputSize), outputSize_(outputSize) {
+        // Create weight and bias buffers
+        createWeightBuffer(device, weights);
+        createBiasBuffer(device, bias);
+
+        // Load shader and create pipeline
+        createPipeline(device, "shaders/dense.spv");
+    }
+
+    void execute(
+        vk::raii::CommandBuffer& cmdBuffer,
+        const vk::raii::Buffer& input,
+        const vk::raii::Buffer& output
+    ) override {
+        // Bind our pipeline
+        cmdBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline_);
+
+        // Bind descriptors (input, weights, bias, output)
+        cmdBuffer.bindDescriptorSets(/*...*/);
+
+        // Push constants
+        struct { uint32_t inSize, outSize; } params = {inputSize_, outputSize_};
+        cmdBuffer.pushConstants(/*...*/, params);
+
+        // Dispatch
+        uint32_t workgroups = (outputSize_ + 63) / 64;
+        cmdBuffer.dispatch(workgroups, 1, 1);
+    }
+
+private:
+    uint32_t inputSize_, outputSize_;
+    vk::raii::Buffer weightBuffer_;
+    vk::raii::Buffer biasBuffer_;
+    vk::raii::Pipeline pipeline_;
+    // ... memory, descriptors, etc.
+};
+----
+
+3 レイヤネットワークの作成は単純になります。
+
+[source,cpp]
+----
+std::vector<std::unique_ptr<Layer>> layers;
+
+layers.push_back(std::make_unique<DenseLayer>(
+    device, 784, 128, weights.fc1_weights, weights.fc1_bias
+));
+
+layers.push_back(std::make_unique<DenseLayer>(
+    device, 128, 64, weights.fc2_weights, weights.fc2_bias
+));
+
+layers.push_back(std::make_unique<DenseLayer>(
+    device, 64, 10, weights.fc3_weights, weights.fc3_bias
+));
+----
+
+ずっと良くなりました。4 レイヤネットワークが欲しい？ push_back を 1 つ追加します。dense レイヤの間に ReLU レイヤを挿入したい？ ReLULayer クラスを作って挿入します。
+
+== バッファ管理
+
+execute シグネチャに問題があることに気づきましたか？ 入出力バッファを渡していますが、レイヤ間の中間結果はどうでしょうか？
+
+レイヤ 1 はあるバッファに出力します。レイヤ 2 はそれを入力として必要とします。レイヤ 3 はレイヤ 2 の出力を必要とします。これらの中間テンソルを管理する方法が必要です。
+
+1 つのアプローチ: バッファを事前割り当てし、明示的に渡す。しかし分岐アーキテクチャ（スキップ接続、複数出力など）では煩雑になります。
+
+より良いアプローチ: 各レイヤが自分の出力バッファを所有する。構築時にレイヤが出力バッファを割り当てます。実行時に各レイヤは自分の出力バッファに書き、次のレイヤがそれを読みます。
+
+つまりレイヤは互いのバッファを知る必要があります。そこでグラフ表現が必要になります——まだそこまでは行きません。今は逐次実行と明示的なバッファ受け渡しでシンプルに保ちます。
+
+== 畳み込みはどうか
+
+dense レイヤは単純です。畳み込みはより複雑——カーネルサイズ、ストライド、パディングパラメータが必要です。抽象化にどう収まるでしょうか？
+
+同じパターン、パラメータが増えるだけです。
+
+[source,cpp]
+----
+class Conv2DLayer : public Layer {
+public:
+    Conv2DLayer(
+        vk::raii::Device& device,
+        uint32_t inputChannels,
+        uint32_t outputChannels,
+        uint32_t kernelHeight,
+        uint32_t kernelWidth,
+        uint32_t stride,
+        uint32_t padding,
+        const std::vector<float>& weights,
+        const std::vector<float>& bias
+    ) { /* ... */ }
+
+    void execute(/*...*/) override {
+        // Bind conv2d.spv shader
+        // Push constants include kernel size, stride, padding
+        // Dispatch with 2D workgroups for spatial dimensions
+    }
+};
+----
+
+異なるパラメータ、異なるシェーダ、異なるディスパッチパターン。しかし同じインタフェース——execute() が仕事をし、呼び出し側は詳細を知る必要がありません。
+
+== 活性化関数
+
+ReLU のような活性化関数はさらに単純——学習パラメータのない要素ごとの演算です。
+
+[source,cpp]
+----
+class ReLULayer : public Layer {
+public:
+    ReLULayer(vk::raii::Device& device, uint32_t elementCount)
+        : elementCount_(elementCount) {
+        createPipeline(device, "shaders/relu.spv");
+    }
+
+    void execute(/*...*/) override {
+        // Bind relu.spv
+        // Push element count
+        // Dispatch ((elementCount + 255) / 256) workgroups
+    }
+};
+----
+
+重みもバイアスもなく、要素数だけです。シェーダは自明——`output[i] = max(0, input[i])` です。
+
+== パターンの出現
+
+各レイヤ型は同じインタフェースを実装しますが、内部は異なります。
+
+- **DenseLayer**: 行列積、重み行列とバイアスベクトルが必要
+- **Conv2DLayer**: 畳み込み、空間パラメータ付きカーネルが必要
+- **ReLULayer**: 要素ごとの max、パラメータなし
+- **MaxPoolLayer**: 空間プーリング、プールサイズとストライドが必要
+- **BatchNormLayer**: 正規化、平均/分散/スケール/シフトが必要
+
+呼び出し側の視点ではすべて同じ方法で実行されます。抽象化が複雑さを隠します。
+
+== 得られたもの
+
+この抽象化は次をもたらします。
+
+**柔軟性**: 新しいレイヤ型の追加が容易——インタフェースを実装すれば完了です。
+
+**再利用性**: 実行ループは任意のレイヤ列で動作します。
+
+**テスト容易性**: 各レイヤ型を単独でテストできます。
+
+**明確さ**: 順伝播が「ほぼ同一のコードのページ」ではなく、明らかに「各レイヤを順に実行」になりました。
+
+しかし問題の一部しか解いていません。レイヤの手動インスタンス化、バッファ接続の管理、実行順序の把握がまだ必要です。3 レイヤネットワークなら問題ありません。スキップ接続と 50 レイヤの ResNet-50 なら、より多くの構造が必要です。
+
+そこでグラフ表現です。レイヤのフラットなリストの代わりに、ノードが演算、エッジがデータ依存関係である有向非巡回グラフとしてネットワークを表現します。
+
+次章: そのグラフ表現を構築します。
+
+xref:ML_Inference/Building_the_Inference_Engine/02_hardcoded_forward_prop.adoc[前へ: ハードコードされた順伝播] | xref:ML_Inference/Building_the_Inference_Engine/04_model_representation.adoc[次へ: モデル表現]

@@ -1,0 +1,67 @@
+:pp: {plus}{plus}
+= ローカルリード同期: ダイナミックレンダリングでのオンタイル効率
+
+== 両方の長所
+
+レガシーなレンダーパスシステムでは、効率的なオンタイルリード操作にサブパスを使いました。これにより GPU は、カラーやデプスアタッチメントをオンチップメモリ（タイルキャッシュ）から直接読め、メインメモリへの高価な往復を避けられました。これはモバイルおよびタイルドレンダリング GPU にとって重要な最適化でした。
+
+**Vulkan 1.4** の導入により、同じ効率が `VK_KHR_dynamic_rendering_local_read` 機能を通じて **ダイナミックレンダリング** でも利用可能になりました。「パスレス」世界のシンプルさと、サブパスベース世界の性能が得られます。
+
+== ローカルリードの実装
+
+実装には二つの部分があります。特化したバリアと、特定のレンダリング設定です。ローカルリードを使うとき、GPU にこう伝えます。「アタッチメントから読みたいが、読み取りは現在の書き込みと同じピクセル (x, y) 位置でのみ行うと約束する。」これによりハードウェアはデータをオンタイルに保てます。
+
+[,cpp]
+----
+// 1. Define the Dependency
+auto localReadBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eInputAttachmentRead,
+    .oldLayout = vk::ImageLayout::eRenderingLocalRead,
+    .newLayout = vk::ImageLayout::eRenderingLocalRead,
+    .image = gBufferAttachment.image(),
+    .subresourceRange = subresourceRange
+};
+
+commandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &localReadBarrier});
+
+// 2. Perform the Rendering
+// You must include the local read information in your RenderingInfo
+auto localReadInfo = vk::RenderingInputAttachmentIndexInfo{
+    .colorAttachmentCount = 1,
+    .pColorAttachmentInputIndices = &colorIndex
+};
+
+auto renderingInfo = vk::RenderingInfo{
+    .pNext = &localReadInfo,
+    // ...
+};
+
+commandBuffer.beginRendering(renderingInfo);
+// ... record your on-tile reads in your Slang shader ...
+commandBuffer.endRendering();
+----
+
+== Slang との統合
+
+Slang シェーダでは、標準の入力アタッチメント構文を使います。Slang コンパイラは、ローカルリードアクセスに必要な SPIR-V 命令を正しくターゲットします。これにより、シェーダコードはクリーンで、異なるハードウェア間で移植可能に保たれます。
+
+[,cpp]
+----
+// Slang snippet
+[[vk::input_attachment_index(0)]]
+InputAttachment<float4> gBufferInput;
+
+float4 main(float2 uv : TEXCOORD0) : SV_Target {
+    float4 data = gBufferInput.SubpassLoad();
+    // ...
+}
+----
+
+ローカルリード同期を極めることで、レガシーなサブパスベースレンダラと同等に効率的でありながら、モダン Vulkan の柔軟性と明確さを持つモダンなディファードレンダラを構築できます。次の章では、これらの原則が **Host Image Copies** における直接的な CPU から GPU へのデータ移動にどう適用されるかを見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Dynamic_Rendering_Sync/02_subpass_replacement.adoc[サブパスの置き換え] | 次へ: xref:Synchronization/Host_Image_Copies_Memory_Sync/01_introduction.adoc[Host Image Copies とメモリマップ同期]

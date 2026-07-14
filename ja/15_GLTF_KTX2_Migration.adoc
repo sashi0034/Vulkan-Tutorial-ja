@@ -1,0 +1,707 @@
+:pp: {plus}{plus}
+
+= モダンなアセット形式への移行: glTF と KTX2
+
+== はじめに
+
+これまでの章では、Wavefront OBJ 形式の 3D モデルの読み込みに tinyobjloader を、PNG や JPEG などの一般的な画像形式のテクスチャ読み込みに stb_image を使ってきました。これらのライブラリと形式はシンプルで広くサポートされていますが、モダンなグラフィックスアプリケーションでは、より高度なアセット形式を使う利点が大きくなります。
+
+この章では、次の移行方法を見ていきます。
+
+1. Wavefront OBJ（tinyobjloader で読み込み）から glTF（tinygltf で読み込み）へ
+2. PNG などの一般的な画像形式（stb_image で読み込み）から KTX2（KTX ライブラリで読み込み）へ
+
+この移行には次のような利点があります。
+
+* **より包括的なモデルデータ**: glTF はアニメーション、スケルトンリグ、PBR マテリアルなどをサポートします
+* **GPU 向けに最適化されたテクスチャ**: KTX2 は圧縮テクスチャ形式、ミップマップ、その他 GPU フレンドリーな機能をサポートします
+* **業界標準**: glTF と KTX2 はどちらも、モダンなグラフィックス API 向けに設計された Khronos 標準です
+
+移行プロセスに入り、Vulkan アプリケーションをこれらのモダンな形式に適応させる方法を見ていきましょう。
+
+== glTF の理解
+
+=== glTF とは
+
+https://www.khronos.org/gltf/[glTF]（GL Transmission Format）は、3D シーンとモデルの効率的な伝送・読み込みのためのロイヤリティフリー仕様です。Khronos Group によって開発され、glTF は「3D のための JPEG」— 3D コンテンツの共通公開形式 — となるよう設計されています。
+
+glTF の主な特徴は次のとおりです。
+
+* **コンパクトなファイルサイズ**: バイナリデータが効率的に格納されます
+* **高速な読み込み**: 読み込み時に必要な処理を最小化します
+* **完全な 3D シーン表現**: メッシュ、マテリアル、テクスチャ、アニメーションなどを含みます
+* **ランタイム対応**: GPU が直接利用できる形式でデータが格納されます
+* **拡張可能**: 新しい機能で形式を拡張できます
+
+=== OBJ と glTF の比較
+
+OBJ 形式と glTF を比較してみましょう。
+
+[cols="1,1,1"]
+|===
+|機能 |OBJ |glTF
+
+|ファイル形式
+|テキストベース
+|JSON + バイナリデータ（単一ファイル向けの GLB オプションあり）
+
+|サポートするデータ
+|ジオメトリ、基本マテリアル、テクスチャ座標
+|ジオメトリ、PBR マテリアル、アニメーション、スケルトン、シーン、カメラなど
+
+|マテリアルシステム
+|基本（MTL ファイル）
+|物理ベースレンダリング（PBR）
+
+|アニメーションサポート
+|なし
+|キーフレームおよびスケルトンアニメーション
+
+|座標系
+|右手系
+|右手系、Y-up
+
+|業界での採用
+|レガシー標準
+|リアルタイム 3D 向けのモダン標準
+|===
+
+== KTX2 の理解
+
+=== KTX2 とは
+
+https://www.khronos.org/ktx/[KTX2]（Khronos Texture 2.0）は、GPU 利用向けに最適化されたテクスチャデータを格納するコンテナファイル形式です。Vulkan、OpenGL、DirectX などのモダンなグラフィックス API と効率的に連携するよう設計されています。
+
+KTX2 の主な特徴は次のとおりです。
+
+* **GPU 対応形式**: 圧縮形式を含むすべての GPU テクスチャ形式をサポートします
+* **ミップマップ格納**: 完全なミップマップチェーンを効率的に格納します
+* **メタデータ**: テクスチャのプロパティに関する情報を含みます
+* **スーパー圧縮**: Basis Universal などの追加圧縮をサポートします
+* **直接アップロード**: 多くの場合、処理なしで GPU に直接アップロードできます
+
+=== PNG/JPEG と KTX2 の比較
+
+従来の画像形式と KTX2 を比較してみましょう。
+
+[cols="1,1,1"]
+|===
+|機能 |PNG/JPEG |KTX2
+
+|ファイル形式
+|汎用画像形式
+|GPU 向けに最適化されたテクスチャコンテナ
+
+|圧縮
+|汎用（PNG）または非可逆（JPEG）
+|GPU テクスチャ圧縮（BC、ETC、ASTC）+ スーパー圧縮
+
+|ミップマップ
+|非サポート
+|組み込みのミップマップチェーンサポート
+
+|GPU アップロード
+|変換が必要
+|GPU に直接アップロード可能
+
+|メタデータ
+|限定的
+|包括的なテクスチャメタデータ
+
+|サポートする機能
+|基本的な 2D 画像
+|すべての GPU テクスチャタイプ（2D、3D、キューブマップ、配列）
+|===
+
+== tinyobjloader から tinygltf への移行
+
+OBJ の代わりに glTF モデルを読み込むには、オープンソースの link:https://github.com/syoyo/tinygltf[ヘッダオンリー C{pp} tiny glTF ライブラリ] を使います。
+
+=== tinygltf のセットアップ
+
+まず、tinyobjloader の代わりに tinygltf ライブラリをインクルードする必要があります。
+
+[,c{pp}]
+----
+// Replace this:
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
+
+// With this:
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <tiny_gltf.h>
+----
+
+tinygltf は内部で画像読み込みに stb_image を使いますが、テクスチャ読み込みコードは後で KTX2 に置き換えます。
+
+=== glTF モデルの読み込み
+
+次に、`loadModel()` 関数を tinyobjloader の代わりに tinygltf を使うよう変更します。
+
+[,c{pp}]
+----
+void loadModel()
+{
+    // Use tinygltf to load the model instead of tinyobjloader
+    tinygltf::Model    model;
+    tinygltf::TinyGLTF loader;
+    std::string        err;
+    std::string        warn;
+
+    bool ret = loader.LoadBinaryFromFile(&model, &err, &warn, MODEL_PATH);
+
+    if (!warn.empty())
+    {
+        std::cout << "glTF warning: " << warn << std::endl;
+    }
+
+    if (!err.empty())
+    {
+        std::cout << "glTF error: " << err << std::endl;
+    }
+
+    if (!ret)
+    {
+        throw std::runtime_error("Failed to load glTF model");
+    }
+
+    vertices.clear();
+    indices.clear();
+
+    // Process all meshes in the model
+    for (const auto &mesh : model.meshes)
+    {
+        for (const auto &primitive : mesh.primitives)
+        {
+            // Get indices
+            const tinygltf::Accessor   &indexAccessor   = model.accessors[primitive.indices];
+            const tinygltf::BufferView &indexBufferView = model.bufferViews[indexAccessor.bufferView];
+            const tinygltf::Buffer     &indexBuffer     = model.buffers[indexBufferView.buffer];
+
+            // Get vertex positions
+            const tinygltf::Accessor   &posAccessor   = model.accessors[primitive.attributes.at("POSITION")];
+            const tinygltf::BufferView &posBufferView = model.bufferViews[posAccessor.bufferView];
+            const tinygltf::Buffer     &posBuffer     = model.buffers[posBufferView.buffer];
+
+            // Get texture coordinates if available
+            bool                        hasTexCoords       = primitive.attributes.find("TEXCOORD_0") != primitive.attributes.end();
+            const tinygltf::Accessor   *texCoordAccessor   = nullptr;
+            const tinygltf::BufferView *texCoordBufferView = nullptr;
+            const tinygltf::Buffer     *texCoordBuffer     = nullptr;
+
+            if (hasTexCoords)
+            {
+                texCoordAccessor   = &model.accessors[primitive.attributes.at("TEXCOORD_0")];
+                texCoordBufferView = &model.bufferViews[texCoordAccessor->bufferView];
+                texCoordBuffer     = &model.buffers[texCoordBufferView->buffer];
+            }
+
+            uint32_t baseVertex = static_cast<uint32_t>(vertices.size());
+
+            for (size_t i = 0; i < posAccessor.count; i++)
+            {
+                Vertex vertex{};
+
+                const float *pos = reinterpret_cast<const float *>(&posBuffer.data[posBufferView.byteOffset + posAccessor.byteOffset + i * 12]);
+                // glTF uses a right-handed coordinate system with Y-up
+                // Vulkan uses a right-handed coordinate system with Y-down
+                // We need to flip the Y coordinate
+                vertex.pos = {pos[0], -pos[1], pos[2]};
+
+                if (hasTexCoords)
+                {
+                    const float *texCoord = reinterpret_cast<const float *>(&texCoordBuffer->data[texCoordBufferView->byteOffset + texCoordAccessor->byteOffset + i * 8]);
+                    vertex.texCoord       = {texCoord[0], texCoord[1]};
+                }
+                else
+                {
+                    vertex.texCoord = {0.0f, 0.0f};
+                }
+
+                vertex.color = {1.0f, 1.0f, 1.0f};
+
+                vertices.push_back(vertex);
+            }
+
+            const unsigned char *indexData   = &indexBuffer.data[indexBufferView.byteOffset + indexAccessor.byteOffset];
+            size_t               indexCount  = indexAccessor.count;
+            size_t               indexStride = 0;
+
+            // Determine index stride based on component type
+            if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+            {
+                indexStride = sizeof(uint16_t);
+            }
+            else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT)
+            {
+                indexStride = sizeof(uint32_t);
+            }
+            else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
+            {
+                indexStride = sizeof(uint8_t);
+            }
+            else
+            {
+                throw std::runtime_error("Unsupported index component type");
+            }
+
+            indices.reserve(indices.size() + indexCount);
+
+            for (size_t i = 0; i < indexCount; i++)
+            {
+                uint32_t index = 0;
+
+                if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
+                {
+                    index = *reinterpret_cast<const uint16_t *>(indexData + i * indexStride);
+                }
+                else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT)
+                {
+                    index = *reinterpret_cast<const uint32_t *>(indexData + i * indexStride);
+                }
+                else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
+                {
+                    index = *reinterpret_cast<const uint8_t *>(indexData + i * indexStride);
+                }
+
+                indices.push_back(baseVertex + index);
+            }
+        }
+    }
+}
+----
+
+tinyobjloader 版と比べた、この実装の主な違いは次のとおりです。
+
+1. **データ構造**: glTF はアクセサ、バッファビュー、バッファからなる、より複雑なデータ構造を使います
+2. **属性へのアクセス**: 頂点データにアクセスするには、これらの構造を辿る必要があります
+3. **複数のメッシュとプリミティブ**: glTF モデルは複数のメッシュを含むことができ、各メッシュは複数のプリミティブを持てます
+4. **コンポーネント型**: 異なるインデックスコンポーネント型（8 ビット、16 ビット、32 ビット）を扱う必要があります
+
+=== 高度な glTF 機能
+
+基本実装ではジオメトリとテクスチャ座標だけを取り出していますが、glTF は他にも多くの機能をサポートしており、必要に応じて使えます。
+
+* **マテリアル**: `primitive.material` 経由で PBR マテリアルプロパティにアクセスします
+* **アニメーション**: `model.animations` 内のアニメーションデータを処理します
+* **スケルトン**: `model.skins` 内のスケルトンデータを扱います
+* **シーンとノード**: `model.scenes` と `model.nodes` 経由でシーン階層を処理します
+
+完全なアプリケーションでは、通常これらの追加機能も処理して、glTF を最大限に活用します。
+
+== stb_image から KTX への移行
+
+png や jpeg などの形式の代わりに KTX ファイルを読み込むには、オープンソースの link:https://github.com/KhronosGroup/KTX-Software[KTX（Khronos Texture）Library and Tools] を使います。
+
+=== KTX のセットアップ
+
+まず、KTX ライブラリをインクルードする必要があります。
+
+[,c{pp}]
+----
+// Replace this:
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
+// With this:
+#include <ktx.h>
+----
+
+=== KTX2 テクスチャの読み込み
+
+次に、`createTextureImage()` 関数を stb_image の代わりに KTX を使うよう変更します。
+
+[,c{pp}]
+----
+void createTextureImage() {
+    // Load KTX2 texture instead of using stb_image
+    ktxTexture* kTexture;
+    KTX_error_code result = ktxTexture_CreateFromNamedFile(
+        TEXTURE_PATH.c_str(),
+        KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT,
+        &kTexture);
+
+    if (result != KTX_SUCCESS) {
+        throw std::runtime_error("failed to load ktx texture image!");
+    }
+
+    // Get texture dimensions and data
+    uint32_t texWidth = kTexture->baseWidth;
+    uint32_t texHeight = kTexture->baseHeight;
+    ktx_size_t imageSize = ktxTexture_GetImageSize(kTexture, 0);
+    ktx_uint8_t* ktxTextureData = ktxTexture_GetData(kTexture);
+
+    // Create staging buffer
+    vk::raii::Buffer stagingBuffer({});
+    vk::raii::DeviceMemory stagingBufferMemory({});
+    createBuffer(imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, stagingBuffer, stagingBufferMemory);
+
+    // Copy texture data to staging buffer
+    void* data = stagingBufferMemory.mapMemory(0, imageSize);
+    memcpy(data, ktxTextureData, imageSize);
+    stagingBufferMemory.unmapMemory();
+
+    // Determine the Vulkan format from KTX format
+    vk::Format textureFormat = vk::Format::eR8G8B8A8Srgb; // Default format, should be determined from KTX metadata
+
+    // Create the texture image
+    createImage(texWidth, texHeight, textureFormat, vk::ImageTiling::eOptimal,
+               vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+               vk::MemoryPropertyFlagBits::eDeviceLocal, textureImage, textureImageMemory);
+
+    // Copy data from staging buffer to texture image
+    transitionImageLayout(textureImage, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
+    copyBufferToImage(stagingBuffer, textureImage, texWidth, texHeight);
+    transitionImageLayout(textureImage, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal);
+
+    // Cleanup KTX resources
+    ktxTexture_Destroy(kTexture);
+}
+----
+
+stb_image 版と比べた、この実装の主な違いは次のとおりです。
+
+1. **読み込み API**: テクスチャの読み込みに KTX API を使います
+2. **テクスチャメタデータ**: KTX はテクスチャのプロパティに関するメタデータを提供します
+3. **リソースのクリーンアップ**: KTX テクスチャオブジェクトを明示的に破棄する必要があります
+
+=== 高度な KTX 機能
+
+この基本実装は単純な 2D テクスチャだけを扱いますが、KTX2 は他にも多くの機能をサポートします。
+
+==== ミップマップの扱い
+
+KTX2 ファイルには事前生成されたミップマップを含められます。使い方は次のとおりです。
+
+[,c{pp}]
+----
+// Get mipmap levels
+uint32_t mipLevels = kTexture->numLevels;
+
+// Create image with mipmap support
+vk::ImageCreateInfo imageInfo{
+    // ... other parameters ...
+    .mipLevels = mipLevels,
+    // ... other parameters ...
+};
+
+// Copy each mip level
+for (uint32_t i = 0; i < mipLevels; i++) {
+    ktx_size_t offset;
+    KTX_error_code result = ktxTexture_GetImageOffset(kTexture, i, 0, 0, &offset);
+
+    // ... copy this mip level to the image ...
+}
+----
+
+==== 圧縮テクスチャ形式の利用
+
+KTX2 は GPU テクスチャ圧縮形式をサポートします。扱い方は次のとおりです。
+
+[,c{pp}]
+----
+// Determine the Vulkan format from KTX format
+vk::Format textureFormat;
+switch (kTexture->vkFormat) {
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        textureFormat = vk::Format::eBc7SrgbBlock;
+        break;
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+        textureFormat = vk::Format::eBc5UnormBlock;
+        break;
+    // ... other format mappings ...
+    default:
+        textureFormat = vk::Format::eR8G8B8A8Srgb;
+        break;
+}
+----
+
+==== キューブマップとテクスチャ配列の扱い
+
+KTX2 はキューブマップとテクスチャ配列を格納できます。
+
+[,c{pp}]
+----
+// Check if the texture is a cubemap
+bool isCubemap = kTexture->isCubemap;
+
+// Get the number of layers
+uint32_t layerCount = kTexture->numLayers;
+
+// Create appropriate image
+vk::ImageCreateInfo imageInfo{
+    // ... other parameters ...
+    .imageType = vk::ImageType::e2D,
+    .arrayLayers = layerCount,
+    .flags = isCubemap ? vk::ImageCreateFlagBits::eCubeCompatible : vk::ImageCreateFlags(),
+    // ... other parameters ...
+};
+----
+
+== アセットを glTF と KTX2 に変換する
+
+=== OBJ から glTF への変換
+
+既存の OBJ ファイルを glTF に変換するには、さまざまなツールを使えます。
+
+* **Blender**: OBJ ファイルを開き、glTF としてエクスポートします
+* **obj2gltf**: OBJ を glTF に変換するコマンドラインツール
+* **assimp**: さまざまな 3D 形式間で変換できるライブラリ
+
+obj2gltf の使用例:
+
+[,bash]
+----
+obj2gltf -i model.obj -o model.gltf
+----
+
+== KTX2 ファイルの扱い
+
+=== KTX2 ファイルの作成
+
+KTX2 ファイルを作成する方法はいくつかあります。
+
+==== KTX-Software ツールの利用
+
+KTX-Software パッケージは、KTX2 ファイル作成用のコマンドラインツールを提供します。
+
+* **toktx**: 既存画像から KTX2 ファイルを作成する主なツール
+
+基本的な使い方:
+
+[,bash]
+----
+# Create a basic KTX2 file
+toktx texture.ktx2 texture.png
+
+# Create a KTX2 file with mipmaps
+toktx --mipmap texture.ktx2 texture.png
+
+# Create a KTX2 file with Basis Universal compression
+toktx --bcmp texture.ktx2 texture.png
+
+# Create a KTX2 file with specific GPU compression format (BC7)
+toktx --bcmp --format BC7_RGBA texture.ktx2 texture.png
+
+# Create a cubemap KTX2 file
+toktx --cubemap cubemap.ktx2 posx.png negx.png posy.png negy.png posz.png negz.png
+----
+
+==== KTX ライブラリ API の利用
+
+KTX ライブラリ API を使ってプログラムから KTX2 ファイルを作成することもできます。
+
+[,c{pp}]
+----
+#include <ktx.h>
+
+// Create a new KTX2 texture
+ktxTexture2* texture;
+ktxTextureCreateInfo createInfo = {
+    .vkFormat = VK_FORMAT_R8G8B8A8_SRGB,
+    .baseWidth = 512,
+    .baseHeight = 512,
+    .baseDepth = 1,
+    .numDimensions = 2,
+    .numLevels = 1,
+    .numLayers = 1,
+    .numFaces = 1,
+    .isArray = KTX_FALSE,
+    .generateMipmaps = KTX_FALSE
+};
+
+KTX_error_code result = ktxTexture2_Create(&createInfo, KTX_TEXTURE_CREATE_ALLOC_STORAGE, &texture);
+
+// Set image data
+uint32_t* imageData = new uint32_t[512 * 512];
+// ... fill image data ...
+ktxTexture_SetImageFromMemory(ktxTexture(texture), 0, 0, 0, imageData, 512 * 512 * 4);
+
+// Write to file
+ktxTexture_WriteToNamedFile(ktxTexture(texture), "output.ktx2");
+
+// Clean up
+ktxTexture_Destroy(ktxTexture(texture));
+delete[] imageData;
+----
+
+==== 画像編集ソフトウェアの利用
+
+一部の画像編集および 3D モデリングソフトウェアは、KTX2 へ直接エクスポートできます。
+
+* **Substance Designer**: テクスチャを KTX2 形式へ直接エクスポートできます
+* **Blender**: プラグインによりテクスチャを KTX2 へエクスポートできます
+* **GIMP**: KTX プラグインにより画像を KTX2 として保存できます
+
+=== 他形式から KTX2 への変換
+
+KTX2 ファイルは、さまざまな一般的な画像形式から作成できます。
+
+==== PNG/JPEG/TIFF から
+
+最も簡単な変換は、toktx を使った標準画像形式からの変換です。
+
+[,bash]
+----
+# Convert PNG to KTX2
+toktx texture.ktx2 texture.png
+
+# Convert JPEG to KTX2
+toktx texture.ktx2 texture.jpg
+
+# Convert TIFF to KTX2
+toktx texture.ktx2 texture.tiff
+----
+
+==== DDS（DirectX テクスチャ形式）から
+
+DDS は、DirectX でよく使われる別の GPU 向け最適化テクスチャ形式です。
+
+[,bash]
+----
+# Using texconv to convert DDS to PNG first
+texconv -ft png texture.dds
+
+# Then convert PNG to KTX2
+toktx texture.ktx2 texture.png
+----
+
+あるいは、Khronos Texture Tools を使えます。
+
+[,bash]
+----
+ktx2ktx2 --convert texture.dds texture.ktx2
+----
+
+==== HDR/EXR（ハイダイナミックレンジ形式）から
+
+HDR テクスチャの場合:
+
+[,bash]
+----
+# Convert HDR to KTX2
+toktx --hdr texture.ktx2 texture.hdr
+
+# Convert EXR to KTX2 (may require intermediate conversion)
+toktx --hdr texture.ktx2 texture.exr
+----
+
+==== PSD（Photoshop）から
+
+Photoshop ファイルの場合:
+
+[,bash]
+----
+# Export PSD as PNG first
+# Then convert to KTX2
+toktx texture.ktx2 texture.png
+----
+
+=== KTX2 ファイルの最適化
+
+KTX2 ファイルを最大限に活用するには、次の最適化手法を検討してください。
+
+==== 圧縮オプション
+
+KTX2 はさまざまな圧縮方式をサポートします。
+
+[,bash]
+----
+# Basis Universal compression (highly portable)
+toktx --bcmp texture.ktx2 texture.png
+
+# ASTC compression (good for mobile)
+toktx --format ASTC_4x4_RGBA texture.ktx2 texture.png
+
+# BC7 compression (good for desktop)
+toktx --format BC7_RGBA texture.ktx2 texture.png
+
+# ETC2 compression (good for Android)
+toktx --format ETC2_RGBA texture.ktx2 texture.png
+----
+
+==== ミップマップ生成
+
+ミップマップはレンダリングの性能と品質を向上させます。
+
+[,bash]
+----
+# Generate mipmaps
+toktx --mipmap texture.ktx2 texture.png
+
+# Generate mipmaps with specific filter
+toktx --mipmap --filter lanczos texture.ktx2 texture.png
+----
+
+==== メタデータ
+
+KTX2 ファイルにはメタデータを含められます。
+
+[,bash]
+----
+# Add key-value metadata
+toktx --mipmap --key "author" --value "Your Name" texture.ktx2 texture.png
+----
+
+=== KTX2 ファイルを扱うツール
+
+KTX2 ファイルを扱うためのツールがいくつかあります。
+
+==== コマンドラインツール
+
+* **KTX-Software Suite**:
+  * `toktx`: KTX2 ファイルを作成します
+  * `ktx2ktx2`: KTX バージョン間で変換します
+  * `ktxinfo`: KTX ファイルの情報を表示します
+  * `ktxsc`: KTX2 ファイルにスーパー圧縮を適用します
+  * `ktxunpack`: KTX ファイルを個別画像に展開します
+
+==== ライブラリと SDK
+
+* **KTX-Software Library**: KTX ファイルの読み書き・処理用の C/C++ ライブラリ
+* **libktx**: KTX-Software が使うコアライブラリ
+* **Basis Universal**: KTX2 で使われる圧縮技術
+* **Vulkan SDK**: KTX ツールとライブラリを含みます
+* **glTF-Transform**: glTF ファイル内の KTX2 テクスチャを処理できる JavaScript ライブラリ
+
+==== ビューアとデバッガ
+
+* **KTX Load Test**: KTX-Software の一部で、KTX ファイルの表示用
+* **RenderDoc**: KTX2 テクスチャを検査できるグラフィックスデバッガ
+* **Khronos Texture Tools**: KTX ファイル用ビューアを含みます
+* **glTF Viewer**: 多くの glTF ビューアが KTX2 テクスチャをサポートしています
+
+==== ゲームエンジンとの統合
+
+* **Unity**: プラグイン経由で KTX2 をサポート
+* **Unreal Engine**: プラグイン経由で KTX2 をサポート
+* **Godot**: KTX2 サポートが開発中
+* **Three.js**: KTX2 テクスチャをサポート
+* **Babylon.js**: KTX2 テクスチャをサポート
+
+=== 画像の KTX2 への変換
+
+既存の画像ファイルを KTX2 に変換するには、次を使えます。
+
+* **toktx**: KTX-Software パッケージに含まれるコマンドラインツール
+* **KTX-Software**: KTX ファイルの作成・操作ツール付きライブラリ
+
+Basis Universal 圧縮付きの KTX2 ファイルを toktx で作成する例:
+
+[,bash]
+----
+toktx --bcmp texture.ktx2 texture.png
+----
+
+== まとめ
+
+OBJ/PNG から glTF/KTX2 への移行は、モダンなグラフィックスアプリケーションに大きな利点をもたらします。
+
+* **より良い性能**: GPU 利用向けに最適化された形式
+* **より多くの機能**: 高度な 3D 機能とテクスチャ形式のサポート
+* **業界標準**: モダンなグラフィックス API 向けに設計された形式
+
+移行にはある程度のコード変更が必要ですが、性能、機能、将来性の面での利点は、本格的なグラフィックスアプリケーションにとって十分に価値があります。
+
+link:/attachments/35_gltf_ktx.cpp[C{pp} code]

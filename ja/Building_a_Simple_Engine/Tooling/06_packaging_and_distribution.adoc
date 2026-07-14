@@ -1,0 +1,541 @@
+:pp: {plus}{plus}
+
+= ツール: パッケージ化と配布
+
+== Vulkan アプリケーションのパッケージ化と配布
+
+Vulkan アプリケーションを開発してテストした後の最後のステップは、それをパッケージ化してユーザーに配布することです。このプロセスには、さまざまなプラットフォーム向けにアプリケーションを準備し、依存関係を処理し、スムーズなインストール エクスペリエンスを提供するインストーラーまたはパッケージを作成することが含まれます。このセクションでは、Vulkan アプリケーションをパッケージ化して配布するための重要な考慮事項とテクニックについて説明します。
+
+=== プラットフォーム固有のパッケージ化に関する考慮事項
+
+各プラットフォームには独自のパッケージ形式と配布メカニズムがあります。主要なプラットフォームの考慮事項を見てみましょう。
+
+==== Windows のパッケージ化
+
+Windows では、一般的なパッケージ形式には次のものがあります。
+
+* *実行可能インストーラー*: NSIS (Nullsoft Scriptable Install System)、Inno Setup、WiX Toolset などのツールで作成されます。
+* *MSIX パッケージ*: クリーン インストールとアンインストールをサポートする最新の Windows アプリ パッケージ
+* *ポータブル アプリケーション*: インストールを必要としない自己完結型アプリケーション
+
+Vulkan アプリケーション用の基本的な NSIS インストーラー スクリプトを作成する例を次に示します。
+
+[source,nsis]
+----
+; Basic NSIS installer script for a Vulkan application
+
+!include "MUI2.nsh"
+
+Name "My Vulkan Application"
+OutFile "MyVulkanApp_Installer.exe"
+InstallDir "$PROGRAMFILES\MyVulkanApp"
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+
+!insertmacro MUI_LANGUAGE "English"
+
+Section "Install"
+  SetOutPath "$INSTDIR"
+
+  ; Application files
+  File "MyVulkanApp.exe"
+  File "*.dll"
+  File /r "shaders"
+  File /r "assets"
+
+  ; Vulkan Runtime
+  File "vulkan-1.dll"
+
+  ; Create uninstaller
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
+
+  ; Create shortcuts
+  CreateDirectory "$SMPROGRAMS\MyVulkanApp"
+  CreateShortcut "$SMPROGRAMS\MyVulkanApp\MyVulkanApp.lnk" "$INSTDIR\MyVulkanApp.exe"
+  CreateShortcut "$SMPROGRAMS\MyVulkanApp\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
+SectionEnd
+
+Section "Uninstall"
+  ; Remove application files
+  Delete "$INSTDIR\MyVulkanApp.exe"
+  Delete "$INSTDIR\*.dll"
+  RMDir /r "$INSTDIR\shaders"
+  RMDir /r "$INSTDIR\assets"
+
+  ; Remove uninstaller
+  Delete "$INSTDIR\Uninstall.exe"
+
+  ; Remove shortcuts
+  Delete "$SMPROGRAMS\MyVulkanApp\MyVulkanApp.lnk"
+  Delete "$SMPROGRAMS\MyVulkanApp\Uninstall.lnk"
+  RMDir "$SMPROGRAMS\MyVulkanApp"
+
+  ; Remove install directory
+  RMDir "$INSTDIR"
+SectionEnd
+----
+
+==== Linuxのパッケージ化
+
+Linux では、一般的なパッケージ形式には次のものがあります。
+
+* *DEB パッケージ*: Debian ベースのディストリビューション用 (Ubuntu、Debian など)
+* *RPM パッケージ*: Red Hat ベースのディストリビューション用 (Fedora、CentOS など)
+* *AppImage*: ほとんどの Linux ディストリビューションで実行される自己完結型アプリケーション
+* *Flatpak*: システム リソースへのアクセスが制御されたサンドボックス アプリケーション
+* *スナップ*: Canonical によって保守されているユニバーサル Linux パッケージ
+
+Vulkan アプリケーションの基本的な AppImage を作成する例を次に示します。
+
+[source,bash]
+----
+#!/bin/bash
+# Script to create an AppImage for a Vulkan application
+
+# Create AppDir structure
+mkdir -p AppDir/usr/bin
+mkdir -p AppDir/usr/lib
+mkdir -p AppDir/usr/share/applications
+mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+mkdir -p AppDir/usr/share/metainfo
+
+# Copy application binary
+cp build/MyVulkanApp AppDir/usr/bin/
+
+# Copy dependencies (excluding system libraries)
+ldd build/MyVulkanApp | grep "=> /" | awk '{print $3}' | xargs -I{} cp -v {} AppDir/usr/lib/
+
+# Copy Vulkan loader
+cp /usr/lib/libvulkan.so.1 AppDir/usr/lib/
+
+# Copy application data
+cp -r assets AppDir/usr/share/MyVulkanApp/assets
+cp -r shaders AppDir/usr/share/MyVulkanApp/shaders
+
+# Create desktop file
+cat > AppDir/usr/share/applications/MyVulkanApp.desktop << EOF
+[Desktop Entry]
+Name=My Vulkan Application
+Exec=MyVulkanApp
+Icon=MyVulkanApp
+Type=Application
+Categories=Graphics;
+EOF
+
+# Copy icon
+cp icon.png AppDir/usr/share/icons/hicolor/256x256/apps/MyVulkanApp.png
+
+# Create AppStream metadata
+cat > AppDir/usr/share/metainfo/MyVulkanApp.appdata.xml << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.example.MyVulkanApp</id>
+  <name>My Vulkan Application</name>
+  <summary>A Vulkan-powered application</summary>
+  <description>
+    <p>
+      My Vulkan Application is a high-performance graphics application
+      built with the Vulkan API.
+    </p>
+  </description>
+  <url type="homepage">https://example.com/MyVulkanApp</url>
+  <releases>
+    <release version="1.0.0" date="2023-01-01"/>
+  </releases>
+</component>
+EOF
+
+# Create AppRun script
+cat > AppDir/AppRun << EOF
+#!/bin/bash
+SELF=\$(readlink -f "\$0")
+HERE=\$(dirname "\$SELF")
+export PATH="\${HERE}/usr/bin:\${PATH}"
+export LD_LIBRARY_PATH="\${HERE}/usr/lib:\${LD_LIBRARY_PATH}"
+export VK_LAYER_PATH="\${HERE}/usr/share/vulkan/explicit_layer.d"
+export VK_ICD_FILENAMES="\${HERE}/usr/share/vulkan/icd.d/vulkan_icd.json"
+"\${HERE}/usr/bin/MyVulkanApp" "$@"
+EOF
+
+chmod +x AppDir/AppRun
+
+# Download appimagetool
+wget -c "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+chmod +x appimagetool-x86_64.AppImage
+
+# Create the AppImage
+./appimagetool-x86_64.AppImage AppDir MyVulkanApp-x86_64.AppImage
+----
+
+==== macOSのパッケージング
+
+macOS では、一般的なパッケージ形式には次のものがあります。
+
+* *アプリケーション バンドル (.app)*: macOS アプリケーションの標準形式
+* *ディスク イメージ (.dmg)*: アプリケーションを含むマウント可能なディスク イメージ
+* *パッケージ (.pkg)*: より複雑なインストール用のインストーラー パッケージ
+
+MoltenVK を使用して Vulkan アプリケーションの基本的な macOS アプリケーション バンドル構造を作成する例を次に示します。
+
+[source,bash]
+----
+#!/bin/bash
+# Script to create a macOS application bundle for a Vulkan application
+
+# Create bundle structure
+mkdir -p MyVulkanApp.app/Contents/MacOS
+mkdir -p MyVulkanApp.app/Contents/Resources
+mkdir -p MyVulkanApp.app/Contents/Frameworks
+
+# Copy application binary
+cp build/MyVulkanApp MyVulkanApp.app/Contents/MacOS/
+
+# Copy MoltenVK framework
+cp -R $VULKAN_SDK/macOS/Frameworks/MoltenVK.framework MyVulkanApp.app/Contents/Frameworks/
+
+# Copy application resources
+cp -r assets MyVulkanApp.app/Contents/Resources/assets
+cp -r shaders MyVulkanApp.app/Contents/Resources/shaders
+cp icon.icns MyVulkanApp.app/Contents/Resources/
+
+# Create Info.plist
+cat > MyVulkanApp.app/Contents/Info.plist << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>MyVulkanApp</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.example.MyVulkanApp</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>My Vulkan Application</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+# Create DMG (optional)
+hdiutil create -volname "My Vulkan Application" -srcfolder MyVulkanApp.app -ov -format UDZO MyVulkanApp.dmg
+----
+
+=== Vulkan の依存関係の処理
+
+Vulkan アプリケーションをパッケージ化する際の重要な考慮事項の 1 つは、Vulkan ローダーと必要な拡張機能の処理です。
+
+==== バルカンローダー
+
+Vulkan ローダーは、アプリケーションをユーザーのシステム上の Vulkan 実装に接続するコンポーネントです。ローダーの処理にはさまざまなアプローチがあります。
+
+1. *システムにインストールされたローダーに依存*: ユーザーには Vulkan SDK またはドライバーがインストールされている必要があります
+2. *ローダーのバンドル*: Vulkan ローダーをアプリケーションに含めます。
+3. *ハイブリッド アプローチ*: システムにインストールされたローダーを確認し、見つからない場合はバンドルされたローダーにフォールバックします。
+
+ハイブリッド アプローチの例を次に示します。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+class VulkanLoader {
+public:
+    static bool initialize() {
+        try {
+            // First, try to use the system-installed Vulkan loader
+            if (try_system_loader()) {
+                std::cout << "Using system-installed Vulkan loader" << std::endl;
+                return true;
+            }
+
+            // If that fails, try to use the bundled loader
+            if (try_bundled_loader()) {
+                std::cout << "Using bundled Vulkan loader" << std::endl;
+                return true;
+            }
+
+            // If both approaches fail, report an error
+            std::cerr << "Failed to initialize Vulkan loader" << std::endl;
+            return false;
+        } catch (const std::exception& e) {
+            std::cerr << "Error initializing Vulkan loader: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+private:
+    static bool try_system_loader() {
+        try {
+            // Create a Vulkan instance to test if the system loader works
+            vk::raii::Context context;
+            vk::ApplicationInfo app_info{};
+            app_info.setApiVersion(VK_API_VERSION_1_2);
+
+            vk::InstanceCreateInfo create_info{};
+            create_info.setPApplicationInfo(&app_info);
+
+            vk::raii::Instance instance(context, create_info);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static bool try_bundled_loader() {
+        try {
+            // Set the path to the bundled Vulkan loader
+            #if defined(_WIN32)
+            std::string loader_path = get_executable_path() + "\\vulkan-1.dll";
+            SetDllDirectoryA(get_executable_path().c_str());
+            #elif defined(__linux__)
+            std::string loader_path = get_executable_path() + "/libvulkan.so.1";
+            setenv("LD_LIBRARY_PATH", get_executable_path().c_str(), 1);
+            #elif defined(__APPLE__)
+            std::string loader_path = get_executable_path() + "/../Frameworks/libMoltenVK.dylib";
+            setenv("DYLD_LIBRARY_PATH", (get_executable_path() + "/../Frameworks").c_str(), 1);
+            #endif
+
+            // Check if the bundled loader exists
+            if (!std::filesystem::exists(loader_path)) {
+                return false;
+            }
+
+            // Try to create a Vulkan instance using the bundled loader
+            vk::raii::Context context;
+            vk::ApplicationInfo app_info{};
+            app_info.setApiVersion(VK_API_VERSION_1_2);
+
+            vk::InstanceCreateInfo create_info{};
+            create_info.setPApplicationInfo(&app_info);
+
+            vk::raii::Instance instance(context, create_info);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    static std::string get_executable_path() {
+        #if defined(_WIN32)
+        char path[MAX_PATH];
+        GetModuleFileNameA(NULL, path, MAX_PATH);
+        std::string exe_path(path);
+        return exe_path.substr(0, exe_path.find_last_of("\\/"));
+        #elif defined(__linux__)
+        char result[PATH_MAX];
+        ssize_t count = readlink("/proc/self/exe", result, PATH_MAX);
+        std::string exe_path(result, (count > 0) ? count : 0);
+        return exe_path.substr(0, exe_path.find_last_of("/"));
+        #elif defined(__APPLE__)
+        char path[PATH_MAX];
+        uint32_t size = sizeof(path);
+        if (_NSGetExecutablePath(path, &size) == 0) {
+            std::string exe_path(path);
+            return exe_path.substr(0, exe_path.find_last_of("/"));
+        }
+        return "";
+        #endif
+    }
+};
+----
+
+==== Vulkan レイヤーと拡張機能
+
+アプリケーションで特定の Vulkan レイヤーまたは拡張機能が必要な場合は、それらを適切に処理する必要があります。
+
+1. *ドキュメント要件*: アプリケーションに必要な拡張機能を明確に文書化します。
+2. *サポートの確認*: 必要な拡張機能を使用する前に、それらが利用可能かどうかを必ず確認してください。
+3. *フォールバックの提供*: 可能であれば、不足している拡張機能に対するフォールバック動作を実装します。
+4. *バンドル レイヤー*: 開発ツールの場合は、検証レイヤーのバンドルを検討してください。
+
+=== シェーダ管理
+
+シェーダは Vulkan アプリケーションの重要な部分であり、パッケージ化時に特別な考慮が必要です。
+
+1. *プリコンパイル シェーダー*: GLSL ソースではなく、プリコンパイルされた SPIR-V シェーダーをパッケージ化します。
+2. *シェーダーのバージョニング*: 更新を処理するシェーダーのバージョニング システムを実装します。
+3. *シェーダーの最適化*: さまざまなハードウェア ターゲットに合わせてシェーダーを最適化することを検討してください。
+4. *シェーダー キャッシュ*: シェーダー キャッシュを実装してロード時間を短縮します。
+
+以下は、パッケージ化されたアプリケーションのシェーダー管理システムの例です。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+class ShaderManager {
+public:
+    ShaderManager(vk::raii::Device& device) : device(device) {
+        // Determine the shader directory based on the application's location
+        shader_dir = get_application_directory() + "/shaders";
+
+        // Create a shader module cache
+        shader_cache.reserve(100); // Reserve space for up to 100 shader modules
+    }
+
+    vk::raii::ShaderModule load_shader(const std::string& name) {
+        // Check if the shader is already in the cache
+        auto it = shader_cache.find(name);
+        if (it != shader_cache.end()) {
+            return vk::raii::ShaderModule(nullptr, nullptr, nullptr); // Return a copy of the cached module
+        }
+
+        // Load the shader from the package
+        std::string path = shader_dir + "/" + name + ".spv";
+        std::vector<char> code = read_file(path);
+
+        // Create the shader module
+        vk::ShaderModuleCreateInfo create_info{};
+        create_info.setCodeSize(code.size());
+        create_info.setPCode(reinterpret_cast<const uint32_t*>(code.data()));
+
+        // Create and cache the shader module
+        vk::raii::ShaderModule module(device, create_info);
+        shader_cache[name] = std::move(module);
+
+        return vk::raii::ShaderModule(nullptr, nullptr, nullptr); // Return a copy of the cached module
+    }
+
+    void clear_cache() {
+        shader_cache.clear();
+    }
+
+private:
+    std::string get_application_directory() {
+        // Platform-specific code to get the application directory
+        // ...
+        return "."; // Placeholder
+    }
+
+    std::vector<char> read_file(const std::string& path) {
+        std::ifstream file(path, std::ios::ate | std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open shader file: " + path);
+        }
+
+        size_t file_size = static_cast<size_t>(file.tellg());
+        std::vector<char> buffer(file_size);
+
+        file.seekg(0);
+        file.read(buffer.data(), file_size);
+        file.close();
+
+        return buffer;
+    }
+
+    vk::raii::Device& device;
+    std::string shader_dir;
+    std::unordered_map<std::string, vk::raii::ShaderModule> shader_cache;
+};
+----
+
+=== CI/CDによる自動パッケージ化
+
+CI/CD セクションで説明したように、パッケージ化プロセスを自動化すると時間を節約し、エラーを減らすことができます。パッケージ化を CI/CD パイプラインに統合する方法は次のとおりです。
+
+1. *ビルド マトリックス*: さまざまなプラットフォームや構成に合わせてビルド マトリックスをセットアップします。
+2. *パッケージ化スクリプト*: 各プラットフォームのパッケージ化プロセス用のスクリプトを作成します。
+3. *バージョン管理*: git タグまたはその他の基準に基づいてバージョン番号を自動的に増分します。
+4. *アーティファクト ストレージ*: パッケージ化されたアプリケーションをビルド アーティファクトとして保存します
+5. *リリース自動化*: 配信プラットフォームへのリリースプロセスを自動化します。
+
+以下は、パッケージ化を含む GitHub Actions ワークフローの例です。
+
+[source,yaml]
+----
+name: Build and Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-package:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            package-script: ./scripts/package_linux.sh
+            artifact-name: MyVulkanApp-Linux
+            artifact-path: MyVulkanApp-x86_64.AppImage
+          - os: windows-latest
+            package-script: .\scripts\package_windows.bat
+            artifact-name: MyVulkanApp-Windows
+            artifact-path: MyVulkanApp_Installer.exe
+          - os: macos-latest
+            package-script: ./scripts/package_macos.sh
+            artifact-name: MyVulkanApp-macOS
+            artifact-path: MyVulkanApp.dmg
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Install Vulkan SDK
+      uses: humbletim/install-vulkan-sdk@v1.1.1
+      with:
+        version: latest
+        cache: true
+
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config Release
+
+    - name: Package
+      run: ${{ matrix.package-script }}
+
+    - name: Upload Package
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.artifact-name }}
+        path: ${{ matrix.artifact-path }}
+
+  create-release:
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          MyVulkanApp-Linux/MyVulkanApp-x86_64.AppImage
+          MyVulkanApp-Windows/MyVulkanApp_Installer.exe
+          MyVulkanApp-macOS/MyVulkanApp.dmg
+----
+
+=== 結論
+
+パッケージ化と配布は、Vulkan アプリケーションのライフサイクルにおける重要なステップです。プラットフォーム固有の要件を慎重に検討し、依存関係を適切に処理し、パッケージ化プロセスを自動化することで、さまざまなプラットフォームにわたってユーザーのスムーズなエクスペリエンスを確保できます。
+
+パッケージ化の目的は、ユーザーにとってインストールと更新を可能な限りシームレスにすることであることに注意してください。堅牢なパッケージングと配布システムの作成に時間を投資すれば、ユーザーはより専門的で信頼性の高いアプリケーションの恩恵を受けることができます。
+
+次の最後のセクションでは、Vulkan アプリケーションのツールについてこの章を通して学んだことをまとめます。
+
+xref:Building_a_Simple_Engine/Tooling/05_extensions.adoc[前: 堅牢性を高めるための Vulkan 拡張機能] | xref:Building_a_Simple_Engine/Tooling/07_conclusion.adoc[次へ: 結論]

@@ -1,0 +1,173 @@
+:pp: {plus}{plus}
+
+= ウィンドウサーフェス
+
+Vulkan はプラットフォーム非依存の API であるため、それ自体でウィンドウシステムと直接やり取りするようには設計されていません。結果を画面に提示するために Vulkan とウィンドウシステムの接続を確立するには、WSI（Window System Integration）拡張を使う必要があります。この章では最初の 1 つ、`VK_KHR_surface` を扱います。これはレンダリングしたイメージを提示する抽象的なサーフェスを表す `VkSurfaceKHR` オブジェクトを公開します。プログラム内のサーフェスは、すでに GLFW で開いたウィンドウをバックエンドとします。
+
+`VK_KHR_surface` 拡張はインスタンスレベルの拡張で、実はすでに有効化しています。`glfwGetRequiredInstanceExtensions` が返すリストに含まれているからです。そのリストには、次の数章で使うほかの WSI 拡張も含まれています。
+
+ウィンドウサーフェスはインスタンス作成の直後に作成する必要があります。物理デバイスの選択に実際に影響し得るからです。後回しにした理由は、ウィンドウサーフェスがレンダーターゲットとプレゼンテーションというより大きな話題の一部であり、基本セットアップを煩雑にするためです。また、オフスクリーンレンダリングだけが必要な場合、ウィンドウサーフェスは Vulkan では完全にオプションのコンポーネントであることも記しておきます。Vulkan では（OpenGL で必要な）不可視ウィンドウ作成のようなハックなしでそれができます。また、提示しない GPU からのリモートレンダリング、インターネット経由のリモート、レンダーやプレゼンテーションターゲットなしの AI 向けコンピュート加速なども可能です。
+
+ここでは GLFW を示しますが、サーフェスへの Vulkan レンダリングという概念は、ほかのあらゆるウィンドウ API のターゲットとしても繰り返されます。この概念はモバイルにも、ウィンドウマネージャへの直接アクセスにも当てはまります。とはいえ今は GLFW に集中し、本チュートリアルで具体的にどう動くかを見ましょう。
+
+== ウィンドウサーフェスの作成
+
+まず、デバッグコールバックのすぐ下に `surface` クラスメンバを追加します。
+
+[,c++]
+----
+vk::raii::SurfaceKHR surface = nullptr;
+----
+
+`VkSurfaceKHR` オブジェクトとその使い方はプラットフォーム非依存ですが、作成はそうではありません。ウィンドウシステムの詳細に依存するからです。たとえば Windows では `HWND` と `HMODULE` ハンドルが必要です。そのため拡張にはプラットフォーム固有の追加があり、Windows では `VK_KHR_win32_surface` と呼ばれ、やはり `glfwGetRequiredInstanceExtensions` のリストに自動で含まれます。
+
+Windows でサーフェスを作成するためにこのプラットフォーム固有拡張をどう使えるかを示しますが、本チュートリアルでは使いません。GLFW のようなライブラリを使っておきながらプラットフォーム固有コードに進む意味がないからです。GLFW には実際にプラットフォーム差分を処理する `glfwCreateWindowSurface` があります。それでも、それに頼る前に裏で何をしているかを見ておくのは有益です。
+
+ネイティブなプラットフォーム関数にアクセスするには、先頭のインクルードを次のように更新する必要があります。
+
+[,c++]
+----
+#define VK_USE_PLATFORM_WIN32_KHR
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+----
+
+ウィンドウサーフェスは Vulkan オブジェクトなので、埋める必要のある `vk::Win32SurfaceCreateInfoKHR` 構造体が付属します。重要なパラメータは `hwnd` と `hinstance` の 2 つです。それぞれウィンドウとプロセスへのハンドルです。
+
+[,c++]
+----
+vk::Win32SurfaceCreateInfoKHR createInfo{.hinstance = GetModuleHandle(nullptr),
+                                         .hwnd      = glfwGetWin32Window(window)};
+----
+
+`glfwGetWin32Window` 関数は GLFW ウィンドウオブジェクトから生の `HWND` を取得するために使います。`GetModuleHandle` 呼び出しは現在のプロセスの `HINSTANCE` ハンドルを返します。
+
+その後、サーフェスは `vk::raii::Instance::createWin32SurfaceKHR` で作成できます。サーフェス作成の詳細とカスタムアロケータ用のパラメータがあります。技術的にはこれは WSI 拡張関数ですが、非常によく使われるため標準の Vulkan ローダに含まれており、ほかの拡張と違って明示的にロードする必要はありません。
+
+[,c++]
+----
+surface = instance.createWin32SurfaceKHR(createInfo);
+----
+
+Linux などの他プラットフォームでも同様で、X11 では `vk::raii::Instance::createXcbSurfaceKHR` が作成詳細として XCB 接続とウィンドウを取ります。
+
+`glfwCreateWindowSurface` 関数は、各プラットフォーム向けに異なる実装でまさにこの操作を行います。ではプログラムに統合しましょう。インスタンス作成と `setupDebugMessenger` の直後に `initVulkan` から呼ばれる関数 `createSurface` を追加します。
+
+[,c++]
+----
+void initVulkan() {
+    createInstance();
+    setupDebugMessenger();
+    createSurface();
+    pickPhysicalDevice();
+    createLogicalDevice();
+}
+
+void createSurface() {
+
+}
+----
+
+GLFW の呼び出しは構造体ではなく単純なパラメータを取るため、関数の実装は非常に素直です。
+
+[,c++]
+----
+void createSurface() {
+    VkSurfaceKHR       _surface;
+    if (glfwCreateWindowSurface(*instance, window, nullptr, &_surface) != 0) {
+        throw std::runtime_error("failed to create window surface!");
+    }
+    surface = vk::raii::SurfaceKHR(instance, _surface);
+}
+----
+
+ただし上記のとおり、GLFW は Vulkan C API のみを扱います。
+VkSurfaceKHR オブジェクトは C API のオブジェクトです。幸いネイティブに C++ ラッパーへ昇格でき、ここでそれをしています。
+
+パラメータは `VkInstance`、GLFW ウィンドウポインタ、カスタムアロケータ、`VkSurfaceKHR` 変数へのポインタです。関連するプラットフォーム呼び出しからの `VkResult` をそのまま通します。GLFW はサーフェス破棄用の特別な関数を提供しませんが、raii の SurfaceKHR オブジェクトに包めば Vulkan RAII がそれを処理します。
+
+== プレゼンテーションサポートの問い合わせ
+
+Vulkan 実装がウィンドウシステム統合をサポートしていても、システム内のすべてのデバイスがそれをサポートするとは限りません。そのため、作成したサーフェスにイメージを提示できるデバイスであることを保証するよう `createLogicalDevice` を拡張する必要があります。プレゼンテーションはキュー固有の機能なので、実際の問題は、作成したサーフェスへの提示をサポートするキューファミリーを見つけることです。
+
+グラフィックスコマンドをサポートするキューファミリーとプレゼンテーションをサポートするキューファミリーが重ならないことも可能ですが、非常にまれです。簡略化のため、そのようなキューファミリーがあると仮定し、ない場合は打ち切ります。
+
+つまり次に、グラフィックス操作とウィンドウサーフェスへの提示の両方をサポートする能力を持つキューファミリーを探します。提示サポートを確認する関数は `vk::raii::PhysicalDevice::getSurfaceSupportKHR` で、キューファミリーインデックスとサーフェスをパラメータに取ります。
+
+[,c++]
+----
+uint32_t queueIndex = ~0;
+for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++)
+{
+  if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) &&
+      physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface))
+  {
+    // found a queue family that supports both graphics and present
+    queueIndex = qfpIndex;
+    break;
+  }
+}
+if (queueIndex == ~0)
+{
+  throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
+}
+----
+
+== プレゼンテーションキューの作成
+
+残るのは、論理デバイス作成手順を修正してキューを作成し、`vk::raii::Queue` ハンドルを取得することです。検出に合わせて使う最適なキューファミリーを見つけるようフィルタリングロジックを修正する必要があります。デバイス作成関数では、1 つの関数で次のように行います。
+
+[,c++]
+----
+void createLogicalDevice() {
+    // find the index of the first queue family that supports graphics
+    std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
+
+    // get the first index into queueFamilyProperties which supports both graphics and present
+    uint32_t queueIndex = ~0;
+    for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++)
+    {
+      if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) &&
+          physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface))
+      {
+        // found a queue family that supports both graphics and present
+        queueIndex = qfpIndex;
+        break;
+      }
+    }
+    if (queueIndex == ~0)
+    {
+      throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
+    }
+
+    // query for Vulkan 1.3 features
+		vk::StructureChain<vk::PhysicalDeviceFeatures2,
+		                   vk::PhysicalDeviceVulkan11Features,
+		                   vk::PhysicalDeviceVulkan13Features,
+		                   vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
+		    featureChain = {
+		        {},                                    // vk::PhysicalDeviceFeatures2
+		        {.shaderDrawParameters = true},        // vk::PhysicalDeviceVulkan11Features
+		        {.dynamicRendering = true},            // vk::PhysicalDeviceVulkan13Features
+		        {.extendedDynamicState = true}         // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
+		    };
+
+    // create a Device
+    float                     queuePriority = 0.5f;
+    vk::DeviceQueueCreateInfo deviceQueueCreateInfo{.queueFamilyIndex = queueIndex, .queueCount = 1, .pQueuePriorities = &queuePriority};
+    vk::DeviceCreateInfo      deviceCreateInfo{.pNext                   = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
+                                               .queueCreateInfoCount    = 1,
+                                               .pQueueCreateInfos       = &deviceQueueCreateInfo,
+                                               .enabledExtensionCount   = static_cast<uint32_t>(requiredDeviceExtension.size()),
+                                               .ppEnabledExtensionNames = requiredDeviceExtension.data()};
+
+    device = vk::raii::Device( physicalDevice, deviceCreateInfo );
+    queue  = vk::raii::Queue(device, queueIndex, 0);
+}
+----
+
+xref:./01_Swap_chain.adoc[次の章] ではスワップチェーンと、サーフェスにイメージを提示する方法を見ていきます。
+
+link:/attachments/05_window_surface.cpp[C{pp} code]

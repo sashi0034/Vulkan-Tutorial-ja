@@ -1,0 +1,240 @@
+= ML 向け Vulkan コンピュートのデバッグ: 明示性を手なずける
+:pp: ++
+:stem: latexmath
+
+ニューラルネットワークレイヤを Vulkan コンピュートシェーダとして実装しました。アプリケーションはコンパイルし、validation layer は静かで、GPU は確かに *何か* をしています。しかし導入で述べたように、ML は静かな失敗の世界です。「動く」は旅の最初の 10% にすぎません。
+
+Vulkan コンピュートのデバッグは独特のスキルセットです。GLSL の論理エラーだけでなく、**オーケストレーションエラー** を探します。本章では Vulkan ML の 3 大摩擦点——同期、ディスクリプタ管理、ワークグループ数学——を見ていきます。
+
+== リレー競走: パイプライン barrier の理解
+
+Vulkan ML で最も一般的なバグは、欠落または誤った同期です。ニューラルネットワークは厳密に逐次的です: レイヤ latexmath:[N] が出力の書き込みを終えるまで、レイヤ latexmath:[N+1] は読み取りを始められません。
+
+PyTorch のような高レベルフレームワークでは自動処理されます。Vulkan では GPU は荒馬——明示的に手綱を引かない限り、スループット最大化のためすべてを同時実行しようとします。
+
+=== barrier の比喩
+推論パイプラインを **リレー競走** と考えてください。
+
+*   **走者**: コンピュートシェーダ（畳み込み、ReLU、プーリング）。
+*   **バトン**: GPU メモリ内のテンソルデータ。
+
+第 2 走者（ReLU）が第 1 走者（畳み込み）がバトンを渡す前に走り出すと、手ぶらで走っています。Vulkan 用語ではこれが **データ競合** です。ReLU シェーダは未初期化メモリ、前フレームの古いデータ、半分だけ書かれた部分結果を読みます。
+
+=== ハンドシェイクの実装
+このハンドシェイクに `vkCmdPipelineBarrier` を使います。2 レイヤ間の適切な barrier は次のとおりです。
+
+[source,cpp]
+----
+// Transitioning from Layer 1 (Convolution) to Layer 2 (ReLU)
+vk::BufferMemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite, // Wait for Convolution to finish writing
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead,  // Ensure ReLU can safely read
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .buffer = activationBuffer,
+    .offset = 0,
+    .size = VK_WHOLE_SIZE
+};
+
+cmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader, // Source stage
+    vk::PipelineStageFlagBits::eComputeShader, // Destination stage
+    {},                                        // Dependency flags
+    nullptr, nullptr, barrier                  // Memory, Buffer, and Image barriers
+);
+----
+
+=== 実行 barrier とメモリ barrier
+経験豊富なグラフィックスプログラマでもつまずく部分です。
+
+1.  **実行 barrier**: GPU に「前のシェーダが終わるまで次を始めるな」と伝えます。
+2.  **メモリ barrier**: GPU に「第 1 シェーダが書いたデータが L1/L2 キャッシュからフラッシュされ、次のシェーダから見えるようにする」と伝えます。
+
+Vulkan では `vkCmdPipelineBarrier` が **両方** を扱います。`srcStage` と `dstStage` で実行を、`srcAccess` と `dstAccess` でメモリ可視性を扱います。
+
+**よくある落とし穴**: `srcAccessMask` に `eShaderRead` を使うこと。`src` は **終えている** 操作、`dst` は **始める** 操作です。読み取りの前に読み取りを待つと、書き込みを保護していません。
+
+=== ML 向けグローバルメモリ barrier
+深いネットワークでは、遷移ごとに `VkBufferMemoryBarrier` を作りたくなるかもしれません。精密ですが「barrier 肥大化」と煩雑なコードにつながります。
+
+プロの ML エンジンは **グローバルメモリ barrier** をよく使います。特定バッファを指定せず、`bufferCount` を 0 にし、汎用 `VkMemoryBarrier` を使います。
+
+[source,cpp]
+----
+vk::MemoryBarrier globalBarrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead
+};
+
+// This protects ALL buffers currently being used by the compute pipe
+cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    {}, globalBarrier, nullptr, nullptr);
+----
+
+やや非効率（GPU が必要以上にフラッシュするかもしれません）ですが、間違えにくいです。デバッグ中はグローバル barrier から始め、最後の 1% の性能が必要なときだけバッファ固有 barrier に移行します。
+
+== 並列性の幾何: ワークグループ数学
+
+「推論エンジン構築」章でワークグループを紹介しました。ここでは「部分レンダ」バグの 90% を引き起こす数学を見ます。
+
+コンピュートシェーダをディスパッチすると、スレッドのグリッドを定義します。
+[latexmath]
+++++
+\text{Total Threads} = \text{Workgroups} \times \text{Local Size}
+++++
+
+=== 「切り上げ」問題
+幅 latexmath:[W = 225] のテンソルでローカルワークグループサイズ latexmath:[16] なら、ワークグループはいくつ必要でしょうか？
+
+単純な整数除算だと:
+[latexmath]
+++++
+225 / 16 = 14 \text{ (Integer)}
+++++
+[latexmath]
+++++
+14 \times 16 = 224
+++++
+
+画像の最右列を取りこぼしました。ネットワークは毎フレームの右端が「見えなく」なります。修正には常に **切り上げ** が必要です。
+
+[latexmath]
+++++
+\text{Workgroups} = \left\lceil \frac{\text{Tensor Dimension}}{\text{Workgroup Size}} \right\rceil = \frac{\text{Tensor Dimension} + \text{Workgroup Size} - 1}{\text{Workgroup Size}}
+++++
+
+C{pp} では:
+[source,cpp]
+----
+uint32_t groupCount = (tensorWidth + localSize - 1) / localSize;
+cmd.dispatch(groupCount, heightCount, depthCount);
+----
+
+=== 「範囲外」安全網
+切り上げは新たな問題を生みます: 一部スレッドがテンソル「外」になります。シェーダが `data[index]` に境界チェックなしで書くと、隣接メモリを破壊するか GPU ページフォルトを起こします。
+
+**すべての ML シェーダに境界チェックが必要です:**
+[source,glsl]
+----
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+
+    // Safety check: Don't process pixels that don't exist
+    if (pos.x >= params.width || pos.y >= params.height) {
+        return;
+    }
+
+    // Real work happens here...
+}
+----
+
+== メモリ可視性: キャッシュの幽霊
+
+同期が完璧でも、**メモリ可視性** により結果が誤ることがあります。
+
+GPU には複数レベルのキャッシュ（L1、L2）があります。シェーダがバッファに書いても、データは L2 に留まり実 VRAM に書き戻されないことがあります。次レイヤが別の「コンピュートユニット」で独自 L1 を持って実行されると、VRAM の「古い」データを読むかもしれません。
+
+Vulkan の barrier は **アクセスフラグ** でこれを扱います。
+*   `eShaderWrite` は L1/L2 キャッシュが **フラッシュ**（VRAM へ）されることを保証します。
+*   `eShaderRead` は L1/L2 キャッシュが **無効化**（VRAM から再読み込み）されることを保証します。
+
+**デバッグのヒント**: 実行のたびに結果が変わる（非決定的）なら、ほぼ確実に可視性バグです。
+
+== ディスクリプタセットの混乱
+
+MobileNetV2 のような深いネットワークでは 50 以上の畳み込みレイヤがあり、それぞれ独自の Weights、Bias、Activation バッファが必要です。
+
+**バグ**: 「レイヤ 3」の compute dispatch 中に「レイヤ 2」の重みをバインドしている。
+**原因**: ディスクリプタセットインデックスを再利用する高レベルループ。
+
+[source,cpp]
+----
+// DANGEROUS: Reusing the same descriptor set for different dispatches in one frame
+for (int i = 0; i < layers.size(); ++i) {
+    updateDescriptorSet(globalSet, layers[i].weights); // This is an CPU-GPU race!
+    cmd.bindDescriptorSets(..., globalSet);
+    cmd.dispatch(...);
+}
+----
+
+Vulkan コマンドはバッファに記録され後で実行されるため、GPU がレイヤ 1 を実行するとき、CPU はすでに `globalSet` をレイヤ 50 の重みに更新しています。
+
+**解決策**:
+
+1.  **レイヤごとに 1 セット割り当て**: 最も安全。50 レイヤなら起動時に 50 ディスクリプタセットを作成。
+2.  **動的オフセットを使用**: モデル全体の重みを 1 つの巨大 `VkBuffer` に詰める。バインド時にオフセットを渡す。本番エンジンで推奨される高効率手法。
+3.  **プッシュディスクリプタを使用**: （サポート時）コマンドストリーム内で直接ディスクリプタを更新。ディスクリプタセット不要だが古いハードウェアでは限定的。
+
+== 探偵の道具箱: ML 向け RenderDoc
+
+RenderDoc は最重要ツールです。「時間を止め」、失敗時点で GPU が見たものを正確に調べられます。
+
+=== 壊れたレイヤのデバッグ方法
+1.  **フレームをキャプチャ**: RenderDoc でアプリを実行し、推論中に `F12` を押す。
+2.  **ディスパッチを探す**: `vkCmdDispatch` を探す。`VK_EXT_debug_utils` でレイヤに名前を付け迷子を防ぐ（例: "Conv_Layer_5"）。
+3.  **入力を検査**: 「Pipeline State」タブで「Read」バッファを見る。重みは本当にあるか、ゼロだけか。
+4.  **出力を検査**: 「Mesh View」または「Raw Data」で出力バッファを見る。
+    *   **Pro Tip**: Mesh View で形式を「3D」にするとテンソルを体積として見られる。ゼロの「チェッカーボード」ならインデックス数学が誤り。
+    *   **Pro Tip**: 「Byte Comparison」で GPU バッファを CPU 参照のバイナリダンプと比較。
+5.  **シェーダデバッグ**: データは正しいが数学が誤るなら、スレッドを右クリックして「Debug Shader」。GLSL を行ごとにステップし、レジスタの変化を追える。
+
+== 共有メモリの同期
+
+最適化の **共有メモリ**（タイリング）を使うと、新カテゴリのバグ——**ワークグループ内競合**——が出ます。
+
+GLSL の `barrier()` は **実行** のみ同期します。全スレッドがその行に到達したことを保証します。**メモリ書き込みが見える** ことは保証しません。
+
+[source,glsl]
+----
+sharedData[gl_LocalInvocationIndex] = inputVal;
+barrier(); // Every thread is here...
+float val = sharedData[neighborIndex]; // ...but did the neighbor finish writing?
+----
+
+**修正**: `memoryBarrierShared()` のあと `groupMemoryBarrier()` を使う。
+
+[source,glsl]
+----
+sharedData[idx] = val;
+memoryBarrierShared(); // Flush writes to shared memory
+barrier();             // Wait for all threads
+// Now it is safe to read
+----
+
+== NaN と Inf の扱い
+
+ML では 1 つの `NaN`（Not a Number）が出るとウイルスのようです。乗算され、以降の計算をすべて破壊します。
+
+=== NaN が起きる理由
+1.  **ゼロ除算**: 分散がゼロの Batch Norm でよくある。
+2.  **オーバーフロー**: Softmax の latexmath:[e^x] で latexmath:[x] が大きすぎる。
+3.  **未初期化メモリ**: クリアし忘れたバッファを読む。
+
+=== NaN のデバッグ
+Vulkan には専用拡張 `VK_EXT_device_fault` があります。ドライバがサポートすれば、無効な浮動小数結果を生んだ命令を特定できます。
+
+代替として、各レイヤのあとに「Sanity Shader」を走らせられます。
+[source,glsl]
+----
+if (isnan(value) || isinf(value)) {
+    atomicAdd(errorCounter, 1);
+}
+----
+
+== トラブルシューティングチェックリスト
+
+出力が `NaN` やゴミのとき:
+
+1.  **Validation Layer**: 「Sync」警告はあるか？（`VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` を有効化）。
+2.  **ディスクリプタチェック**: RenderDoc は現在レイヤの正しい Weight バッファを示しているか？
+3.  **ワークグループチェック**: 切り上げと境界チェックをしているか？
+4.  **barrier チェック**: すべてのレイヤディスパッチの間に barrier があるか？
+5.  **レイアウトチェック**: シェーダが NCHW を期待するときデータは NCHW か？
+6.  **読み戻しチェック**: CPU で結果を読む前に `VkFence` で GPU 完了を待ったか？
+
+Vulkan ML のデバッグは **明示性** です。ドライバが「正しいこと」をしてくれると仮定できません。いつ待つか、どこを見るか、いくつ計算するかを正確に伝える必要があります。
+
+次に、ゴールデン参照との数学的検証で「正しさ」を定量化する方法を見ます。
+
+xref:ML_Inference/Debugging_and_Performance/01_introduction.adoc[前へ: 導入] | xref:ML_Inference/Debugging_and_Performance/03_verifying_correctness.adoc[次へ: 正しさの検証]

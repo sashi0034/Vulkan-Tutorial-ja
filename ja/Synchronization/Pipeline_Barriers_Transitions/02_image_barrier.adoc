@@ -1,0 +1,120 @@
+:pp: {plus}{plus}
+= イメージバリア: vk::ImageMemoryBarrier2 の実装
+
+== コアメカニズム
+
+モダン Vulkan の世界では、イメージメモリバリアが、リソースがパイプラインをどう流れるかを管理する決定的な道具です。同期の理論が「実行」と「可視性」に関するものだとしても、イメージバリアは同じく重要な第三の要素——**レイアウト遷移**——を加えます。線形なメモリの帯に過ぎないバッファとは異なり、イメージにはテクセルの並び方を決めるレイアウトがあります。
+
+イメージにカラーアタッチメントとして書き込みたい場合、GPU ハードウェアは `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` にあることを期待します。後で同じイメージをシェーダでサンプリングしたい場合は、`VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL` へ遷移させなければなりません。これは単なるドライバ側の「フラグ」ではありません——一部のハードウェアでは、この遷移がデータの物理的な再配置やキャッシュフラッシュを引き起こすことがあります。
+
+image::/images/image_barrier_anatomy.svg[イメージバリアの解剖]
+
+「物理的な再配置」と言うとき、異なるハードウェアユニットが同じビットをどう見るかを指しています。例えばラスタライザは、帯域を節約するために特化したタイル圧縮形式（Delta Color Compression など）を使うことがあります。しかし、同じイメージをサンプリングするコンピュートシェーダはその圧縮を理解できないかもしれません。レイアウト遷移は、データが「展開」されるか、次のステージが消費できる形式へ移されることを保証します。
+
+== イメージバリアの分解
+
+パイプラインバリアを記録するとき、本質的には GPU が通らなければならない「ゲート」を定義しています。エンジンで使う RAII スタイルの Vulkan-Hpp ラッパでどう構築するかを見てみましょう。
+
+[,cpp]
+----
+auto imageBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .image = renderTarget.image(),
+    .subresourceRange = {
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    }
+};
+
+auto dependencyInfo = vk::DependencyInfo{
+    .imageMemoryBarrierCount = 1,
+    .pImageMemoryBarriers = &imageBarrier
+};
+
+commandBuffer.pipelineBarrier2(dependencyInfo);
+----
+
+この例では、後続のフラグメントシェーダがサンプリングできるようカラーアタッチメントを遷移させています。`srcStageMask` は GPU に「先行コマンドのカラーアタッチメント出力ステージが終わるのを待て」と伝え、`srcAccessMask` はそのステージからのメモリ *書き込み* の完了を具体的に待っていることを指定します。ゲートの向こう側では、`dstStageMask` と `dstAccessMask` が、レイアウト遷移とキャッシュフラッシュが終わるまでフラグメントシェーダステージが読み取り操作を開始しないことを保証します。
+
+== レイアウト破棄の力
+
+Vulkan で最も一般的な性能最適化の一つが、`oldLayout` として `vk::ImageLayout::eUndefined` を使うことです。旧レイアウトを undefined に設定すると、ドライバに「このイメージに以前何があったかは気にしない」と伝えています。
+
+これは非常に強力です。前の内容がゴミだとドライバが分かれば、レイアウト遷移中にデータを保持する高価な作業をスキップできます。例えば、イメージをクリアして新しいカラーアタッチメントとして使う直前なら、`eUndefined` から `eColorAttachmentOptimal` への遷移は、`eShaderReadOnlyOptimal` からの遷移（前フレームのデータの「resolve」や「展開」が必要になり得る）より大幅に速くなります。
+
+== サブリソースレンジとアスペクトマスク
+
+Vulkan はイメージ全体の同期だけでなく、`subresourceRange` を通じて特定部分への精密な制御を与えます。複雑なエフェクトには不可欠です。
+
+* **ミップマップ生成**: ブリットを行うためにミップレベル 0 を `eTransferSrcOptimal`、レベル 1 を `eTransferDstOptimal` に遷移させ、その後戻すことができます。
+* **アスペクトマスク**: デプスステンシル形式では、`eStencil` はそのままに `eDepth` アスペクトだけを遷移させたい（またはその逆）場合があります。
+* **レイヤードレンダリング**: VR やキューブマップレンダリングでは、個々の配列レイヤを独立に遷移させ、GPU の異なる部分が異なるビューを同時に処理できるようにできます。
+
+== ダイナミックレンダリングにおける同期
+
+モダン Vulkan における大きな転換の一つが **ダイナミックレンダリング**（Vulkan 1.3 からコア、または拡張経由）への移行です。旧「レンダーパス」システムでは、遷移はしばしばサブパス依存やレンダーパス定義自体の中に隠れていました。これはしばしば混乱を招き、過剰同期につながりました。
+
+ダイナミックレンダリングでは、遷移の責任ははっきり私たちにあります。通常、`beginRendering` と `endRendering` の呼び出し *の間* で遷移を行います。作業が増えたように感じるかもしれませんが、はるかに明確です。明示的に記録しているので、遷移がどこで起きているかが正確に分かります。また、レンダリングパスがレガシーシステムより流動的で柔軟なモダンエンジンアーキテクチャとの統合もはるかに容易になります。
+
+== エンジンでのまとめ方
+
+実世界のエンジンでは、バリアを一つだけ出すことは稀です。バッチします。最終 UI パスの前に、シーンカラーとデプスバッファ（被写界深度用）の両方を遷移させる一般的な「ポストプロセス」シーケンスを、`Renderer` がどう扱うかの例です。
+
+[,cpp]
+----
+std::array<vk::ImageMemoryBarrier2, 2> barriers;
+
+// Transition Scene Color from Attachment to Shader Read
+barriers[0] = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .image = sceneColor.image()
+};
+
+// Transition Depth from Attachment to Shader Read (Depth Aspect only!)
+barriers[1] = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eLateFragmentTests,
+    .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    .oldLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+    .newLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
+    .image = depthBuffer.image(),
+    .subresourceRange = {
+        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    }
+};
+
+commandBuffer.pipelineBarrier2(vk::DependencyInfo{
+    .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+    .pImageMemoryBarriers = barriers.data()
+});
+----
+
+これらを一つの `DependencyInfo` にバッチすることで、ドライバは状態変化とキャッシュフラッシュを最適化でき、GPU がバリア待ちより描画に多くの時間を費やすようになります。
+
+== Simple Engine: 統一バリア
+
+`Simple Engine` では、ドライバオーバーヘッドを最小化するためにイメージ遷移を集約しています。`renderer_rendering.cpp` の `Renderer::Render` を見ると、**不透明パス** から **ポストプロセスパス** への遷移の扱い方が分かります。カラーバッファだけでなく、デプスバッファや補助バッファ（Forward+ ライティング用の G-Buffer など）も、しばしば一つの `vk::DependencyInfo` で遷移させます。
+
+`Simple Engine` で使う具体的な技の一つが **レイアウト追跡** システムです。`Renderer` は異なるレンダリングパス（ラスタライゼーション対レイクエリなど）を切り替えられるため、主要イメージの現在のレイアウト（`opaqueSceneColorImageLayouts` など）を追跡します。パスを始めるとき、現在のレイアウトを確認し、遷移が本当に必要なときだけバリアを出します。イメージがすでに正しいレイアウトならバリアを完全にスキップし、貴重な GPU サイクルを節約します。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Pipeline_Barriers_Transitions/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Pipeline_Barriers_Transitions/03_queue_family_ownership.adoc[キューファミリー所有権]

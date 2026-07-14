@@ -1,0 +1,530 @@
+:pp: {plus}{plus}
+
+= Vulkan でのマルチスレッド
+
+== はじめに
+
+この章では、アプリケーションの性能を向上させるため、Vulkan でマルチスレッドを活用する方法を見ていきます。モダンな CPU は複数コアを持ち、これらのコアを効率的に使うことで、特に計算負荷の高いタスクにおいてアプリケーションの性能を大きく高められます。Vulkan の明示的な設計はマルチスレッドアーキテクチャに適しており、同期とリソースアクセスを細かく制御できます。
+
+== 概要
+
+Vulkan はマルチスレッドを念頭に設計されており、古い API に比べて次のような利点があります。
+
+1. *スレッドセーフなコマンドバッファ記録*: 複数スレッドが同時に異なるコマンドバッファへコマンドを記録できます。
+2. *明示的な同期*: Vulkan は明示的な同期を要求するため、スレッド間のリソースアクセスを精密に制御できます。
+3. *キューベースのアーキテクチャ*: 異なる操作を異なるキューに投入でき、並列に実行される可能性があります。
+
+ただし、Vulkan でのマルチスレッドには次の点を慎重に検討する必要があります。
+
+1. *リソース共有*: スレッド間で共有リソースへの安全なアクセスを確保する。
+2. *同期*: スレッド間の操作を適切に同期する。
+3. *作業の分散*: 並列性を最大化するよう作業を効果的に分散する。
+
+この章では、コンピュートシェーダを使ったこれまでの作業を踏まえ、マルチスレッドのレンダリングシステムを実装します。次のようなパーティクルシステムを作成します。
+
+1. 1 つのスレッドがウィンドウイベントとプレゼンテーションを担当する
+2. 複数のワーカースレッドが異なるパーティクルグループ用にコマンドバッファを記録する
+3. 専用スレッドが GPU へ作業を投入する
+
+== 実装
+
+Vulkan アプリケーションにマルチスレッドを実装するために必要な主なコンポーネントを見ていきましょう。
+
+=== スレッドセーフなリソース管理
+
+まず、リソースがスレッド間で安全にアクセスされることを保証する必要があります。いくつかの手法を組み合わせて使います。
+
+[,c{pp}]
+----
+// Thread-safe resource manager
+class ThreadSafeResourceManager {
+private:
+    std::mutex resourceMutex;
+    // Resources that need thread-safe access
+    std::vector<vk::raii::CommandPool> commandPools;
+    std::vector<vk::raii::CommandBuffer> commandBuffers;
+
+public:
+    // Create a command pool for each worker thread
+    void createThreadCommandPools(vk::raii::Device& device, uint32_t queueFamilyIndex, uint32_t threadCount) {
+        std::lock_guard<std::mutex> lock(resourceMutex);
+
+        commandPools.clear();
+        for (uint32_t i = 0; i < threadCount; i++) {
+            vk::CommandPoolCreateInfo poolInfo{
+                .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+                .queueFamilyIndex = queueFamilyIndex
+            };
+            commandPools.emplace_back(device, poolInfo);
+        }
+    }
+
+    // Get a command pool for a specific thread
+    vk::raii::CommandPool& getCommandPool(uint32_t threadIndex) {
+        std::lock_guard<std::mutex> lock(resourceMutex);
+        return commandPools[threadIndex];
+    }
+
+    // Allocate command buffers for each thread
+    void allocateCommandBuffers(vk::raii::Device& device, uint32_t threadCount, uint32_t buffersPerThread) {
+        std::lock_guard<std::mutex> lock(resourceMutex);
+
+        commandBuffers.clear();
+        for (uint32_t i = 0; i < threadCount; i++) {
+            vk::CommandBufferAllocateInfo allocInfo{
+                .commandPool = *commandPools[i],
+                .level = vk::CommandBufferLevel::ePrimary,
+                .commandBufferCount = buffersPerThread
+            };
+            auto threadBuffers = device.allocateCommandBuffers(allocInfo);
+            for (auto& buffer : threadBuffers) {
+                commandBuffers.emplace_back(std::move(buffer));
+            }
+        }
+    }
+
+    // Get a command buffer
+    vk::raii::CommandBuffer& getCommandBuffer(uint32_t index) {
+        std::lock_guard<std::mutex> lock(resourceMutex);
+        return commandBuffers[index];
+    }
+};
+----
+
+=== ワーカースレッドの実装
+
+次に、異なるパーティクルグループ用にコマンドバッファを記録するワーカースレッドを実装します。
+
+[,c{pp}]
+----
+class MultithreadedApplication {
+private:
+    // Thread-related members
+    uint32_t threadCount;
+    std::vector<std::thread> workerThreads;
+    std::atomic<bool> shouldExit{false};
+    std::vector<std::atomic<bool>> threadWorkReady;
+    std::vector<std::atomic<bool>> threadWorkDone;
+
+    // Synchronization primitives
+    std::mutex queueSubmitMutex;
+    std::condition_variable workCompleteCv;
+
+    // Resource manager
+    ThreadSafeResourceManager resourceManager;
+
+    // Particle system data
+    struct ParticleGroup {
+        uint32_t startIndex;
+        uint32_t count;
+    };
+    std::vector<ParticleGroup> particleGroups;
+
+    // ... other Vulkan resources ...
+
+public:
+    void initThreads() {
+        // Determine the number of threads to use (leave one core for the main thread)
+        threadCount = std::max(1u, std::thread::hardware_concurrency() - 1);
+
+        // Initialize synchronization primitives
+        threadWorkReady.resize(threadCount);
+        threadWorkDone.resize(threadCount);
+
+        for (uint32_t i = 0; i < threadCount; i++) {
+            threadWorkReady[i] = false;
+            threadWorkDone[i] = true;
+        }
+
+        // Create command pools for each thread
+        resourceManager.createThreadCommandPools(device, graphicsQueueFamilyIndex, threadCount);
+
+        // Divide particles into groups, one for each thread
+        const uint32_t particlesPerThread = PARTICLE_COUNT / threadCount;
+        particleGroups.resize(threadCount);
+
+        for (uint32_t i = 0; i < threadCount; i++) {
+            particleGroups[i].startIndex = i * particlesPerThread;
+            particleGroups[i].count = (i == threadCount - 1) ?
+                (PARTICLE_COUNT - i * particlesPerThread) : particlesPerThread;
+        }
+
+        // Start worker threads
+        for (uint32_t i = 0; i < threadCount; i++) {
+            workerThreads.emplace_back(&MultithreadedApplication::workerThreadFunc, this, i);
+        }
+    }
+
+    void workerThreadFunc(uint32_t threadIndex) {
+        while (!shouldExit) {
+            // Wait for work to be ready
+            if (!threadWorkReady[threadIndex]) {
+                std::this_thread::yield();
+                continue;
+            }
+
+            // Get the particle group for this thread
+            const ParticleGroup& group = particleGroups[threadIndex];
+
+            // Get the command buffer for this thread
+            vk::raii::CommandBuffer& cmdBuffer = resourceManager.getCommandBuffer(threadIndex);
+
+            // Record commands for this particle group
+            recordComputeCommandBuffer(cmdBuffer, group.startIndex, group.count);
+
+            // Mark work as done
+            threadWorkDone[threadIndex] = true;
+            threadWorkReady[threadIndex] = false;
+
+            // Notify main thread
+            workCompleteCv.notify_one();
+        }
+    }
+
+    void recordComputeCommandBuffer(vk::raii::CommandBuffer& cmdBuffer, uint32_t startIndex, uint32_t count) {
+        cmdBuffer.reset();
+        cmdBuffer.begin({});
+
+        // Bind compute pipeline and descriptor sets
+        cmdBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
+        cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *computePipelineLayout, 0, {*computeDescriptorSets[frameIndex]}, {});
+
+        // Add a push constant to specify the particle range for this thread
+        struct PushConstants {
+            uint32_t startIndex;
+            uint32_t count;
+        } pushConstants{startIndex, count};
+
+        cmdBuffer.pushConstants<PushConstants>(*computePipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pushConstants);
+
+        // Dispatch compute work
+        uint32_t groupCount = (count + 255) / 256;
+        cmdBuffer.dispatch(groupCount, 1, 1);
+
+        cmdBuffer.end();
+    }
+
+    void signalThreadsToWork() {
+        // Signal all threads to start working
+        for (uint32_t i = 0; i < threadCount; i++) {
+            threadWorkDone[i] = false;
+            threadWorkReady[i] = true;
+        }
+    }
+
+    void waitForThreadsToComplete() {
+        // Wait for all threads to complete their work
+        std::unique_lock<std::mutex> lock(queueSubmitMutex);
+        workCompleteCv.wait(lock, [this]() {
+            for (uint32_t i = 0; i < threadCount; i++) {
+                if (!threadWorkDone[i]) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    void cleanup() {
+        // Signal threads to exit and join them
+        shouldExit = true;
+        for (auto& thread : workerThreads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+
+        // ... cleanup other resources ...
+    }
+};
+----
+
+=== コンピュートシェーダの変更
+
+プッシュ定数で指定されたパーティクル範囲で動作するよう、コンピュートシェーダを変更する必要があります。
+
+[,c{pp}]
+----
+// In the compute shader (31_shader_compute.slang)
+[[vk::push_constant]]
+struct PushConstants {
+    uint startIndex;
+    uint count;
+};
+
+[[vk::binding(0, 0)]] ConstantBuffer<UniformBufferObject> ubo;
+[[vk::binding(1, 0)]] RWStructuredBuffer<Particle> particlesIn;
+[[vk::binding(2, 0)]] RWStructuredBuffer<Particle> particlesOut;
+PushConstants pushConstants;
+
+[numthreads(256,1,1)]
+void compMain(uint3 threadId : SV_DispatchThreadID)
+{
+    uint index = threadId.x;
+
+    // Only process particles within our assigned range
+    if (index >= pushConstants.count) {
+        return;
+    }
+
+    // Adjust index to start from our assigned start index
+    uint globalIndex = pushConstants.startIndex + index;
+
+    // Process the particle
+    Particle particle = particlesIn[globalIndex];
+
+    // Update particle position based on velocity and delta time
+    particle.position += particle.velocity * ubo.deltaTime;
+
+    // Simple boundary check with velocity inversion
+    if (abs(particle.position.x) > 1.0) {
+        particle.velocity.x *= -1.0;
+    }
+    if (abs(particle.position.y) > 1.0) {
+        particle.velocity.y *= -1.0;
+    }
+
+    // Write the updated particle to the output buffer
+    particlesOut[globalIndex] = particle;
+}
+----
+
+=== メインループの更新
+
+最後に、ワーカースレッドを協調させるようメインループを更新します。
+
+[,c{pp}]
+----
+void drawFrame() {
+    // Wait for the previous frame to finish
+    auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
+    if (fenceResult != vk::Result::eSuccess)
+    {
+        throw std::runtime_error("failed to wait for fence!");
+    }
+
+    // Acquire the next image
+    auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *imageAvailableSemaphores[frameIndex], nullptr);
+
+    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR || framebufferResized) {
+        framebufferResized = false;
+        recreateSwapChain();
+        return;
+    }
+
+    // Update uniform buffers
+    updateUniformBuffer(frameIndex);
+
+    // Signal worker threads to start recording compute command buffers
+    signalThreadsToWork();
+
+    // While worker threads are busy, record the graphics command buffer on the main thread
+    recordGraphicsCommandBuffer(imageIndex);
+
+    // Wait for all worker threads to complete
+    waitForThreadsToComplete();
+
+    // Collect command buffers from all threads
+    std::vector<vk::CommandBuffer> computeCmdBuffers;
+    for (uint32_t i = 0; i < threadCount; i++) {
+        computeCmdBuffers.push_back(*resourceManager.getCommandBuffer(i));
+    }
+
+    // Submit compute work
+    vk::SubmitInfo computeSubmitInfo{
+        .commandBufferCount = static_cast<uint32_t>(computeCmdBuffers.size()),
+        .pCommandBuffers = computeCmdBuffers.data()
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(queueSubmitMutex);
+        computeQueue.submit(computeSubmitInfo, nullptr);
+    }
+
+    // Wait for compute to finish before graphics
+    vk::PipelineStageFlags waitStages[] = {vk::PipelineStageFlagBits::eVertexInput};
+
+    // Submit graphics work
+    vk::SubmitInfo graphisSubmitInfo{.waitSemaphoreCount   = 1,
+                                      .pWaitSemaphores      = &*imageAvailableSemaphores[frameIndex],
+                                      .pWaitDstStageMask    = &waitDestinationStageMask,
+                                      .commandBufferCount   = 1,
+                                      .pCommandBuffers      = &*graphicsCommandBuffers[frameIndex],
+                                      .signalSemaphoreCount = 1,
+                                      .pSignalSemaphores    = &*renderFinishedSemaphores[imageIndex]};
+
+    {
+        std::lock_guard<std::mutex> lock(queueSubmitMutex);
+        device.resetFences(*inFlightFences[frameIndex]);
+        graphicsQueue.submit(graphicsSubmitInfo, *inFlightFences[frameIndex]);
+    }
+
+    // Present the image
+    vk::PresentInfoKHR presentInfo{
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &*renderFinishedSemaphores[frameIndex],
+        .swapchainCount = 1,
+        .pSwapchains = &*swapChain,
+        .pImageIndices = &imageIndex
+    };
+
+    result = presentQueue.presentKHR(presentInfo);
+
+    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR || framebufferResized) {
+        framebufferResized = false;
+        recreateSwapChain();
+    } else if (result != vk::Result::eSuccess) {
+        throw std::runtime_error("failed to present swap chain image!");
+    }
+
+    frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
+}
+----
+
+== 高度なマルチスレッド手法
+
+上記の基本実装を超えて、マルチスレッド Vulkan アプリケーションをさらに最適化するための高度な手法がいくつかあります。
+
+=== セカンダリコマンドバッファ
+
+セカンダリコマンドバッファは並列に記録し、プライマリコマンドバッファから実行できます。
+
+[,c{pp}]
+----
+// In worker thread:
+vk::CommandBufferInheritanceInfo inheritanceInfo{
+    .renderPass = *renderPass,
+    .subpass = 0,
+    .framebuffer = *framebuffers[imageIndex]
+};
+
+vk::CommandBufferBeginInfo beginInfo{
+    .flags = vk::CommandBufferUsageFlagBits::eRenderPassContinue,
+    .pInheritanceInfo = &inheritanceInfo
+};
+
+secondaryCommandBuffer.begin(beginInfo);
+// Record rendering commands...
+secondaryCommandBuffer.end();
+
+// In main thread:
+primaryCommandBuffer.begin({});
+primaryCommandBuffer.beginRenderPass(...);
+primaryCommandBuffer.executeCommands(secondaryCommandBuffers);
+primaryCommandBuffer.endRenderPass();
+primaryCommandBuffer.end();
+----
+
+=== 動的な作業分散のためのスレッドプール
+
+各スレッドに固定の作業を割り当てる代わりに、スレッドプールを使って作業を動的に分散できます。
+
+[,c{pp}]
+----
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    bool stop;
+
+public:
+    ThreadPool(size_t threads) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread& worker : workers) {
+            worker.join();
+        }
+    }
+};
+----
+
+=== 非同期リソース読み込み
+
+マルチスレッドを使ってリソースを非同期に読み込めます。
+
+[,c{pp}]
+----
+std::future<TextureData> loadTextureAsync(const std::string& filename) {
+    return std::async(std::launch::async, [filename]() {
+        TextureData data;
+        // Load texture data from file
+        return data;
+    });
+}
+
+// Later in your code:
+auto textureDataFuture = loadTextureAsync("texture.ktx");
+// Do other work...
+TextureData textureData = textureDataFuture.get(); // Wait for completion if needed
+// Create Vulkan texture from the loaded data
+----
+
+== 性能上の考慮事項
+
+Vulkan でマルチスレッドを実装するとき、次の性能上の考慮事項を心に留めておいてください。
+
+1. *スレッド作成のオーバーヘッド*: スレッド作成にはオーバーヘッドがあるため、フレームごとではなく起動時に一度だけ作成します。
+2. *作業の粒度*: スレッド化のオーバーヘッドに見合うだけの作業を各スレッドに持たせます。
+3. *フォールスシェアリング*: 複数スレッドが隣接メモリにアクセスするときのキャッシュライン競合に注意します。
+4. *キュー投入*: レースコンディションを避けるため、キュー投入は同期する必要があります。
+5. *メモリバリア*: スレッド間でのメモリ操作の可視性を確保するため、メモリバリアを正しく使います。
+6. *スレッドごとのコマンドプール*: 同期オーバーヘッドを避けるため、各スレッドは独自のコマンドプールを持つべきです。
+7. *性能測定*: マルチスレッドが実際に性能を向上させていることを必ず測定で確認します。
+
+== マルチスレッド Vulkan アプリケーションのデバッグ
+
+マルチスレッドアプリケーションのデバッグは難しいことがあります。いくつかのヒントです。
+
+1. *バリデーションレイヤ*: 同期の問題を検出するため、Vulkan バリデーションレイヤを有効にします。
+2. *スレッドサニタイザ*: ThreadSanitizer などのツールでデータレースを検出します。
+3. *ログ*: 実行フローを追跡するため、スレッドセーフなログを実装します。
+4. *単純化*: より単純なスレッドモデルから始め、徐々に複雑さを加えます。
+5. *アトミック操作*: スレッドセーフなカウンタとフラグにはアトミック操作を使います。
+
+== まとめ
+
+この章では、性能向上のために Vulkan でマルチスレッドを活用する方法を見てきました。次のようなマルチスレッドパーティクルシステムを実装しました。
+
+1. 複数のワーカースレッドが並列にコマンドバッファを記録する
+2. メインスレッドが作業を協調し、プレゼンテーションを担当する
+3. 適切な同期によりスレッド安全性を確保する
+
+作業を複数の CPU コアに分散することで、特に計算負荷の高いアプリケーションで性能を大きく向上させられます。Vulkan の明示的な設計はマルチスレッドアーキテクチャに適しており、同期とリソースアクセスを細かく制御できます。
+
+Vulkan アプリケーションの開発を続けるなかで、モダンな CPU の力を引き出すためにマルチスレッドがどう役立つかを検討し、自分のユースケースでスレッドモデルが実際に有益であることを常に測定で確認してください。
+
+link:/attachments/37_multithreading.cpp[C{pp} code]

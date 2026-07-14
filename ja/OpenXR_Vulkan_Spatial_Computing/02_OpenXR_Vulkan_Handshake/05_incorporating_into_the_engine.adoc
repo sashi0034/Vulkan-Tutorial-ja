@@ -1,0 +1,180 @@
+:pp: {plus}{plus}
+= エンジンへの組み込み
+
+この章では、OpenXR と Vulkan 1.3 の間の基本的なハンドシェイクを探りました。これらの概念を `simple_game_engine` に取り入れるには、`renderer_core.cpp` と `xr_context.cpp` のコア初期化ロジックを進化させる必要があります。実装例は link:../../../attachments/openxr_engine/xr_context.cpp[xr_context.cpp] と link:../../../attachments/openxr_engine/renderer_core.cpp[renderer_core.cpp] にあります。
+
+== XR モードのテスト
+
+エンジンを変更する前に、OpenXR を試すべきかどうかを検出する方法が必要です。`main.cpp` の `main` 関数内で、エンジン初期化の前にチェックを追加できます。
+
+[source,cpp]
+----
+// main.cpp
+int main(int, char *[]) {
+    // ... initial setup ...
+
+    Engine engine;
+
+    // Test if we are able to run in XR mode
+    bool useXR = false;
+    if (XrContext::checkRuntimeAvailable()) {
+        std::cout << "OpenXR Runtime detected. Attempting spatial initialization..." << std::endl;
+        useXR = true;
+    }
+
+    if (!engine.Initialize("Simple Engine", WINDOW_WIDTH, WINDOW_HEIGHT, ENABLE_VALIDATION_LAYERS, useXR)) {
+        throw std::runtime_error("Failed to initialize engine");
+    }
+
+    // ...
+}
+----
+
+== レンダラー初期化の修正
+
+`renderer_core.cpp` では、OpenXR ハンドシェイクを扱うよう `Renderer::Initialize` とそのヘルパーメソッドを更新する必要があります。
+
+== サポートコード: XrContext ヘルパー
+
+このチュートリアル全体で、OpenXR API をラップする `XrContext`（インスタンスとしては `xrContext`）というヘルパークラスを使います。これによりエンジンコードは空間ロジックに集中したままクリーンに保てます。レンダラーを変更する前に、このヘルパー向けの基本構造がエンジンにあることを確認してください。
+
+[source,cpp]
+----
+// xr_context.h
+class XrContext {
+public:
+    // Core Handshake (Chapter 2)
+    std::vector<const char*> getVulkanInstanceExtensions();
+    const uint8_t* getRequiredLUID();
+
+    // Swapchain Management (Chapter 3)
+    void createSwapchains(vk::Device device, vk::Format format, vk::Extent2D extent);
+    std::vector<vk::Image> enumerateSwapchainImages();
+    vk::Extent2D getSwapchainExtent();
+    vk::Format getSwapchainFormat();
+    void waitSwapchainImage();
+    uint32_t acquireSwapchainImage();
+    void releaseSwapchainImage();
+
+    // Frame Lifecycle (Chapter 5)
+    XrFrameState waitFrame();
+    void beginFrame();
+    void endFrame(const std::array<std::vector<vk::ImageView>, 2>& eyeViews);
+
+    // View & Projection (Chapter 4 & 11)
+    void locateViews(XrTime predictedTime);
+    std::vector<XrView> getLatestViews();
+    std::array<XrPosef, 2> getLatestViewPoses(); // Added for Late Latching
+    vk::Viewport getViewport(uint32_t eye);
+    vk::Rect2D getScissor(uint32_t eye);
+    glm::mat4 getProjectionMatrix(uint32_t eye);
+    glm::mat4 getViewMatrix(uint32_t eye);
+    glm::vec3 getEyePosition(uint32_t eye); // Added for UBO updates
+
+    // Input Actions (Chapter 7)
+    void pollActions();
+    bool isActionActive(const std::string& name);
+    XrPosef getActionPose(const std::string& name);
+
+    // Scene Understanding (Chapter 16)
+    std::vector<XrSpatialMesh> getLatestSpatialMeshes();
+
+    // ML & Occlusion (Chapter 17 & 18)
+    glm::vec2 getGazeNDC();
+    XrReferenceSpaceType getReferenceSpace();
+};
+
+// Common Helper: Convert XrPosef to glm::mat4
+inline glm::mat4 xrPoseToMatrix(const XrPosef& pose) {
+    glm::quat q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+    glm::mat4 m = glm::mat4_cast(q);
+    m[3] = glm::vec4(pose.position.x, pose.position.y, pose.position.z, 1.0f);
+    return m;
+}
+----
+
+== 1. XR 拡張付きインスタンス作成
+
+`Renderer::createInstance` では、OpenXR が要求する拡張を追加しなければなりません。GLFW だけに頼るのではなく、XR ランタイムに問い合わせます。
+
+[source,cpp]
+----
+// renderer_core.cpp
+bool Renderer::createInstance(const std::string& appName, bool enableValidationLayers) {
+    // ...
+    std::vector<const char *> extensions;
+
+    // Standard GLFW extensions
+    #if defined(PLATFORM_DESKTOP)
+    uint32_t glfwExtensionCount = 0;
+    const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
+    extensions.insert(extensions.end(), glfwExtensions, glfwExtensions + glfwExtensionCount);
+    #endif
+
+    // NEW: Add OpenXR mandatory extensions
+    if (xrMode) {
+        auto xrExtensions = xrContext.getVulkanInstanceExtensions();
+        extensions.insert(extensions.end(), xrExtensions.begin(), xrExtensions.end());
+    }
+
+    // ... create vk::raii::Instance ...
+}
+----
+
+=== 2. ハードウェア整合（LUID マッチング）
+
+`Renderer::pickPhysicalDevice` では、OpenXR が実際に使っている GPU を選ぶことを保証しなければなりません。LUID をマッチさせて行います。
+
+[source,cpp]
+----
+// renderer_core.cpp
+bool Renderer::pickPhysicalDevice() {
+    // ... enumerate devices ...
+
+    for (auto& _device : devices) {
+        if (xrMode) {
+            // Match the LUID provided by OpenXR
+            auto props2 = _device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceIDProperties>();
+            const auto& idProps = props2.get<vk::PhysicalDeviceIDProperties>();
+
+            const uint8_t* requiredLuid = xrContext.getRequiredLUID();
+            if (requiredLuid && std::memcmp(idProps.deviceLUID, requiredLuid, VK_LUID_SIZE) != 0) {
+                continue; // Not the right GPU for XR!
+            }
+        }
+        // ... rest of suitability scoring ...
+    }
+}
+----
+
+=== 3. Vulkan 1.3 機能の有効化
+
+`Renderer::createLogicalDevice` では、空間コンピューティングに必要な Vulkan 1.3 機能、特に **ダイナミックレンダリング** と **Synchronization 2** を明示的に有効化しなければなりません。
+
+[source,cpp]
+----
+// renderer_core.cpp
+bool Renderer::createLogicalDevice(bool enableValidationLayers) {
+    // ...
+
+    // Enable Vulkan 1.3 features using designated initializers
+    vk::PhysicalDeviceVulkan13Features vulkan13Features{
+        .synchronization2 = vk::True,
+        .dynamicRendering = vk::True
+    };
+
+    // Enable Multiview (if in XR mode) using designated initializers
+    vk::PhysicalDeviceMultiviewFeatures multiviewFeatures{
+        .pNext = &vulkan13Features,
+        .multiview = xrMode ? vk::True : vk::False
+    };
+
+    // ... create vk::raii::Device with multiviewFeatures in pNext ...
+}
+----
+
+== なぜこれらの変更か？
+
+`renderer_core.cpp` の具体的な箇所を見ると、OpenXR は単なる「アドオン」ではなく、Vulkan ライフサイクルにおける **協力者** であることが分かります。`pickPhysicalDevice` での LUID マッチングがなければ、エンジンがディスクリート GPU で初期化され、VR ヘッドセットが統合 GPU に接続されている、といった状況で表示が完全に失敗し得ます。同様に、拡張交渉は XR コンポジタとエンジンが同じ Vulkan の「方言」を話すことを保証します。
+
+xref:OpenXR_Vulkan_Spatial_Computing/02_OpenXR_Vulkan_Handshake/04_vulkan_1_3_feature_requirements.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/01_introduction.adoc[次へ]

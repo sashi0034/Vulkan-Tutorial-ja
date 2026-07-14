@@ -1,0 +1,434 @@
+:pp: {plus}{plus}
+
+= サブシステム: オーディオ処理用の Vulkan
+
+== Vulkan によるオーディオの強化
+
+前のセクションでは、エンジン用の基本的なオーディオ システムを実装しました。次に、Vulkan のコンピューティング機能がオーディオ処理、特に頭部伝達関数 (HRTF) を使用したリアルな 3D 空間オーディオの実装をどのように強化できるかを検討します。
+
+=== HRTFを理解する
+
+頭部伝達関数 (HRTF) は、音が鼓膜に到達する前に頭、外耳、胴体によってどのように変化するかをモデル化する一連の音響フィルターです。これらのフィルターは、リスナーに対する音源の方向に基づいて変化します。
+
+HRTF 処理により、音源の位置に基づいて適切なフィルターを適用することで、説得力のある 3D オーディオを作成できます。これにより、単純なステレオ パンや距離減衰よりも没入感の高い体験が生まれます。
+
+HRTF 処理の課題は、計算コストが高いことです。
+
+1. 各音源には、その位置に基づいた固有のフィルターのセットが必要です
+2. これらのフィルターはオーディオ ストリームにリアルタイムで適用する必要があります
+3. このプロセスには、複雑な畳み込み (オーディオ サンプルとフィルター係数の乗算) が含まれます。
+
+ここで、Vulkan 計算シェーダーがこれらの計算を GPU にオフロードすることで役立ちます。
+
+[[audio-vulkan-why]]
+=== 音声処理に Vulkan を使用する理由
+
+従来のオーディオ処理は CPU で実行されますが、特定のオーディオ タスクに Vulkan コンピューティング シェーダーを使用すると、いくつかの利点があります。
+
+1. *並列処理*: オーディオ処理、特に HRTF コンボリューションは高度に並列化できるため、GPU 計算に適しています。
+2. *CPU 負荷の軽減*: オーディオ処理を GPU にオフロードすることで、ゲーム ロジック、AI、およびその他のタスクのために CPU リソースが解放されます。
+3. *スケーラビリティ*: GPU ベースの処理は、数百または数千の同時音源を処理するためにより簡単に拡張できます。
+4. *統合メモリ*: Vulkan を使用すると、グラフィックスとオーディオ処理の間でメモリを共有できるため、データ転送のオーバーヘッドが削減されます。
+
+=== Vulkan を使用した HRTF 処理の実装
+
+Vulkan コンピューティング シェーダーを使用して、オーディオ システムを拡張して HRTF 処理を組み込みましょう。
+
+まず、HRTF 関連の構造をオーディオ システムに追加します。
+
+[source,cpp]
+----
+// Audio.h (additions)
+#include <vulkan/vulkan_raii.hpp>
+#include <array>
+
+namespace Engine {
+namespace Audio {
+
+// HRTF data for a specific direction
+struct HRTFData {
+    std::array<float, 256> leftEarImpulseResponse;
+    std::array<float, 256> rightEarImpulseResponse;
+};
+
+// HRTF database containing filters for different directions
+class HRTFDatabase {
+public:
+    HRTFDatabase(const std::string& filename);
+
+    // Get HRTF data for a specific direction
+    const HRTFData& GetHRTFData(float azimuth, float elevation) const;
+
+private:
+    // In a real implementation, this would be a more sophisticated data structure
+    std::vector<HRTFData> m_Data;
+    // Mapping from direction to data index
+    // ...
+};
+
+// Extended AudioSystem with Vulkan-based HRTF processing
+class AudioSystem {
+public:
+    // ... existing methods ...
+
+    // Enable/disable HRTF processing
+    void SetHRTFEnabled(bool enabled) { m_HRTFEnabled = enabled; }
+    bool IsHRTFEnabled() const { return m_HRTFEnabled; }
+
+    // Set the HRTF database to use
+    void SetHRTFDatabase(std::shared_ptr<HRTFDatabase> database) { m_HRTFDatabase = database; }
+
+private:
+    // ... existing members ...
+
+    // HRTF processing
+    bool m_HRTFEnabled = false;
+    std::shared_ptr<HRTFDatabase> m_HRTFDatabase;
+
+    // Vulkan resources for HRTF processing
+    struct VulkanResources {
+        vk::raii::ShaderModule computeShaderModule = nullptr;
+        vk::raii::DescriptorSetLayout descriptorSetLayout = nullptr;
+        vk::raii::PipelineLayout pipelineLayout = nullptr;
+        vk::raii::Pipeline computePipeline = nullptr;
+        vk::raii::DescriptorPool descriptorPool = nullptr;
+
+        // Buffers for audio data
+        vk::raii::Buffer inputBuffer = nullptr;
+        vk::raii::DeviceMemory inputBufferMemory = nullptr;
+        vk::raii::Buffer outputBuffer = nullptr;
+        vk::raii::DeviceMemory outputBufferMemory = nullptr;
+        vk::raii::Buffer hrtfBuffer = nullptr;
+        vk::raii::DeviceMemory hrtfBufferMemory = nullptr;
+
+        // Descriptor sets
+        std::vector<vk::raii::DescriptorSet> descriptorSets;
+
+        // Command buffer for compute operations
+        vk::raii::CommandPool commandPool = nullptr;
+        vk::raii::CommandBuffer commandBuffer = nullptr;
+    };
+
+    VulkanResources m_VulkanResources;
+
+    // Initialize Vulkan resources for HRTF processing
+    void InitializeVulkanResources();
+    void CleanupVulkanResources();
+
+    // Process audio with HRTF using Vulkan
+    void ProcessAudioWithVulkan(float* inputBuffer, float* outputBuffer, size_t frameCount);
+};
+
+} // namespace Audio
+} // namespace Engine
+----
+
+次に、Vulkan ベースの HRTF 処理を実装しましょう。
+
+[source,cpp]
+----
+// Audio.cpp (implementation)
+
+void AudioSystem::InitializeVulkanResources() {
+    // Get Vulkan device from the engine
+    auto& device = m_Engine.GetVulkanDevice();
+
+    // Create compute shader module
+    auto shaderCode = LoadShaderFile("shaders/hrtf_processing.comp.spv");
+    vk::ShaderModuleCreateInfo shaderModuleCreateInfo({}, shaderCode.size() * sizeof(uint32_t),
+                                                     reinterpret_cast<const uint32_t*>(shaderCode.data()));
+    m_VulkanResources.computeShaderModule = vk::raii::ShaderModule(device, shaderModuleCreateInfo);
+
+    // Create descriptor set layout
+    std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {
+        // Input audio buffer
+        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eStorageBuffer, 1,
+                                      vk::ShaderStageFlagBits::eCompute),
+        // Output audio buffer
+        vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1,
+                                      vk::ShaderStageFlagBits::eCompute),
+        // HRTF data buffer
+        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eStorageBuffer, 1,
+                                      vk::ShaderStageFlagBits::eCompute)
+    };
+
+    vk::DescriptorSetLayoutCreateInfo descriptorSetLayoutCreateInfo({}, bindings);
+    m_VulkanResources.descriptorSetLayout = vk::raii::DescriptorSetLayout(device, descriptorSetLayoutCreateInfo);
+
+    // Create pipeline layout
+    vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo({}, *m_VulkanResources.descriptorSetLayout);
+    m_VulkanResources.pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutCreateInfo);
+
+    // Create compute pipeline
+    vk::PipelineShaderStageCreateInfo shaderStageCreateInfo({}, vk::ShaderStageFlagBits::eCompute,
+                                                           *m_VulkanResources.computeShaderModule, "main");
+    vk::ComputePipelineCreateInfo computePipelineCreateInfo({}, shaderStageCreateInfo,
+                                                           *m_VulkanResources.pipelineLayout);
+    m_VulkanResources.computePipeline = vk::raii::Pipeline(device, nullptr, computePipelineCreateInfo);
+
+    // Create descriptor pool
+    std::array<vk::DescriptorPoolSize, 1> poolSizes = {
+        vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 3)
+    };
+    vk::DescriptorPoolCreateInfo descriptorPoolCreateInfo({}, 1, poolSizes);
+    m_VulkanResources.descriptorPool = vk::raii::DescriptorPool(device, descriptorPoolCreateInfo);
+
+    // Allocate descriptor sets
+    vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(*m_VulkanResources.descriptorPool,
+                                                           1, &*m_VulkanResources.descriptorSetLayout);
+    m_VulkanResources.descriptorSets = vk::raii::DescriptorSets(device, descriptorSetAllocateInfo);
+
+    // Create buffers for audio data
+    // In a real implementation, you would size these appropriately and handle multiple frames
+    CreateBuffer(device, sizeof(float) * 1024, vk::BufferUsageFlagBits::eStorageBuffer,
+                m_VulkanResources.inputBuffer, m_VulkanResources.inputBufferMemory);
+    CreateBuffer(device, sizeof(float) * 2048, vk::BufferUsageFlagBits::eStorageBuffer,
+                m_VulkanResources.outputBuffer, m_VulkanResources.outputBufferMemory);
+    CreateBuffer(device, sizeof(float) * 512, vk::BufferUsageFlagBits::eStorageBuffer,
+                m_VulkanResources.hrtfBuffer, m_VulkanResources.hrtfBufferMemory);
+
+    // Update descriptor sets
+    std::array<vk::DescriptorBufferInfo, 3> bufferInfos = {
+        vk::DescriptorBufferInfo(*m_VulkanResources.inputBuffer, 0, VK_WHOLE_SIZE),
+        vk::DescriptorBufferInfo(*m_VulkanResources.outputBuffer, 0, VK_WHOLE_SIZE),
+        vk::DescriptorBufferInfo(*m_VulkanResources.hrtfBuffer, 0, VK_WHOLE_SIZE)
+    };
+
+    std::array<vk::WriteDescriptorSet, 3> descriptorWrites = {
+        vk::WriteDescriptorSet(*m_VulkanResources.descriptorSets[0], 0, 0, 1,
+                              vk::DescriptorType::eStorageBuffer, nullptr, &bufferInfos[0]),
+        vk::WriteDescriptorSet(*m_VulkanResources.descriptorSets[0], 1, 0, 1,
+                              vk::DescriptorType::eStorageBuffer, nullptr, &bufferInfos[1]),
+        vk::WriteDescriptorSet(*m_VulkanResources.descriptorSets[0], 2, 0, 1,
+                              vk::DescriptorType::eStorageBuffer, nullptr, &bufferInfos[2])
+    };
+
+    device.updateDescriptorSets(descriptorWrites, {});
+
+    // Create command pool and command buffer
+    vk::CommandPoolCreateInfo commandPoolCreateInfo({}, m_Engine.GetVulkanQueueFamilyIndex());
+    m_VulkanResources.commandPool = vk::raii::CommandPool(device, commandPoolCreateInfo);
+
+    vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*m_VulkanResources.commandPool,
+                                                           vk::CommandBufferLevel::ePrimary, 1);
+    auto commandBuffers = vk::raii::CommandBuffers(device, commandBufferAllocateInfo);
+    m_VulkanResources.commandBuffer = std::move(commandBuffers[0]);
+}
+
+void AudioSystem::ProcessAudioWithVulkan(float* inputBuffer, float* outputBuffer, size_t frameCount) {
+    if (!m_HRTFEnabled || !m_HRTFDatabase) {
+        // If HRTF is disabled, just copy input to output (or do simple stereo panning)
+        memcpy(outputBuffer, inputBuffer, frameCount * sizeof(float));
+        return;
+    }
+
+    auto& device = m_Engine.GetVulkanDevice();
+    auto& queue = m_Engine.GetVulkanComputeQueue();
+
+    // Copy input audio data to the input buffer
+    void* data;
+    vkMapMemory(device, *m_VulkanResources.inputBufferMemory, 0, frameCount * sizeof(float), 0, &data);
+    memcpy(data, inputBuffer, frameCount * sizeof(float));
+    vkUnmapMemory(device, *m_VulkanResources.inputBufferMemory);
+
+    // Update HRTF data based on source positions
+    // In a real implementation, you would update this for each sound source
+    // For simplicity, we're just using a single HRTF filter here
+    const auto& hrtfData = m_HRTFDatabase->GetHRTFData(0.0f, 0.0f);
+    vkMapMemory(device, *m_VulkanResources.hrtfBufferMemory, 0, sizeof(HRTFData), 0, &data);
+    memcpy(data, &hrtfData, sizeof(HRTFData));
+    vkUnmapMemory(device, *m_VulkanResources.hrtfBufferMemory);
+
+    // Record command buffer
+    vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+    m_VulkanResources.commandBuffer.begin(beginInfo);
+
+    m_VulkanResources.commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *m_VulkanResources.computePipeline);
+    m_VulkanResources.commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                                     *m_VulkanResources.pipelineLayout, 0,
+                                                     *m_VulkanResources.descriptorSets[0], {});
+
+    // Dispatch compute shader
+    // The workgroup size should match what's defined in the shader
+    m_VulkanResources.commandBuffer.dispatch(frameCount / 64 + 1, 1, 1);
+
+    m_VulkanResources.commandBuffer.end();
+
+    // Submit command buffer
+    vk::SubmitInfo submitInfo({}, {}, *m_VulkanResources.commandBuffer);
+    queue.submit(submitInfo, nullptr);
+    queue.waitIdle();
+
+    // Copy output audio data from the output buffer
+    vkMapMemory(device, *m_VulkanResources.outputBufferMemory, 0, frameCount * 2 * sizeof(float), 0, &data);
+    memcpy(outputBuffer, data, frameCount * 2 * sizeof(float));
+    vkUnmapMemory(device, *m_VulkanResources.outputBufferMemory);
+}
+
+void AudioSystem::Update(float deltaTime) {
+    // Process all active audio sources
+    for (auto& source : m_Sources) {
+        if (source->IsPlaying()) {
+            // Get audio data from the source
+            auto clip = source->GetClip();
+            if (!clip) continue;
+
+            // Calculate spatial position relative to listener
+            glm::vec3 relativePosition = source->GetPosition() - m_Listener.GetPosition();
+
+            // Rotate relative position based on listener orientation
+            glm::mat3 listenerOrientation(
+                glm::cross(m_Listener.GetForward(), m_Listener.GetUp()),
+                m_Listener.GetUp(),
+                -m_Listener.GetForward()
+            );
+            relativePosition = listenerOrientation * relativePosition;
+
+            // Calculate azimuth and elevation
+            float distance = glm::length(relativePosition);
+            float azimuth = atan2(relativePosition.x, relativePosition.z);
+            float elevation = atan2(relativePosition.y, sqrt(relativePosition.x * relativePosition.x + relativePosition.z * relativePosition.z));
+
+            // Get audio data from the clip
+            const float* audioData = clip->GetData() + source->GetCurrentSample();
+            size_t remainingSamples = clip->GetSampleCount() - source->GetCurrentSample();
+            size_t framesToProcess = std::min(remainingSamples, size_t(1024));
+
+            // Process audio with HRTF using Vulkan
+            float processedAudio[2048]; // Stereo output (2 channels)
+            ProcessAudioWithVulkan(const_cast<float*>(audioData), processedAudio, framesToProcess);
+
+            // Send processed audio to the audio backend
+            // ...
+
+            // Update source state
+            source->IncrementSample(framesToProcess);
+        }
+    }
+}
+----
+
+=== HRTF コンピューティング シェーダー
+
+HRTF コンボリューションを実行する計算シェーダーは次のとおりです。
+
+[source,glsl]
+----
+// hrtf_processing.comp
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Input mono audio buffer
+layout(std430, binding = 0) buffer InputBuffer {
+    float samples[];
+} inputBuffer;
+
+// Output stereo audio buffer
+layout(std430, binding = 1) buffer OutputBuffer {
+    float leftSamples[];
+    float rightSamples[];
+} outputBuffer;
+
+// HRTF data
+layout(std430, binding = 2) buffer HRTFBuffer {
+    float leftImpulseResponse[256];
+    float rightImpulseResponse[256];
+} hrtfBuffer;
+
+void main() {
+    uint gID = gl_GlobalInvocationID.x;
+
+    // Check if this invocation is within the audio buffer
+    if (gID >= inputBuffer.samples.length()) {
+        return;
+    }
+
+    // Perform convolution with HRTF impulse responses
+    float leftSample = 0.0;
+    float rightSample = 0.0;
+
+    for (int i = 0; i < 256; i++) {
+        int sampleIndex = int(gID) - i;
+        if (sampleIndex >= 0 && sampleIndex < inputBuffer.samples.length()) {
+            leftSample += inputBuffer.samples[sampleIndex] * hrtfBuffer.leftImpulseResponse[i];
+            rightSample += inputBuffer.samples[sampleIndex] * hrtfBuffer.rightImpulseResponse[i];
+        }
+    }
+
+    // Write to output buffer
+    outputBuffer.leftSamples[gID] = leftSample;
+    outputBuffer.rightSamples[gID] = rightSample;
+}
+----
+
+=== パフォーマンスに関する考慮事項
+
+Vulkan を使用して HRTF 処理を実装する場合は、次のパフォーマンスの最適化を考慮してください。
+
+1. *バッチ処理*: コマンド送信のオーバーヘッドを軽減するために、1 回のディスパッチで複数のオーディオ フレームを処理します。
+2. *メモリ転送*: より大きなオーディオのチャンクを一度に処理することで、CPU と GPU メモリ間の転送を最小限に抑えます。
+3. *複数のソース*: GPU 使用率を最大化するために、単一のシェーダー呼び出しで複数の音源を処理します。
+4. *動的 HRTF 選択*: 音源の位置が大幅に変化した場合にのみ HRTF フィルターを更新します。
+5. *ワークグループ サイズ*: 最適なパフォーマンスを得るために、ターゲット ハードウェアに基づいてワークグループ サイズを調整します。
+
+=== オーディオシステムとの統合
+
+Vulkan ベースの HRTF 処理をオーディオ システムに統合するには、`AudioSystem::Initialize` メソッドを変更する必要があります。
+
+[source,cpp]
+----
+void AudioSystem::Initialize() {
+    // Initialize audio backend
+    // ...
+
+    // Initialize Vulkan resources for HRTF processing
+    if (m_Engine.IsVulkanInitialized()) {
+        InitializeVulkanResources();
+    }
+
+    // Load default HRTF database
+    m_HRTFDatabase = std::make_shared<HRTFDatabase>("data/hrtf/default.hrtf");
+    m_HRTFEnabled = true;
+}
+
+void AudioSystem::Shutdown() {
+    // Cleanup Vulkan resources
+    if (m_Engine.IsVulkanInitialized()) {
+        CleanupVulkanResources();
+    }
+
+    // Shutdown audio backend
+    // ...
+}
+----
+
+=== Vulkan ベースの HRTF の利点
+
+コンピューティング シェーダーが適している理由の概要については、<<audio-vulkan-why,Why Use Vulkan for Audio Processing?>> にリストされている主要な利点を参照してください。特に HRTF の文脈では、2 つの実際的な利点を強調する価値があります。
+
+1. *品質*: パフォーマンスに大きな影響を与えることなく高次の HRTF フィルターを使用できるため、空間のリアリズムが向上します。
+2. *高度なエフェクト*: GPU の計算能力により、HRTF に加えて、より高度なエフェクト (室内音響シミュレーションなど) が可能になります。
+
+=== 制限事項と考慮事項
+
+Vulkan ベースのオーディオ処理には多くの利点がありますが、考慮すべき制限がいくつかあります。
+
+1. *レイテンシー*: GPU 処理により追加のレイテンシーが発生し、リアルタイム オーディオでは問題になる可能性があります。
+2. *複雑さ*: GPU ベースのオーディオ処理の実装とデバッグは、CPU ベースのソリューションよりも複雑です。
+3. *プラットフォームのサポート*: すべてのプラットフォームが Vulkan をサポートしているわけではないため、フォールバック CPU 実装が必要になる場合があります。
+4. *消費電力*: GPU 処理により消費電力が増加する可能性があるため、モバイル デバイスではこれを考慮する必要があります。
+
+=== 現実世界のアプリケーション
+
+いくつかの最新のゲーム エンジンとオーディオ ミドルウェア ソリューションは、オーディオ処理に GPU アクセラレーションを活用し始めています。
+
+1. *Steam オーディオ*: Valve のオーディオ SDK は、空間オーディオ処理の GPU アクセラレーションをサポートしています。
+2. *Wwise*: Audiokinetic の Wwise は、特定の DSP エフェクトを GPU にオフロードできます。
+3. *カスタム ソリューション*: AAA ゲーム スタジオは、タイトルにカスタム GPU アクセラレーション オーディオ処理を実装することがよくあります。
+
+Vulkan ベースの HRTF 処理をエンジンに実装することで、最新のゲームにおける高性能オーディオに関する業界のベスト プラクティスに従っています。
+
+次のセクションでは、物理サブシステムに焦点を移し、Vulkan コンピューティング シェーダーがどのように物理シミュレーションを高速化できるかを検討します。
+
+xref:Building_a_Simple_Engine/Subsystems/02_audio_basics.adoc[前: オーディオの基本] | xref:Building_a_Simple_Engine/Subsystems/04_physics_basics.adoc[次へ: 物理学の基礎]

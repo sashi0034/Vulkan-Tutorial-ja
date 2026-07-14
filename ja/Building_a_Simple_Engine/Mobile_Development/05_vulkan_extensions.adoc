@@ -1,0 +1,393 @@
+:pp: {plus}{plus}
+
+= モバイル開発: Vulkan 拡張機能
+
+== モバイル用の Vulkan 拡張機能
+
+Vulkan の拡張性は最大の強みの 1 つであり、ハードウェア ベンダーはパフォーマンスを大幅に向上させる特殊な機能を公開できます。モバイル開発の場合、モバイル GPU の固有の特性を最適化するのに役立ついくつかの拡張機能が特に価値があります。このセクションでは、モバイル デバイスのパフォーマンスを向上させることができる主要な Vulkan 拡張機能について説明します。
+
+=== VK_KHR_dynamic_rendering
+
+ダイナミック レンダリングは、明示的なレンダー パスとフレームバッファ オブジェクトの必要性を排除することで、Vulkan レンダリング ワークフローを簡素化する革新的な拡張機能です。
+
+==== 概要
+
+`VK_KHR_dynamic_rendering` 拡張機能 (現在は Vulkan 1.3 コアの一部) を使用すると、レンダー パスやフレームバッファ オブジェクトを作成せずに、コマンド バッファ内で直接レンダリング操作を開始および終了できます。これは、次のような理由から、幅広いプラットフォーム (デスクトップとモバイル) にメリットをもたらします。
+
+1. *コードの簡素化*: レンダー パスとフレームバッファの管理の複雑さを軽減します。
+2. *より柔軟なレンダリングを可能*: 従来のレンダー パス モデルにうまく適合しないテクニックの実装が容易になります。
+3. *API オーバーヘッドを削減できる可能性*: 作成および管理するオブジェクトが少ないため、セットアップが簡素化されます。通常、CPU の節約はわずかであり、ワークロードに依存します。
+
+==== 実装 (ステップバイステップ)
+
+セットアップをいくつかの小さな、焦点を絞ったステップに分けてみましょう。
+
+===== 拡張機能を有効にしてエントリ ポイントをロードする
+
+まずデバイス拡張機能を有効にし、Vulkan 1.3 コアを使用していない場合は関数ポインターをロードします。
+
+[source,cpp]
+----
+// Enable the extension when creating the device
+std::vector<const char*> device_extensions = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME
+};
+
+// Get function pointers (if not using Vulkan 1.3)
+PFN_vkCmdBeginRenderingKHR vkCmdBeginRenderingKHR =
+    reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(
+        vkGetDeviceProcAddr(device, "vkCmdBeginRenderingKHR"));
+PFN_vkCmdEndRenderingKHR vkCmdEndRenderingKHR =
+    reinterpret_cast<PFN_vkCmdEndRenderingKHR>(
+        vkGetDeviceProcAddr(device, "vkCmdEndRenderingKHR"));
+----
+
+これにより、デバイスでダイナミック レンダリングを使用できるようになり、従来のレンダー パスを使用せずにレンダリング スコープの開始/終了に必要なコマンドにアクセスできるようになります。
+
+===== このレンダリング スコープの添付ファイルを説明します
+
+色と深度のアタッチメントを定義し、それらを VkRenderingInfoKHR にパッケージ化します。これは、通常はレンダー パス/フレームバッファ オブジェクトにベイクされる内容のインラインで 1 回限りの記述であると考えてください。
+
+[source,cpp]
+----
+VkRenderingAttachmentInfoKHR color_attachment{};
+color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+color_attachment.imageView = color_image_view;
+color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+color_attachment.clearValue = clear_value;
+
+VkRenderingAttachmentInfoKHR depth_attachment{};
+depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+depth_attachment.imageView = depth_image_view;
+depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+depth_attachment.clearValue = depth_clear_value;
+
+VkRenderingInfoKHR rendering_info{};
+rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
+rendering_info.renderArea = render_area;
+rendering_info.layerCount = 1;
+rendering_info.colorAttachmentCount = 1;
+rendering_info.pColorAttachments = &color_attachment;
+rendering_info.pDepthAttachment = &depth_attachment;
+----
+
+各フレーム (またはサブパスに相当) では、これらのディスクリプタを直接調整でき (サイズ変更後のスワップチェーン ビューなど)、パイプライン全体の再作成を回避できます。
+
+===== レンダリングの開始、描画、レンダリングの終了
+
+説明した添付ファイルを使用して、レンダリング スコープを開き、描画を記録してからスコープを閉じます。
+
+[source,cpp]
+----
+vkCmdBeginRenderingKHR(command_buffer, &rendering_info);
+
+// Record drawing commands
+vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+vkCmdDraw(command_buffer, vertex_count, 1, 0, 0);
+
+// End rendering
+vkCmdEndRenderingKHR(command_buffer);
+----
+
+begin/end ペアは vkCmdBeginRenderPass/vkCmdEndRenderPass を置き換えると同時に、最新のレンダリング フローにさらなる柔軟性を提供します。
+
+===== C++ バインディング (vulkan.hpp) バリアント
+
+vulkan.hpp (vk::) を使用している場合、構造の作成はより人間工学的になりますが、同じ手順に従います。
+
+[source,cpp]
+----
+// Using vulkan.hpp
+vk::RenderingAttachmentInfoKHR color_attachment;
+color_attachment.setImageView(color_image_view);
+color_attachment.setImageLayout(vk::ImageLayout::eColorAttachmentOptimal);
+color_attachment.setLoadOp(vk::AttachmentLoadOp::eClear);
+color_attachment.setStoreOp(vk::AttachmentStoreOp::eStore);
+color_attachment.setClearValue(clear_value);
+
+vk::RenderingAttachmentInfoKHR depth_attachment;
+depth_attachment.setImageView(depth_image_view);
+depth_attachment.setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal);
+depth_attachment.setLoadOp(vk::AttachmentLoadOp::eClear);
+depth_attachment.setStoreOp(vk::AttachmentStoreOp::eDontCare);
+depth_attachment.setClearValue(depth_clear_value);
+
+vk::RenderingInfoKHR rendering_info;
+rendering_info.setRenderArea(render_area);
+rendering_info.setLayerCount(1);
+rendering_info.setColorAttachments(color_attachment);
+rendering_info.setPDepthAttachment(&depth_attachment);
+----
+
+説明を組み立てたら、レンダリング スコープを開始し、描画を送信して、スコープを終了します。
+
+[source,cpp]
+----
+command_buffer.beginRenderingKHR(rendering_info);
+
+// Record drawing commands
+command_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+command_buffer.draw(vertex_count, 1, 0, 0);
+
+// End rendering
+command_buffer.endRenderingKHR();
+----
+
+=== VK_KHR_dynamic_rendering_local_read
+
+`VK_KHR_dynamic_rendering_local_read` 拡張機能は、タイルをメイン メモリに強制的に送ったり戻したりすることなく、シェーダーが添付ファイルから読み取ることができるため、タイルベースのレンダラにとって特に価値があります。
+
+==== 概要
+
+この拡張機能により、フラグメント シェーダが同じレンダリング スコープ内のカラーおよび深度/ステンシル アタッチメントから読み取ることができるようになり、動的レンダリングが強化されます。タイルベースのレンダラーでは、これは読み取りがタイル メモリから直接行われ、メイン メモリへの高価な往復を回避できることを意味します。
+
+主な利点は次のとおりです。
+
+1. *メモリ帯域幅の削減*: 読み取りはメイン メモリではなくオンチップ メモリから行われるため、帯域幅を大量に使用する操作での帯域幅の使用量が削減されます。
+2. *パフォーマンスの向上*: 特に、以前に書き込まれた添付ファイルから読み取る必要があるアルゴリズムの場合。
+3. *電力効率*: メモリ帯域幅が低いほど、消費電力が低くなります。
+
+==== メモリ帯域幅の削減方法
+
+`VK_KHR_dynamic_rendering_local_read` 拡張機能は、次の理由からメモリ帯​​域幅の削減に特に効果的です。
+
+1. *タイル フラッシュ操作の排除*: この拡張機能を使用しないと、シェーダーが以前に書き込まれた添付ファイルから読み取る必要がある場合、GPU はタイル全体をメイン メモリにフラッシュしてから読み戻す必要があります。この拡張機能により、シェーダがタイル メモリから直接読み取ることができるようになり、これらのコストのかかるフラッシュ操作が不要になります。
+
+2. *ピクセル単位のローカル読み取りをサポート*: フラグメント シェーダーが、現在のレンダリング スコープ/タイル内のアタッチメントから同じピクセルに書き込まれた値を読み取ることができるようになります。これは、ピクセルごとの操作 (トーン マッピングや深度/前の色の読み取りなど) に適しています。
+
+3. *帯域幅削減の測定*: 実際のアプリケーションでは、この拡張機能により、ピクセルごとのローカル読み取りの恩恵を受けるワークロードのメモリ帯域幅が削減されることが示されています。利点はワークロードと GPU に依存します。
+
+4. *実践例*: 照明のために同じピクセルで G バッファ データを読み取る必要がある遅延レンダリングパイプラインを考えてみましょう。この拡張機能がないと、G バッファをメイン メモリに書き込んでから、ライティング パスのために読み戻す必要があります。この拡張機能により、ライティング パスはタイル メモリ内の G バッファから直接読み取ることができるため、帯域幅が節約されます。
+
+==== 実装
+
+この拡張機能を使用するには:
+
+[source,cpp]
+----
+// Enable the extension when creating the device
+std::vector<const char*> device_extensions = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+    VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME
+};
+
+// Create a pipeline that reads from attachments
+vk::PipelineRenderingCreateInfoKHR rendering_create_info;
+rendering_create_info.setColorAttachmentCount(1);
+rendering_create_info.setColorAttachmentFormats(color_format);
+rendering_create_info.setDepthAttachmentFormat(depth_format);
+
+// Set up the attachment local read info
+vk::AttachmentSampleCountInfoAMD sample_count_info;
+sample_count_info.setColorAttachmentSamples(vk::SampleCountFlagBits::e1);
+sample_count_info.setDepthStencilAttachmentSamples(vk::SampleCountFlagBits::e1);
+
+vk::RenderingAttachmentLocationInfoKHR location_info;
+location_info.setColorAttachmentLocations(0);  // Location 0 for the color attachment
+
+vk::RenderingInputAttachmentIndexInfoKHR input_index_info;
+input_index_info.setColorInputAttachmentIndices(0);  // Index 0 for the color attachment
+
+// Create the graphics pipeline
+vk::GraphicsPipelineCreateInfo pipeline_info;
+pipeline_info.setPNext(&rendering_create_info);
+// ... set other pipeline creation parameters
+
+// In your fragment shader, you can now read from the attachment
+// using subpassLoad() or texture sampling with the appropriate extension
+// Fragment shader example (GLSL):
+// #extension GL_EXT_shader_tile_image : require
+// layout(location = 0) out vec4 outColor;
+// layout(input_attachment_index = 0, set = 0, binding = 0) uniform subpassInput inputColor;
+// void main() {
+//     vec4 color = subpassLoad(inputColor);
+//     outColor = color * 2.0;  // Double the brightness
+// }
+----
+
+=== VK_EXT_shader_tile_image
+
+`VK_EXT_shader_tile_image` 拡張機能は、シェーダー内のタイル メモリへの直接アクセスを提供し、タイルベースのレンダラーのパフォーマンスを大幅に向上させることができます。
+
+==== 概要
+
+この拡張機能を使用すると、シェーダで次のことが可能になります。
+
+1. *タイル メモリに直接アクセス*: メイン メモリを経由せずに、現在のタイルのメモリに読み書きします。
+2. *タイルローカル操作の実行*: 完全にタイル メモリ内に留まる操作を実行します。
+3. *帯域幅を大量に使用するアルゴリズムの最適化*: 後処理エフェクトに特に有益です。
+4. *メモリ帯域幅の削減*: マルチパス ワークロード中にデータをタイル ローカル メモリに保持することで、メモリ帯域幅の削減に役立ちます。
+
+==== メモリ帯域幅の削減方法
+
+`VK_EXT_shader_tile_image` 拡張機能は、次の理由によりメモリ帯域幅を削減するのに特に効果的です。
+
+1. *タイルベースのアーキテクチャの最適化*: モバイル GPU は通常、画面が独立して処理される小さなタイルに分割されるタイルベースのレンダリングを使用します。この拡張機能は、シェーダーが高速オンチップ メモリ内のタイル データを直接操作できるようにすることで、このアーキテクチャを最大限に活用しています。
+
+2. *中間メモリ転送の排除*: この拡張機能を使用しない場合、マルチパス レンダリングでは、各パスの後に結果をメイン メモリに書き込み、次のパスで結果を読み戻す必要があります。 `VK_EXT_shader_tile_image` を使用すると、これらの中間結果をタイル メモリに保持できるため、コストのかかる転送が不要になります。
+
+3. *帯域幅節約の測定*: さまざまなモバイル GPU でのテストにより、複雑なマルチパス パイプラインの帯域幅が大幅に削減されることが示されました。実際の利益はワークロードと GPU に依存します。
+
+4. *実用的なアプリケーション*:
+   - *画像処理フィルター*: タイル メモリを残さずに複数のフィルター (ぼかし、シャープ、色補正) を適用できます。
+   - *遅延レンダリング*: G バッファー データは、ライティング パスのためにタイル メモリに保持できます。
+   - *シャドウ マッピング*: 奥行き情報をタイル メモリに保持することで、シャドウの計算をより効率的に実行できます。
+
+5. *電力効率*: メモリ帯域幅の削減は消費電力の削減に直接つながり、これはモバイル デバイスにとって重要です。テストでは、グラフィックスを多用するアプリケーションで最大 20% の電力節約が確認されています。
+
+==== 実装
+
+この拡張機能を使用するには:
+
+[source,cpp]
+----
+// Enable the extension when creating the device
+std::vector<const char*> device_extensions = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME
+};
+
+// When creating your shader module, make sure your shader uses the extension
+// GLSL example:
+// #extension GL_EXT_shader_tile_image : require
+//
+// layout(tile_image, set = 0, binding = 0) uniform tileImageColor { vec4 color; } tileColor;
+//
+// void main() {
+//     // Read from tile memory
+//     vec4 current_color = tileColor.color;
+//
+//     // Process the color
+//     vec4 new_color = process(current_color);
+//
+//     // Write back to tile memory
+//     tileColor.color = new_color;
+// }
+----
+
+=== 拡張機能を組み合わせてパフォーマンスを最大化する
+
+最高のモバイル パフォーマンスを得るには、次の拡張機能を併用することを検討してください。
+
+[source,cpp]
+----
+// Enable all relevant extensions
+std::vector<const char*> device_extensions = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+    VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME,
+    VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME
+};
+
+// Check which extensions are supported
+auto available_extensions = physical_device.enumerateDeviceExtensionProperties();
+std::vector<const char*> supported_extensions;
+
+for (const auto& requested_ext : device_extensions) {
+    for (const auto& available_ext : available_extensions) {
+        if (strcmp(requested_ext, available_ext.extensionName) == 0) {
+            supported_extensions.push_back(requested_ext);
+            break;
+        }
+    }
+}
+
+// Create device with supported extensions
+vk::DeviceCreateInfo device_create_info;
+device_create_info.setPEnabledExtensionNames(supported_extensions);
+// ... set other device creation parameters
+vk::Device device = physical_device.createDevice(device_create_info);
+
+// Now you can use the supported extensions in your rendering code
+// ...
+----
+
+=== デバイス拡張のサポート
+
+モバイル ベンダーやデバイスが異なれば、公開する Vulkan 拡張機能も異なります。デバイスごとのサポートを理解すると、実行時に機能を安全に選択するのに役立ちます。
+
+==== デバイス拡張サポートの詳細
+
+モバイル GPU ベンダーごとに、Vulkan 拡張機能のサポート レベルが異なります。
+
+* *ダイナミック レンダリング サポート*: 多くのモバイル GPU は `VK_KHR_dynamic_rendering` をサポートしています。これにより API サーフェスが簡素化されますが、次のタイルベースの最適化のいずれかがサポートされていない限り、複数のサブパスが関係する場合、従来のレンダー パスを使用するよりも遅くなる可能性があります。
+
+* *タイルベースの最適化*: タイルベースの GPU (Mali、PowerVR など) では、`VK_EXT_shader_tile_image` と `VK_KHR_dynamic_rendering_local_read` はタイル メモリ内で読み取りと書き込みを維持するため効果的です。詳細については、上記の拡張機能のセクションを参照してください。利点はワークロードと GPU に依存します。
+
+* *現在のデバイスの拡張サポート (EXT/KHR) を確認しています*:
+
+[source,cpp]
+----
+// Common vendor IDs (used here only for labeling/logging output)
+const uint32_t VENDOR_ID_QUALCOMM = 0x5143; // Adreno
+const uint32_t VENDOR_ID_ARM = 0x13B5;      // Mali
+const uint32_t VENDOR_ID_IMAGINATION = 0x1010; // PowerVR
+const uint32_t VENDOR_ID_HUAWEI = 0x19E5;   // Kirin
+const uint32_t VENDOR_ID_APPLE = 0x106B;    // Apple
+
+bool log_device_extension_support(vk::PhysicalDevice physical_device) {
+    vk::PhysicalDeviceProperties props = physical_device.getProperties();
+    std::string vendor_name;
+
+    // Identify vendor for display purposes only
+    switch (props.vendorID) {
+        case VENDOR_ID_QUALCOMM: vendor_name = "Qualcomm"; break;
+        case VENDOR_ID_ARM: vendor_name = "ARM Mali"; break;
+        case VENDOR_ID_IMAGINATION: vendor_name = "PowerVR"; break;
+        case VENDOR_ID_HUAWEI: vendor_name = "Huawei"; break;
+        case VENDOR_ID_APPLE: vendor_name = "Apple"; break;
+        default: vendor_name = "Unknown"; break;
+    }
+
+    // Check for widely useful EXT/KHR extensions on this device
+    auto available_extensions = physical_device.enumerateDeviceExtensionProperties();
+    bool has_dynamic_rendering = false;
+    bool has_dynamic_rendering_local_read = false;
+    bool has_shader_tile_image = false;
+
+    for (const auto& ext : available_extensions) {
+        std::string ext_name = ext.extensionName;
+        if (ext_name == VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) {
+            has_dynamic_rendering = true;
+        } else if (ext_name == VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) {
+            has_dynamic_rendering_local_read = true;
+        } else if (ext_name == VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME) {
+            has_shader_tile_image = true;
+        }
+    }
+
+    // Log the extension support
+    std::cout << vendor_name << " device detected with extension support:" << std::endl;
+    std::cout << "  Dynamic Rendering: " << (has_dynamic_rendering ? "Yes" : "No") << std::endl;
+    std::cout << "  Dynamic Rendering Local Read: " << (has_dynamic_rendering_local_read ? "Yes" : "No") << std::endl;
+    std::cout << "  Shader Tile Image: " << (has_shader_tile_image ? "Yes" : "No") << std::endl;
+
+    return has_dynamic_rendering || has_dynamic_rendering_local_read || has_shader_tile_image;
+}
+----
+
+* *プラットフォーム固有の最適化*: モバイル デバイス向けに開発する場合、
+次の最適化を検討してください。
+   - タイルベースのレンダラーでは、従来のレンダー パスよりもダイナミック レンダリングの使用を優先します。
+   - 利用可能な場合は常にタイルベースの拡張機能を使用する
+   - さまざまな構成をテストして、さまざまなデバイス モデルに最適な設定を見つけます。
+
+=== 拡張機能を使用するためのベスト プラクティス
+
+1. *サポートの確認*: 拡張機能を使用する前に、その拡張機能がサポートされているかどうかを必ず確認してください。
+
+2. *フォールバック パス*: 拡張機能が利用できない場合に備えてフォールバック パスを実装します。
+
+3. *実デバイスでテスト*: 拡張機能はベンダーやデバイスによって動作が異なる場合があります。さまざまなメーカーのさまざまなハードウェアでテストします。
+
+4. *最新情報を入手*: モバイル GPU ベンダーが Vulkan サポートを強化し続けているため、モバイルのパフォーマンスにメリットをもたらす可能性のある新しい拡張機能を追跡してください。
+
+次のセクションでは、重要なポイントとベスト プラクティスをまとめて、モバイル開発の探求を終了します。
+
+xref:Building_a_Simple_Engine/Mobile_Development/04_rendering_approaches.adoc[前: レンダリングのアプローチ] | xref:Building_a_Simple_Engine/Mobile_Development/06_conclusion.adoc[次へ: 結論]

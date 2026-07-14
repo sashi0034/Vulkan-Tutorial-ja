@@ -1,0 +1,174 @@
+:pp: {plus}{plus}
+
+= エンジンアーキテクチャ: アーキテクチャパターン
+
+== アーキテクチャパターン
+
+この節では、モダンなレンダリングエンジンおよびゲームエンジンで使われる一般的なアーキテクチャパターンを手短に概観します。焦点は、本 Vulkan レンダリングエンジンの基盤となるコンポーネントベースアーキテクチャに置きます。
+
+個別のパターンに入る前に、本チュートリアルでは Vulkan ベースのレンダリングエンジンを構築しますが、ここで扱う多くのアーキテクチャパターンは、レンダリングエンジンと本格的なゲームエンジンの両方で一般的に使われる点を明確にしておきます。レンダリングエンジンは主にグラフィックスレンダリング能力に焦点を当て、本格的なゲームエンジンは通常、物理、オーディオ、AI、ゲームプレイロジックなどの追加システムを含みます。
+
+=== 一般的なアーキテクチャパターンの概要
+
+ゲームエンジンおよびレンダリングエンジンで最も一般的なアーキテクチャパターンを簡潔に紹介します。
+
+==== link:https://games-1312234642.cos.ap-guangzhou.myqcloud.com/course/GAMES104/GAMES104_Lecture02.pdf[レイヤードアーキテクチャ]
+
+レイヤードアーキテクチャは、システムをそれぞれ特定の責任を持つ明確な層に分割します。典型的な層には、プラットフォーム抽象化、リソース管理、レンダリング、シーン管理、アプリケーション層があります。
+
+image::../../../images/layered_architecture_diagram.png[Layered Architecture Diagram, width=400, alt="Layered Architecture Diagram showing different layers of a rendering engine"]
+
+*主な利点:*
+
+* 関心の明確な分離
+* 理解と保守が容易
+* 他の層に影響を与えずに個々の層を置換・変更できる
+
+詳細情報と実装例は、xref:Building_a_Simple_Engine/Appendix/appendix.adoc#layered-architecture[付録: レイヤードアーキテクチャ] を参照してください。
+
+==== link:https://www.youtube.com/watch?v=rX0ItVEVjHc[データ指向設計]
+
+データ指向設計（DOD）は、オブジェクト中心にコードを組織するのではなく、効率的な処理のためにデータを組織することに焦点を当てます。キャッシュフレンドリーなメモリレイアウトと、データの一括処理を重視します。
+
+image::../../../images/data_oriented_design_diagram.svg[Data-Oriented Design Diagram, width=400]
+
+*主な利点:*
+
+* より良いキャッシュ利用
+* より効率的なメモリ使用
+* 並列化が容易
+
+詳細情報と実装例は、xref:Building_a_Simple_Engine/Appendix/appendix.adoc#data-oriented-design[付録: データ指向設計] を参照してください。
+
+==== link:https://gameprogrammingpatterns.com/service-locator.html[サービスロケーターパターン]
+
+サービスロケーターパターンは、利用側を具象実装に結合せずに、サービスへのグローバルなアクセス点を提供します。
+
+image::../../../images/service_locator_pattern_diagram.svg[Service Locator Pattern Diagram, width=400]
+
+*主な利点:*
+
+* サービス利用側とサービス提供側を疎結合にする
+* サービスの置換が容易
+* モックサービスによるテストを容易にする
+
+詳細情報と実装例は、xref:Building_a_Simple_Engine/Appendix/appendix.adoc#service-locator-pattern[付録: サービスロケーターパターン] を参照してください。
+
+=== link:https://gameprogrammingpatterns.com/component.html[コンポーネントベースアーキテクチャ]
+
+コンポーネントベースアーキテクチャはモダンなゲームエンジンで広く使われ、本 Vulkan レンダリングエンジンの基盤となります。継承より合成を推し進め、より柔軟なエンティティ設計を可能にします。
+
+image::../../../images/component_based_architecture_diagram.png[Component-Based Architecture Diagram, width=600, alt="Component-Based Architecture Diagram showing entities, components, and systems"]
+
+[NOTE]
+====
+*図の凡例:*
+
+* *ボックス*: 青いボックスは Entities、オレンジのボックスは Components、緑のボックスは Systems を表します
+* *線の種類*:
+** 破線は所有・包含関係（Entities が Components を含む）を示します
+** 実線は処理関係（Systems が特定の Components を処理する）を示します
+* *テキスト*: すべてのテキスト要素は、ライト／ダーク両モードで見やすいよう暗い色を使用します
+* *方向の流れ*: 矢印は要素間の関係の方向を示します
+====
+
+==== 主要概念
+
+1. *Entities* — ゲーム世界のオブジェクトを表す基本的なコンテナ。
+2. *Components* — エンティティに付与できる、機能のモジュール単位。
+3. *Systems* — 特定のコンポーネントを持つエンティティを処理し、ゲームロジックを実装する。
+
+==== コンポーネントベースアーキテクチャの利点
+
+* 高度にモジュール化され柔軟
+* 深い継承階層を避けられる
+* データ指向設計を可能にする
+* 並列処理を容易にする
+
+==== 実装例
+
+[source,cpp]
+----
+// Component base class
+class Component {
+public:
+    virtual ~Component() = default;
+    virtual void Update(float deltaTime) {}
+};
+
+// Specific component types
+class TransformComponent : public Component {
+private:
+    glm::vec3 position;
+    glm::quat rotation;
+    glm::vec3 scale;
+
+public:
+    // Methods to manipulate transform
+};
+
+class MeshComponent : public Component {
+private:
+    Mesh* mesh;
+    Material* material;
+
+public:
+    // Methods to render the mesh
+};
+
+// Entity class
+class Entity {
+private:
+    std::vector<std::unique_ptr<Component>> components;
+
+public:
+    template<typename T, typename... Args>
+    T* AddComponent(Args&&... args) {
+        static_assert(std::is_base_of<Component, T>::value, "T must derive from Component");
+        auto component = std::make_unique<T>(std::forward<Args>(args)...);
+        T* componentPtr = component.get();
+        components.push_back(std::move(component));
+        return componentPtr;
+    }
+
+    template<typename T>
+    T* GetComponent() {
+        for (auto& component : components) {
+            if (T* result = dynamic_cast<T*>(component.get())) {
+                return result;
+            }
+        }
+        return nullptr;
+    }
+
+    void Update(float deltaTime) {
+        for (auto& component : components) {
+            component->Update(deltaTime);
+        }
+    }
+};
+----
+
+=== なぜコンポーネントシステムに焦点を当てるか
+
+本 Vulkan レンダリングエンジンでは、次の主な理由からコンポーネントベースアーキテクチャに焦点を当てます。
+
+1. *グラフィックス機能への柔軟性*: コンポーネントシステムにより、大規模なリファクタリングなしに、レンダリング機能（異なるシェーディングモデル、ポストプロセス効果、ライティング技法など）の追加・削除・入れ替えが容易になります。
+
+2. *レンダリング関心の分離*: コンポーネントは、レンダリングの異なる側面（ジオメトリ、マテリアル、ライティング、カメラ）を、管理しやすく再利用可能な単位に自然に分けます。
+
+3. *業界標準*: モダンなレンダリングエンジンやグラフィックスフレームワークの多くは、柔軟性・保守性・パフォーマンスのバランスが良いため、コンポーネントベースのアプローチを採用しています。
+
+4. *拡張性*: グラフィックス技術は急速に進化するため、コンポーネントシステムは新しい Vulkan 機能やレンダリング技法の取り込みを容易にします。
+
+5. *データ指向最適化との両立*: コンポーネントベースのアプローチを使いながらも、パフォーマンスが重要なレンダリングパスでは、コンポーネント内でデータ指向設計の原則を適用できます。
+
+他のアーキテクチャパターンにも利点はありますが、コンポーネントベースアーキテクチャは、モダンで柔軟なレンダリングエンジンの最良の基盤を提供します。とはいえ、適切な場面では他のパターンの側面も取り入れます——全体構造にはレイヤードアーキテクチャ、パフォーマンスが重要なシステムにはデータ指向設計、横断的関心事にはサービスロケーターを用います。
+
+=== まとめ
+
+一般的なアーキテクチャパターンを簡潔に概観し、本チュートリアル全体で用いるコンポーネントベースアーキテクチャに焦点を当てました。他のアーキテクチャパターンの詳細（実装例や比較分析を含む）は、xref:Building_a_Simple_Engine/Appendix/appendix.adoc[付録: 詳細なアーキテクチャパターン] を参照してください。
+
+次の節では、コンポーネントシステムと、エンジンでの効果的な実装方法をより深く掘り下げます。
+
+xref:Building_a_Simple_Engine/Engine_Architecture/01_introduction.adoc[前へ: はじめに] | xref:Building_a_Simple_Engine/Engine_Architecture/03_component_systems.adoc[次へ: コンポーネントシステム]

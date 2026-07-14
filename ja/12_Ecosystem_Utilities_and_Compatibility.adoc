@@ -1,0 +1,550 @@
+:pp: {plus}{plus}
+
+= エコシステムユーティリティと GPU 互換性
+
+== はじめに
+
+この章では、Vulkan 開発のための重要なエコシステムユーティリティを探り、より広い範囲の GPU をサポートするためにコードをどう適応させるかを学びます。Vulkan が新しいバージョンと機能で進化し続ける中で、次のことを理解することが重要です。
+
+1. 異なる GPU がどの機能をサポートしているかを調べる
+2. 古いハードウェアとの互換性を維持するようコードを変更する
+3. 利用可能なときに高度な機能を条件付きで使う
+
+この知識は、最新のハイエンド GPU から古い、またはより制限されたデバイスまで、多様なハードウェアで動く Vulkan アプリケーションを開発するために不可欠です。
+
+== Vulkan Hardware Database（GPUInfo.org）
+
+=== GPUInfo.org の紹介
+
+link:https://vulkan.gpuinfo.org/[Vulkan Hardware Database]（GPUInfo.org）は、Vulkan 開発者にとって非常に貴重なリソースです。このコミュニティ主導のデータベースは、幅広い GPU とデバイスにわたる Vulkan サポートの情報を収集・提示します。
+
+GPUInfo.org は次の詳細情報を提供します。
+
+* サポートされている Vulkan バージョン
+* 利用可能な拡張
+* 機能サポート
+* 実装の制限
+* フォーマットプロパティ
+* キューファミリプロパティ
+
+この情報は、Vulkan Hardware Capability Viewer ツールを実行して GPU の能力をデータベースに報告するユーザーからクラウドソースされています。
+
+=== 開発での GPUInfo.org の使い方
+
+Vulkan アプリケーションを開発するとき、GPUInfo.org は次の助けになります。
+
+1. *最小要件の決定*: 希望するハードウェア範囲をサポートするために、どの Vulkan バージョンと拡張をターゲットにすべきかを理解する。
+
+2. *機能の可用性の確認*: ダイナミックレンダリング、タイムラインセマフォ、レイトレーシングなどの特定機能が広くサポートされているかを検証する。
+
+3. *実装の制限の把握*: さまざまなハードウェアにわたる各種 Vulkan 機能の実用的な制限を発見する。
+
+4. *ベンダーとデバイスの比較*: NVIDIA、AMD、Intel、モバイル GPU ベンダー間の Vulkan サポートの違いを理解する。
+
+GPUInfo.org の実用的な使用例をいくつか見てみましょう。
+
+==== 例: Vulkan バージョンサポートの確認
+
+ダイナミックレンダリングを導入した Vulkan 1.3 がどれだけ広くサポートされているかを調べるには:
+
+1. link:https://vulkan.gpuinfo.org/[GPUInfo.org] を開く
+2. 「Core Version Support」へ移動する
+3. Vulkan 1.3 をサポートするデバイスの割合を確認する
+
+新しい GPU は Vulkan 1.3+ をサポートする一方で、Vulkan 1.0、1.1、または 1.2 に限られたデバイスがまだ多くあることが分かるでしょう。
+
+==== 例: 拡張サポートの確認
+
+特定の拡張の使用を検討している場合:
+
+1. 「Extensions」セクションを開く
+2. 関心のある拡張を検索する
+3. ベンダーごとのサポート割合を確認する
+
+これにより、拡張を必須にするか、フォールバックパスを用意するかを判断できます。
+
+==== 例: Vulkan Configurator ツールの使い方
+
+Vulkan Configurator ツール（全プラットフォームで実行ファイル名は `vkconfig`）は Vulkan SDK に含まれ、システム上の Vulkan 設定を便利に構成する方法を提供します。使い方は次のとおりです。
+
+1. *Vulkan Configurator を起動する*:
+   - Windows: Start メニューから「Vulkan Configurator」を起動することを推奨します。コマンドラインから `vkconfig.exe` を実行すると限られたオプションしか表示されないためです
+   - 他のプラットフォーム: ターミナルを開き `vkconfig` を実行する
+
+   実行ファイルは全プラットフォームで `vkconfig` と呼ばれます。
+
+2. *バリデーションレイヤを構成する*:
+   - 「Layers」タブへ移動する
+   - デバッグの必要に応じて特定のバリデーションレイヤを有効／無効にする
+   - たとえば、開発中は API 使用エラーを捕捉するために `VK_LAYER_KHRONOS_validation` を有効にする
+
+3. *環境変数を管理する*:
+   - 「Settings」タブへ行く
+   - `VK_LAYER_PATH` や `VK_ICD_FILENAMES` などの環境変数を設定する
+   - これらの設定はシステム全体または現在のセッションに適用できる
+
+4. *ドライバ固有のオプションを構成する*:
+   - 一部の GPU ベンダーは追加の構成オプションを提供する
+   - これらはベンダー固有のタブからアクセスできる
+
+5. *構成をエクスポートする*:
+   - 後で使うため、またはチームメンバーと共有するために構成を保存する
+   - これにより開発マシン間で一貫した Vulkan 環境を確保できる
+
+Vulkan Configurator の利用が特に役立つのは次の場合です。
+- 異なるバリデーションレイヤ構成で Vulkan アプリケーションをデバッグする
+- コードを変更せずに異なる Vulkan 設定でアプリケーションをテストする
+- 特定の Vulkan 要件を持つ開発環境をセットアップする
+
+==== コードの代わりにバリデーションレイヤへ Vulkan Configurator を使う
+
+多くの Vulkan アプリケーションでは、インスタンス作成時にプログラムでバリデーションレイヤを有効にし、通常はデバッグビルドでのみ行います。一般的なやり方は次のとおりです。
+
+[,c++]
+----
+// Define validation layers
+const std::vector<char const*> validationLayers = {
+    "VK_LAYER_KHRONOS_validation"
+};
+
+// Enable only in debug builds
+#ifdef NDEBUG
+constexpr bool enableValidationLayers = false;
+#else
+constexpr bool enableValidationLayers = true;
+#endif
+
+void createInstance() {
+    // Check if validation layers are available
+    if (enableValidationLayers && !checkValidationLayerSupport()) {
+        throw std::runtime_error("validation layers requested, but not available!");
+    }
+
+    // Application info...
+
+    // Enable validation layers if in debug mode
+    std::vector<char const *> enabledLayers;
+    if (enableValidationLayers) {
+        enabledLayers.assign(validationLayers.begin(), validationLayers.end());
+    }
+
+    // Create instance with validation layers
+    vk::InstanceCreateInfo createInfo{
+        .pApplicationInfo        = &appInfo,
+        .enabledLayerCount       = static_cast<uint32_t>(enabledLayers.size()),
+        .ppEnabledLayerNames     = enabledLayers.data(),
+        // ... other parameters
+    };
+
+    instance = vk::raii::Instance(context, createInfo);
+}
+----
+
+このアプローチは動作しますが、いくつかの欠点があります。
+
+1. バリデーションの有効／無効のためにコードの変更と再コンパイルが必要
+2. 異なるバリデーションレイヤ構成を試すのが難しい
+3. コードベースに複雑さが加わる
+
+より良いアプローチは、Vulkan Configurator を使ってバリデーションレイヤを外部で管理することです。これを活かすためのコード変更は次のとおりです。
+
+[,c++]
+----
+void createInstance() {
+    // Application info...
+
+    // Create instance without explicitly enabling validation layers
+    vk::InstanceCreateInfo createInfo{
+        .pApplicationInfo        = &appInfo,
+        // ... other parameters
+    };
+
+    instance = vk::raii::Instance(context, createInfo);
+}
+----
+
+このアプローチでは:
+
+1. アプリケーションからバリデーションレイヤ固有のコードをすべて削除する
+2. 必要なときに Vulkan Configurator でバリデーションレイヤを有効にする
+3. 再コンパイルなしでバリデーション構成を切り替えられる
+
+Vulkan Configurator でバリデーションレイヤを有効にするには:
+
+1. Vulkan Configurator を起動する（Windows では Start メニューから、またはターミナルで `vkconfig` を実行 — 実行ファイルは全プラットフォームで `vkconfig`）
+2. 「Layers」タブへ行く
+3. `VK_LAYER_KHRONOS_validation` レイヤを有効にする
+4. 設定を適用する
+
+この構成はその環境で実行されるすべての Vulkan アプリケーションに適用され、コード変更なしでバリデーションのオン／オフを簡単に切り替えられます。
+
+このアプローチの利点には次があります。
+
+* *よりきれいなコード*: アプリケーションコードがバリデーションレイヤを扱う必要がない
+* *柔軟性*: 再コンパイルなしでバリデーション設定を変更できる
+* *一貫性*: 複数のアプリケーションに同じバリデーション設定を適用できる
+* *実験*: 異なるバリデーション構成を簡単に試せる
+
+=== その他の有用なエコシステムツール
+
+GPUInfo.org のほかにも、Vulkan アプリケーションの開発とデバッグに役立つツールがいくつかあります。
+
+* *Vulkan SDK ツール*:
+** `vulkaninfo`: ローカルシステムの Vulkan 能力を表示する
+** `vkconfig`（Vulkan Configurator）: Vulkan 設定を管理する構成ツール（詳細は <<Example: Using the Vulkan Configurator Tool>> を参照）
+** バリデーションレイヤ: API 使用エラーの特定を助ける
+** RenderDoc: グラフィックスデバッグツール
+
+* *ベンダー固有ツール*:
+** NVIDIA Nsight Graphics
+** AMD Radeon GPU Profiler
+
+== 古い GPU のサポート
+
+GPU の能力を調べる方法が分かったので、ダイナミックレンダリングのような Vulkan 1.3/1.4 機能を持たない古い GPU をサポートするためにコードをどう変更するかを探りましょう。
+
+=== 利用可能な機能の検出
+
+最初のステップは、ユーザーの GPU でどの機能が利用可能かを検出することです。これはデバイス作成時に行います。
+
+[,c++]
+----
+// Check if dynamic rendering is supported
+bool dynamicRenderingSupported = false;
+
+// Check for Vulkan 1.3 support
+if (deviceProperties.apiVersion >= VK_API_VERSION_1_3) {
+    dynamicRenderingSupported = true;
+} else {
+    // Check for the extension on older Vulkan versions
+    for (const auto& extension : availableExtensions) {
+        if (strcmp(extension.extensionName, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) == 0) {
+            dynamicRenderingSupported = true;
+            break;
+        }
+    }
+}
+
+// Store this information for later use
+appInfo.dynamicRenderingSupported = dynamicRenderingSupported;
+----
+
+=== ダイナミックレンダリングの代替: 伝統的なレンダーパス
+
+ダイナミックレンダリングが利用できない場合は、伝統的なレンダーパスとフレームバッファを使う必要があります。この代替アプローチの実装方法は次のとおりです。
+
+==== レンダーパスの作成
+
+[,c++]
+----
+void createRenderPass() {
+    if (appInfo.dynamicRenderingSupported) {
+        // No render pass needed with dynamic rendering
+        return;
+    }
+
+    // Color attachment description
+    vk::AttachmentDescription colorAttachment{
+        .format = swapChainImageFormat,
+        .samples = vk::SampleCountFlagBits::e1,
+        .loadOp = vk::AttachmentLoadOp::eClear,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+        .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+        .initialLayout = vk::ImageLayout::eUndefined,
+        .finalLayout = vk::ImageLayout::ePresentSrcKHR
+    };
+
+    // Subpass reference to the color attachment
+    vk::AttachmentReference colorAttachmentRef{
+        .attachment = 0,
+        .layout = vk::ImageLayout::eColorAttachmentOptimal
+    };
+
+    // Subpass description
+    vk::SubpassDescription subpass{
+        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &colorAttachmentRef
+    };
+
+    // Dependency to ensure proper image layout transitions
+    vk::SubpassDependency dependency{
+        .srcSubpass = VK_SUBPASS_EXTERNAL,
+        .dstSubpass = 0,
+        .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        .dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        .srcAccessMask = vk::AccessFlagBits::eNone,
+        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite
+    };
+
+    // Create the render pass
+    vk::RenderPassCreateInfo renderPassInfo{
+        .attachmentCount = 1,
+        .pAttachments = &colorAttachment,
+        .subpassCount = 1,
+        .pSubpasses = &subpass,
+        .dependencyCount = 1,
+        .pDependencies = &dependency
+    };
+
+    renderPass = device.createRenderPass(renderPassInfo);
+}
+----
+
+==== フレームバッファの作成
+
+[,c++]
+----
+void createFramebuffers() {
+    if (appInfo.dynamicRenderingSupported) {
+        // No framebuffers needed with dynamic rendering
+        return;
+    }
+
+    swapChainFramebuffers.resize(swapChainImageViews.size());
+
+    for (size_t i = 0; i < swapChainImageViews.size(); i++) {
+        vk::ImageView attachments[] = {
+            swapChainImageViews[i]
+        };
+
+        vk::FramebufferCreateInfo framebufferInfo{
+            .renderPass = renderPass,
+            .attachmentCount = 1,
+            .pAttachments = attachments,
+            .width = swapChainExtent.width,
+            .height = swapChainExtent.height,
+            .layers = 1
+        };
+
+        swapChainFramebuffers[i] = device.createFramebuffer(framebufferInfo);
+    }
+}
+----
+
+==== パイプライン作成の変更
+
+グラフィックスパイプラインを作成するとき、ダイナミックレンダリングが利用できない場合はレンダーパスを指定する必要があります。
+
+[,c++]
+----
+void createGraphicsPipeline() {
+    // ... existing shader stage and fixed function setup ...
+
+    vk::GraphicsPipelineCreateInfo pipelineInfo{};
+
+    if (appInfo.dynamicRenderingSupported) {
+        // Use dynamic rendering
+        vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
+            .colorAttachmentCount = 1,
+            .pColorAttachmentFormats = &swapChainImageFormat
+        };
+
+        pipelineInfo.pNext = &pipelineRenderingCreateInfo;
+        pipelineInfo.renderPass = nullptr;
+    } else {
+        // Use traditional render pass
+        pipelineInfo.pNext = nullptr;
+        pipelineInfo.renderPass = renderPass;
+        pipelineInfo.subpass = 0;
+    }
+
+    // ... rest of pipeline creation ...
+}
+----
+
+==== コマンドバッファ記録の適応
+
+最後に、コマンドバッファの記録方法を変更する必要があります。
+
+[,c++]
+----
+void recordCommandBuffer(vk::CommandBuffer commandBuffer, uint32_t imageIndex) {
+    // ... begin command buffer ...
+
+    if (appInfo.dynamicRenderingSupported) {
+        // Begin dynamic rendering
+        vk::RenderingAttachmentInfo colorAttachment{
+            .imageView = swapChainImageViews[imageIndex],
+            .imageLayout = vk::ImageLayout::eAttachmentOptimal,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .clearValue = clearColor
+        };
+
+        vk::RenderingInfo renderingInfo{
+            .renderArea = {{0, 0}, swapChainExtent},
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colorAttachment
+        };
+
+        commandBuffer.beginRendering(renderingInfo);
+    } else {
+        // Begin traditional render pass
+        vk::RenderPassBeginInfo renderPassInfo{
+            .renderPass = renderPass,
+            .framebuffer = swapChainFramebuffers[imageIndex],
+            .renderArea = {{0, 0}, swapChainExtent},
+            .clearValueCount = 1,
+            .pClearValues = &clearColor
+        };
+
+        commandBuffer.beginRenderPass(renderPassInfo, vk::SubpassContents::eInline);
+    }
+
+    // ... bind pipeline and draw ...
+
+    if (appInfo.dynamicRenderingSupported) {
+        commandBuffer.endRendering();
+    } else {
+        commandBuffer.endRenderPass();
+    }
+
+    // ... end command buffer ...
+}
+----
+
+=== その他の Vulkan 1.3/1.4 機能の扱い
+
+ダイナミックレンダリングは、古い GPU で利用できないかもしれない機能の一例にすぎません。代替を用意する必要があるかもしれない他の Vulkan 1.3/1.4 機能には次があります。
+
+==== タイムラインセマフォ
+
+タイムラインセマフォ（Vulkan 1.2 で導入）は、バイナリセマフォより柔軟な同期メカニズムを提供します。利用できない場合は、バイナリセマフォとフェンスを使う必要があります。
+
+[,c++]
+----
+bool timelineSemaphoresSupported = false;
+
+// Check for Vulkan 1.2 support or extension
+if (deviceProperties.apiVersion >= VK_API_VERSION_1_2) {
+    timelineSemaphoresSupported = true;
+} else {
+    // Check for extension
+    for (const auto& extension : availableExtensions) {
+        if (strcmp(extension.extensionName, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) == 0) {
+            timelineSemaphoresSupported = true;
+            break;
+        }
+    }
+}
+
+// Create appropriate synchronization primitives
+if (timelineSemaphoresSupported) {
+    // Create timeline semaphore
+    vk::SemaphoreTypeCreateInfo timelineCreateInfo{
+        .semaphoreType = vk::SemaphoreType::eTimeline,
+        .initialValue = 0
+    };
+
+    vk::SemaphoreCreateInfo semaphoreInfo{
+        .pNext = &timelineCreateInfo
+    };
+
+    timelineSemaphore = device.createSemaphore(semaphoreInfo);
+} else {
+    // Create binary semaphores and fences
+    vk::SemaphoreCreateInfo semaphoreInfo{};
+    vk::FenceCreateInfo fenceInfo{.flags = vk::FenceCreateFlagBits::eSignaled};
+
+    for (size_t i = 0; i < swapChainImages.size(); i++)
+    {
+        renderFinishedSemaphores[i] = device.createSemaphore(semaphoreInfo);
+    }
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+    {
+        imageAvailableSemaphores[i] = device.createSemaphore(semaphoreInfo);
+        inFlightFences[i] = device.createFence(fenceInfo);
+    }
+}
+----
+
+==== Synchronization2
+
+Synchronization2 機能（Vulkan 1.3）は、パイプラインバリアとメモリ依存関係を単純化します。利用できない場合は、元の同期コマンドを使います。
+
+[,c++]
+----
+bool synchronization2Supported = false;
+
+// Check for Vulkan 1.3 support or extension
+if (deviceProperties.apiVersion >= VK_API_VERSION_1_3) {
+    synchronization2Supported = true;
+} else {
+    // Check for extension
+    for (const auto& extension : availableExtensions) {
+        if (strcmp(extension.extensionName, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) == 0) {
+            synchronization2Supported = true;
+            break;
+        }
+    }
+}
+
+// Use appropriate barrier commands
+if (synchronization2Supported) {
+    // Use Synchronization2 API
+    vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eAttachmentOptimal,
+        .image = swapChainImages[i],
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+    };
+
+    vk::DependencyInfo dependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier
+    };
+
+    commandBuffer.pipelineBarrier2(dependencyInfo);
+} else {
+    // Use original synchronization API
+    vk::ImageMemoryBarrier barrier{
+        .srcAccessMask = vk::AccessFlagBits::eNone,
+        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = swapChainImages[i],
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+    };
+
+    commandBuffer.pipelineBarrier(
+        vk::PipelineStageFlagBits::eTopOfPipe,
+        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::DependencyFlagBits::eByRegion,
+        {},
+        {},
+        { barrier }
+    );
+}
+----
+
+== クロス GPU 互換性のためのベストプラクティス
+
+学んだことに基づき、幅広い GPU で動く Vulkan アプリケーションを開発するためのベストプラクティスは次のとおりです。
+
+1. *実行時に機能の可用性を確認する*: Vulkan バージョンだけに基づいて機能が利用可能だと仮定しない。常に特定の機能と拡張を確認する。
+
+2. *フォールバックパスを用意する*: モダンな機能が利用できないときの代替コードパスを実装する。
+
+3. *機能構造体を使う*: 論理デバイスを作成するとき、必要な機能のうち利用可能なものだけを有効にする適切な機能構造体を使う。
+
+4. *さまざまなハードウェアでテストする*: GPUInfo.org を使って一般的なハードウェア構成を特定し、代表的なサンプルでアプリケーションをテストする。
+
+5. *優雅な劣化*: 能力の低いハードウェアで動くときに、視覚品質や機能を優雅に下げられるようアプリケーションを設計する。
+
+6. *要件を文書化する*: アプリケーションの最小および推奨 Vulkan バージョンと拡張要件を明確に文書化する。
+
+== まとめ
+
+Vulkan エコシステムのユーティリティを理解し、異なる GPU 能力に合わせてコードを適応させる方法を知ることは、Vulkan 開発者にとって不可欠なスキルです。この章で概説したアプローチに従うことで、幅広いハードウェアで動きつつ、利用可能なときは最新機能を活かすアプリケーションを作れます。
+
+link:/attachments/32_ecosystem_utilities.cpp[C{pp} コード]

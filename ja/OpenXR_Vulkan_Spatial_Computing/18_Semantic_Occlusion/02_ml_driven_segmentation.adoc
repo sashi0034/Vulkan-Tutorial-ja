@@ -1,0 +1,71 @@
+:pp: {plus}{plus}
+= ML 駆動セグメンテーション
+
+セマンティックセグメンテーションは、カメラフィードの各ピクセルにカテゴリをラベル付けし、仮想と物理のコンテンツを現実的にブレンドするために必要なピクセル完全な理解を提供します。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+OpenXR は基本的な環境ブレンディングを提供しますが、標準はピクセル完全なセマンティックラベルやエッジ洗練を管理しません。Vulkan のコンピュートシェーダーとサブグループ演算を使い、標準 OpenXR アルファブレンディングモデルがネイティブに管理しない高度な時間的エッジ洗練とオクルージョンロジックを実装します。
+
+== 概念: ピクセル単位の理解
+
+セマンティックセグメンテーションは、カメラフィードの各ピクセルにカテゴリをラベル付けします（例: 背景は 0、テーブルは 1、人間の手は 2）。これによりシーンのピクセル完全な理解が得られ、エンジンが知的なブレンディング決定を下せます。
+
+ランタイムはカメラフィードからこれらのマスクを生成し、引き継ぎ前にユーザーの最新頭ポーズに合わせてマスクを「ワープ」することでレイテンシ補償を行うことがよくあります。
+
+== オクルージョンマスクの実装
+
+Vulkan エンジンでは、ML 出力を **オクルージョンマスク** テクスチャとして扱います。指定初期化子を使い、合成パスでこのマスクをバインドします。
+
+[source,cpp]
+----
+// Binding the semantic mask using designated initializers
+vk::DescriptorImageInfo maskInfo{
+    .sampler = *pointSampler,
+    .imageView = *semanticMaskView,
+    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+};
+
+vk::WriteDescriptorSet maskWrite{
+    .dstSet = *compositeSet,
+    .dstBinding = 1,
+    .descriptorCount = 1,
+    .descriptorType = vk::DescriptorType::eSampledImage,
+    .pImageInfo = &maskInfo
+};
+----
+
+Slang では、ラベルを使い仮想ピクセルの可視性をゲートします。
+
+[source,slang]
+----
+// A Slang fragment shader utilizing a semantic mask for occlusion
+[shader("pixel")]
+float4 fragmentMain(V2P input) : SV_Target {
+    float4 virtualColor = sceneTexture.Sample(input.uv);
+    uint label = semanticMask.Sample(input.uv).r;
+
+    // If the pixel is labeled as "Hand", we hide the virtual object
+    if (label == SEMANTIC_LABEL_HAND) {
+        return float4(0, 0, 0, 0); // Transparent output
+    }
+    return virtualColor;
+}
+----
+
+== 発展: 時間的エッジ洗練とアトミック深度
+
+Vulkan は、標準マスクフィードを超える合成品質を可能にします。
+
+*   **時間的エッジ洗練**: Vulkan の **Subgroup Operations** を使い、複数フレームにわたるセグメンテーションマスクを分析し、ノイズの多いエッジを滑らかなアルファチャネルへ「洗練」し、生 OpenXR フィードより高い品質を提供できる。
+*   **深度認識セマンティック合成**: Vulkan の **Atomic Operations** を使い、OpenXR ラベルとエンジンの深度データを組み合わせ、標準 OpenXR アルファブレンディングモデルがネイティブに協調しない複雑な重なりを解決できる。
+
+== 現実の深度バッファ
+
+セマンティックラベルは物体が *何か* を教えてくれますが、**LiDAR** データと組み合わせると **深度認識セマンティックオクルージョン** が可能になります。仮想ロボットは実在の椅子の後ろに隠れつつ、より奥の実在の壁の前に現れられます。オン GPU 推論を利用することで、最小レイテンシでこれらのマスクを生成し、仮想世界が物理的な動きに瞬時に応答することを保証します。
+
+TIP: セマンティックセグメンテーションと画像ブレンディングの詳細については、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#XR_FB_semantic_labels[XR_FB_semantic_labels Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/18_Semantic_Occlusion/01_introduction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/18_Semantic_Occlusion/03_per_pixel_masking.adoc[Next]

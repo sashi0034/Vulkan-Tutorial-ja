@@ -1,0 +1,78 @@
+:pp: {plus}{plus}
+
+= Visual Studio: Windows ネイティブ開発
+
+== はじめに: 診断ハブ
+
+多くのグラフィックスエンジニアにとって、Visual Studio（MSVS）はワークフローの中心ツールです。Microsoft C{pp} コンパイラ（MSVC）との密接な統合と高度なデバッガにより、Windows ベースの Vulkan 開発でよく選ばれます。
+
+しかし「伝統的」な Visual Studio セットアップは、急速に進化する AI 風景に適応が遅い重量級環境のように感じることがあります。**協調エンジニアリング** を真にマスターするには、Visual Studio を受動的エディタから **能動的診断ハブ** へ変えなければなりません。
+
+== コア概念: 「Debug-to-Chat」パイプライン
+
+Visual Studio の最も独自な利点は **深いデバッグコンテキスト** です。他エディタがクラッシュをコンソールの単純な一行テキストとして扱うのに対し、Visual Studio は実行状態全体を「所有」します。AI 強化ワークフローでは、この状態を高推論モデルに直接つなぎます。
+
+例えば、無効なオフセットで `VUID-VkBufferMemoryBarrier-buffer-01191` エラーに当たったとします。通常のワークフローでは一時停止し、「Locals」ウィンドウで `VkBufferMemoryBarrier` 構造体を見て、バッファサイズに対してオフセットを手動確認します。**Copilot Chat** 統合では、エラーを「読む」だけではありません。ハイライトして尋ねます。*「現在の `stagingBuffer` に対してなぜこのオフセットは無効か？」* AI は推測するだけではありません。MSVC デバッガの状態から `stagingBuffer.size` と `barrier.offset` のランタイム値を直接「見ます」。そしてアラインメント論理が物理デバイスから `minStorageBufferOffsetAlignment` を照会する代わりに 16 バイト定数を使っていることを特定します。
+
+== チュートリアル: Windows 診断ハブのセットアップ
+
+Visual Studio を受動的エディタから能動的診断ツールへ変えるには、デバッガとプロジェクトコンテキストを AI アシスタントにリンクする次の手順に従ってください。
+
+=== ステップ 1: ソリューション認識計画（Copilot）
+**GitHub Copilot** がインストールされ、`.sln` の初期インデックスが完了していることを確認します。次にアーキテクチャタスクに `@workspace` コマンドを使います。
+
+[source,text]
+----
+@workspace Create a new 'DescriptorBufferHandler' class.
+It must follow the naming conventions in 'DescriptorManager.cpp'
+and implement the 'VK_EXT_descriptor_buffer' extension.
+----
+
+=== ステップ 2: Debug-to-Chat（ライブ修正）
+Vulkan エラーやバリデーション VUID でアプリがクラッシュしたら、デバッガをアクティブのまま **Copilot Chat** ウィンドウを使います。
+
+[source,text]
+----
+# Copy the VUID from the 'Output' window and ask:
+Why is this VUID-VkBufferMemoryBarrier-buffer-01191 occurring
+for our 'stagingBuffer'? Check the 'Locals' window for
+the current offset and buffer size.
+----
+
+=== ステップ 3: ローカルプライベートスペシャリスト（Continue）
+プライバシーに敏感なレンダリング論理向けに、**Continue** 拡張をローカル **Qwen 3-Coder** モデルと **Vulkan MCP** を使うよう設定します。これは xref:AI_Assisted_Vulkan/02_environment_setup/01_introduction.adoc#_first_step_building_the_vulkan_mcp_server[環境セットアップのはじめに] で説明したとおり、すでに `mcp-Vulkan` サーバをビルド済みであることを前提とします。
+
+[source,json]
+----
+{
+  "mcpServers": [
+    {
+      "name": "Vulkan-Registry",
+      "command": "node",
+      "args": ["/path/to/mcp-Vulkan/vulkan/build/index.js"]
+    }
+  ]
+}
+----
+
+== 欠点と段階的な勝利
+
+=== 「重い IDE」パフォーマンス税
+Visual Studio はリソース集約的なアプリケーションです。複数の AI 拡張とインデックス処理を追加すると、特に RAM 32GB 未満のシステムで目立つ UI ラグにつながり得ます。大きなソリューションを開いた後「Indexing Workspace」アイコンが数分回ることがあります。緩和するには、**IntelliCode** のようなレガシー機能を無効化し、Copilot やローカル SLM のようなより現代的な高推論ツールへリソースを空けてください。
+
+=== 段階的な勝利: 意図としてのボイラープレート
+最大の「生活の質」改善は、ボイラープレートを **意図** として扱うことです。20 行の `VkGraphicsPipelineCreateInfo` を打つ代わりに、単一コメントを書きます。`// Create a graphics pipeline state for a wireframe overlay with no culling.` AI は既存のパイプライン作成関数を見て、エンジンの正しいデフォルト（例: 特定の `VkRenderPass` ハンドル）で構造を埋めます。これは「タイピング」を「レビュー」に変え、協調エンジニアリング転換の核心です。
+
+=== 「共通地点」への到達
+
+本チュートリアルの残りに必要な **共通地点** に到達するには、Visual Studio 環境を **ハイブリッドモデル戦略** で設定すべきです。これには `.sln` 内の高レベルアーキテクチャタスクとクロスファイル計画向けの **GitHub Copilot** のようなソリューション認識モデル、およびコスト効率の良い反復とプライバシー敏感なコード生成向けの **Continue** 拡張経由のローカルスペシャリストが含まれます。
+
+これらが IDE（Copilot と Continue 経由）にリンクされたら、AI 支援開発の「ベースキャンプ」に到達しています。環境を完成させるには、次に xref:AI_Assisted_Vulkan/02_environment_setup/05_goose_native_agent.adoc[Goose とローカル知能] へ進み、自律エージェントとローカル推論エンジンをセットアップしてください。
+
+== まとめ: Windows プロフェッショナル
+
+AI 強化 Visual Studio 環境は単なるコード生成器ではなく、**診断ハブ** です。IDE の包括的デバッグツールをクラウドベース推論モデルとローカル特化モデルの両方と橋渡しすることで、AI が Vulkan コードを書くだけでなく、あらゆるビットマスクとメモリバリアの深い「なぜ」を理解する手助けをするワークフローを作ります。
+
+次は **goose native agent** 体験へジャンプします。他環境のイメージを得るには、xref:AI_Assisted_Vulkan/02_environment_setup/04_xcode_apple.adoc[Xcode & Apple Silicon] 向けの **Native-First Hybrid** 戦略も見てみるとよいでしょう。
+
+xref:AI_Assisted_Vulkan/02_environment_setup/01_introduction.adoc[前へ: 環境のはじめに] | xref:AI_Assisted_Vulkan/02_environment_setup/05_goose_native_agent.adoc[次へ: Goose Native Agent]

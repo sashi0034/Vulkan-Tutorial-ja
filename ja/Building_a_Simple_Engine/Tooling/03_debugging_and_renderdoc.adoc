@@ -1,0 +1,363 @@
+:pp: {plus}{plus}
+
+= ツール: VK_KHR_debug_utils と RenderDoc を使用したデバッグ
+
+== Vulkan アプリケーションのデバッグ
+
+グラフィックス アプリケーションのデバッグは、複雑で並列的な性質があり、処理の多くが GPU で行われるため、困難になる場合があります。 Vulkan は明示的な設計により、アプリケーションの問題の特定と修正に役立つ強力なデバッグ ツールを提供します。このセクションでは、Vulkan アプリケーションをデバッグするための 2 つの主要なアプローチを検討します。
+
+1. アプリケーション内デバッグのための VK_KHR_debug_utils 拡張機能の使用
+2. フレームのキャプチャと分析に RenderDoc などの外部ツールを使用する
+
+=== VK_KHR_debug_utils の使用
+
+VK_KHR_debug_utils 拡張機能は、Vulkan アプリケーションをデバッグするための包括的なツール セットを提供します。これにより、次のことが可能になります。
+
+* オブジェクトに意味のある名前を付ける
+* コマンドバッファ領域の先頭と末尾をマークします。
+* デバッグマーカーを挿入する
+* 検証層メッセージを受信するようにデバッグ メッセンジャーを設定する
+
+これらの機能を C++20 モジュールと vk::raii で使用する方法を見てみましょう。
+
+==== デバッグメッセージングのセットアップ
+
+まず、検証層メッセージを受信するようにデバッグ メッセンジャーをセットアップしましょう。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+// Debug callback function
+VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
+    VkDebugUtilsMessageTypeFlagsEXT message_type,
+    const VkDebugUtilsMessengerCallbackDataEXT* callback_data,
+    void* user_data) {
+
+    // Convert severity to string
+    std::string severity;
+    if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT) {
+        severity = "VERBOSE";
+    } else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
+        severity = "INFO";
+    } else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        severity = "WARNING";
+    } else if (message_severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        severity = "ERROR";
+    }
+
+    // Convert type to string
+    std::string type;
+    if (message_type & VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT) {
+        type = "GENERAL";
+    } else if (message_type & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) {
+        type = "VALIDATION";
+    } else if (message_type & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) {
+        type = "PERFORMANCE";
+    }
+
+    // Log the message
+    std::cerr << "[" << severity << ": " << type << "] "
+              << callback_data->pMessage << std::endl;
+
+    // Return false to indicate the Vulkan call should not be aborted
+    return VK_FALSE;
+}
+
+// Create a debug messenger using vk::raii
+vk::raii::DebugUtilsMessengerEXT create_debug_messenger(vk::raii::Instance& instance) {
+    vk::DebugUtilsMessengerCreateInfoEXT create_info{};
+    create_info.setMessageSeverity(
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::eError
+    );
+    create_info.setMessageType(
+        vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+        vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+        vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance
+    );
+    create_info.setPfnUserCallback(debug_callback);
+
+    return vk::raii::DebugUtilsMessengerEXT(instance, create_info);
+}
+----
+
+==== オブジェクトの命名
+
+VK_KHR_debug_utils の最も便利な機能の 1 つは、Vulkan オブジェクトに意味のある名前を付ける機能です。これにより、検証レイヤー メッセージや RenderDoc などのツールでオブジェクトを識別できるため、デバッグがはるかに簡単になります。
+
+[source,cpp]
+----
+// Helper function to set a name on any Vulkan handle
+template<typename T>
+void set_object_name(vk::raii::Device& device, T handle, const std::string& name) {
+    vk::DebugUtilsObjectNameInfoEXT name_info{};
+    name_info.setObjectType(get_object_type<T>());
+    name_info.setObjectHandle(reinterpret_cast<uint64_t>(static_cast<T>(handle)));
+    name_info.setPObjectName(name.c_str());
+
+    device.setDebugUtilsObjectNameEXT(name_info);
+}
+
+// Example usage
+void name_vulkan_objects(vk::raii::Device& device) {
+    // Name the device itself
+    set_object_name(device, *device, "Main Device");
+
+    // Name a buffer
+    vk::BufferCreateInfo buffer_info{};
+    // ... set buffer creation parameters
+    vk::raii::Buffer buffer(device, buffer_info);
+    set_object_name(device, *buffer, "Vertex Buffer");
+
+    // Name a pipeline
+    vk::raii::Pipeline pipeline = create_graphics_pipeline(device);
+    set_object_name(device, *pipeline, "Main Render Pipeline");
+}
+----
+
+==== コマンドバッファのラベル付け
+
+コマンド バッファー実行の領域にラベルを付けることもできます。これは、レンダリング中に問題が発生する場所を特定するのに役立ちます。
+
+[source,cpp]
+----
+void record_command_buffer(vk::raii::CommandBuffer& cmd_buffer) {
+    cmd_buffer.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+    // Begin a labeled region
+    vk::DebugUtilsLabelEXT label_info{};
+    label_info.setPLabelName("Shadow Pass");
+    label_info.setColor(std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}); // Black for shadow pass
+    cmd_buffer.beginDebugUtilsLabelEXT(label_info);
+
+    // Record shadow pass commands
+    // ...
+
+    // End the labeled region
+    cmd_buffer.endDebugUtilsLabelEXT();
+
+    // Begin another labeled region
+    label_info.setPLabelName("Main Render Pass");
+    label_info.setColor(std::array<float, 4>{0.0f, 1.0f, 0.0f, 1.0f}); // Green for main pass
+    cmd_buffer.beginDebugUtilsLabelEXT(label_info);
+
+    // Record main render pass commands
+    // ...
+
+    // Insert a marker within this region
+    cmd_buffer.insertDebugUtilsLabelEXT({
+        "Drawing Opaque Objects",
+        std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}
+    });
+
+    // More rendering commands
+    // ...
+
+    // End the labeled region
+    cmd_buffer.endDebugUtilsLabelEXT();
+
+    cmd_buffer.end();
+}
+----
+
+==== キューのラベル付け
+
+同様に、キューに送信された操作にラベルを付けることができます。
+
+[source,cpp]
+----
+void submit_work(vk::raii::Queue& queue, vk::raii::CommandBuffer& cmd_buffer) {
+    // Begin a labeled region for the queue submission
+    vk::DebugUtilsLabelEXT label_info{};
+    label_info.setPLabelName("Frame Rendering");
+    label_info.setColor(std::array<float, 4>{0.0f, 0.5f, 1.0f, 1.0f}); // Blue for frame
+    queue.beginDebugUtilsLabelEXT(label_info);
+
+    // Submit the command buffer
+    vk::SubmitInfo submit_info{};
+    submit_info.setCommandBufferCount(1);
+    submit_info.setPCommandBuffers(&(*cmd_buffer));
+    queue.submit(submit_info, nullptr);
+
+    // End the labeled region
+    queue.endDebugUtilsLabelEXT();
+}
+----
+
+=== RenderDoc の使用
+
+RenderDoc は、グラフィックス フレーム デバッガーおよびキャプチャ/分析ツールです (コンパイラーではありません)。これにより、アプリケーションからフレームをキャプチャし、詳細に分析できます。 API が包括的にサポートされているため、Vulkan アプリケーションに特に役立ちます。
+
+
+==== RenderDoc をアプリケーションと統合する
+
+アプリケーション内 API を使用して、RenderDoc をアプリケーションに直接統合できます。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+#include <renderdoc_app.h>
+
+// Load the RenderDoc API
+RENDERDOC_API_1_4_1* renderdoc_api = nullptr;
+
+bool load_renderdoc_api() {
+    #if defined(_WIN32)
+    HMODULE renderdoc_module = LoadLibraryA("renderdoc.dll");
+    #else
+    void* renderdoc_module = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+    #endif
+
+    if (!renderdoc_module) {
+        std::cerr << "RenderDoc not loaded in this application" << std::endl;
+        return false;
+    }
+
+    #if defined(_WIN32)
+    pRENDERDOC_GetAPI get_api = (pRENDERDOC_GetAPI)GetProcAddress(renderdoc_module, "RENDERDOC_GetAPI");
+    #else
+    pRENDERDOC_GetAPI get_api = (pRENDERDOC_GetAPI)dlsym(renderdoc_module, "RENDERDOC_GetAPI");
+    #endif
+
+    if (!get_api) {
+        std::cerr << "Failed to get RenderDoc API function" << std::endl;
+        return false;
+    }
+
+    int ret = get_api(eRENDERDOC_API_Version_1_4_1, (void**)&renderdoc_api);
+    if (ret != 1) {
+        std::cerr << "Failed to initialize RenderDoc API" << std::endl;
+        return false;
+    }
+
+    std::cout << "RenderDoc API initialized successfully" << std::endl;
+    return true;
+}
+
+// Trigger a capture
+void capture_frame() {
+    if (renderdoc_api) {
+        renderdoc_api->TriggerCapture();
+    }
+}
+----
+
+==== キャプチャの分析
+
+フレームをキャプチャしたら、RenderDoc アプリケーションで分析できます。注目すべき重要な機能をいくつか示します。
+
+1. *パイプライン状態*: 各描画呼び出しの完全なグラフィックス パイプライン状態を検査します。
+2. *リソース検査*: バッファー、テクスチャー、その他のリソースの内容を表示します。
+3. *シェーダー デバッグ*: 特定のピクセルに対してシェーダーをステップ実行します。
+4. *タイミング情報*: フレームのさまざまな部分のパフォーマンスを分析します。
+
+==== RenderDoc のベスト プラクティス
+
+RenderDoc を最大限に活用するには:
+
+1. *オブジェクト名を使用する*: 前に説明したように、Vulkan オブジェクトに名前を付けると、RenderDoc でオブジェクトを識別しやすくなります (リソース インスペクター ビューとパイプライン状態ビューに表示されます)。
+2. *コマンド バッファ ラベルを使用*: これらは RenderDoc のイベント ブラウザに表示され、関連する描画/ディスパッチにすばやく移動するのに役立ちます。
+3. *問題フレームをキャプチャ*: 問題が発生したときに正確にキャプチャをトリガーし (ホットキーまたはアプリケーション内 API 経由)、無関係なイベントやノイズを最小限に抑えます。
+4. *最小化して再現*: 最小限の再現可能なシーンを作成するか、機能をオフにして問題を切り分けます。解像度を下げる場合は、バグを隠すような方法で順序やタイミングが変更されないように注意してください。
+
+=== VK_KHR_debug_utils と RenderDoc の組み合わせ
+
+本当の威力は、次のアプローチを組み合わせることで生まれます。
+
+1. VK_KHR_debug_utils を使用して豊富なデバッグ情報をアプリケーションに追加します
+2. RenderDoc を使用して、この情報を含むフレームをキャプチャして分析します
+3. 検証レイヤーを使用して API 使用エラーを検出する
+
+これらのアプローチを組み合わせたデバッグ環境のセットアップ例を次に示します。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+class DebugManager {
+public:
+    DebugManager() {
+        // Try to load RenderDoc API
+        load_renderdoc_api();
+    }
+
+    void setup_instance_debugging(vk::raii::Context& context, vk::InstanceCreateInfo& create_info) {
+        // Add validation layers
+        std::vector<const char*> validation_layers = {"VK_LAYER_KHRONOS_validation"};
+        create_info.setPEnabledLayerNames(validation_layers);
+
+        // Add debug utils extension
+        std::vector<const char*> extensions = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+        // Add any existing extensions
+        if (create_info.enabledExtensionCount > 0) {
+            for (uint32_t i = 0; i < create_info.enabledExtensionCount; i++) {
+                extensions.push_back(create_info.ppEnabledExtensionNames[i]);
+            }
+        }
+        create_info.setPEnabledExtensionNames(extensions);
+
+        // Store debug messenger create info for instance creation
+        debug_create_info.setMessageSeverity(
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eError
+        );
+        debug_create_info.setMessageType(
+            vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+            vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+            vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance
+        );
+        debug_create_info.setPfnUserCallback(debug_callback);
+
+        // Add to pNext chain
+        debug_create_info.pNext = create_info.pNext;
+        create_info.pNext = &debug_create_info;
+    }
+
+    void setup_debug_messenger(vk::raii::Instance& instance) {
+        debug_messenger = vk::raii::DebugUtilsMessengerEXT(instance, debug_create_info);
+    }
+
+    template<typename T>
+    void set_name(vk::raii::Device& device, T handle, const std::string& name) {
+        try {
+            vk::DebugUtilsObjectNameInfoEXT name_info{};
+            name_info.setObjectType(get_object_type<T>());
+            name_info.setObjectHandle(reinterpret_cast<uint64_t>(static_cast<T>(handle)));
+            name_info.setPObjectName(name.c_str());
+
+            device.setDebugUtilsObjectNameEXT(name_info);
+        } catch (vk::SystemError& err) {
+            std::cerr << "Failed to set object name: " << err.what() << std::endl;
+        }
+    }
+
+    void capture_next_frame() {
+        if (renderdoc_api) {
+            renderdoc_api->TriggerCapture();
+        }
+    }
+
+private:
+    vk::DebugUtilsMessengerCreateInfoEXT debug_create_info{};
+    vk::raii::DebugUtilsMessengerEXT debug_messenger{nullptr};
+    RENDERDOC_API_1_4_1* renderdoc_api = nullptr;
+};
+----
+
+=== 結論
+
+複雑な Vulkan アプリケーションを開発するには、効果的なデバッグが不可欠です。アプリケーション内デバッグ用の VK_KHR_debug_utils と、フレーム キャプチャと分析用の RenderDoc の機能を組み合わせることで、レンダリングパイプラインの問題を迅速に特定して修正できます。
+
+次のセクションでは、実稼働環境で発生する問題を診断するために重要なクラッシュ処理とミニダンプについて説明します。
+
+xref:Building_a_Simple_Engine/Tooling/02_cicd.adoc[前: Vulkan プロジェクトの CI/CD] | xref:Building_a_Simple_Engine/Tooling/04_crash_minidump.adoc[次へ: クラッシュ処理とミニダンプ]

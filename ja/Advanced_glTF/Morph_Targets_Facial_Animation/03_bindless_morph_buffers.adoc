@@ -1,0 +1,311 @@
+:pp: {plus}{plus}
+= バインドレスモーフバッファとコンピュート統合
+
+== なぜバインドレスか
+
+Vulkan 1.2 のディスクリプタインデックス（Vulkan 1.3 で正式化され、Vulkan 1.4 で完全必須）以前は、シェーダーから GPU バッファの配列にアクセスするには、各バッファを個別にバインドする必要がありました。別々のディスクリプタセットとしても、事前に宣言した固定サイズ配列の要素としてもです。モーフターゲットでは実用的な問題が生じます。非アクティブなものも含めすべてのモーフターゲットバッファをバインドするか、アクティブなセットが変わるたびに毎フレームディスクリプタセットを再構築するか、のどちらかが必要になります。
+
+**ディスクリプタインデックス**（バインドレスレンダリングとも呼ばれる）は、実行中に計算した値でランタイムにディスクリプタ配列をインデックスできることでこれを解決します。シェーダーで大きなディスクリプタ配列を宣言し、読み込み時にすべてのモーフターゲットバッファで埋め、ディスパッチ時に *どのインデックスを読むか*—現在アクティブなモーフターゲットとそのウェイト—のリストを渡します。GPU はディスクリプタインデックス（単なる整数）で正しいバッファハンドルを引き当て、CPU 側の再バインドは不要です。
+
+具体的に必要な Vulkan 機能は `VK_EXT_descriptor_indexing`（Vulkan 1.2 コア）で、`shaderStorageBufferArrayNonUniformIndexing` 機能を有効にすることです。
+
+=== デバイス機能の有効化
+
+バインドレスモーフバッファを使うには、論理デバイス作成時に対応する機能を有効にする必要があります。Vulkan 1.4 ではこれらの機能はコア仕様の一部ですが、`VkPhysicalDeviceFeatures2` チェーンで明示的に要求する必要があります。
+
+[source,cpp]
+----
+// 1. Check for support
+VkPhysicalDeviceDescriptorIndexingFeatures indexing_features {};
+indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+
+VkPhysicalDeviceFeatures2 device_features {};
+device_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+device_features.pNext = &indexing_features;
+
+vkGetPhysicalDeviceFeatures2(physical_device, &device_features);
+
+if (!indexing_features.shaderStorageBufferArrayNonUniformIndexing) {
+    throw std::runtime_error("GPU does not support non-uniform indexing of storage buffers!");
+}
+
+// 2. Enable during device creation
+VkDeviceCreateInfo device_info {};
+device_info.pNext = &device_features; // Includes the requested indexing features
+// ... rest of device creation ...
+----
+
+== ディスクリプタ基盤のセットアップ
+
+ランタイムサイズのストレージバッファディスクリプタ配列を含むディスクリプタセットレイアウトが必要です。Vulkan では `VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT` と `VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT` フラグで宣言します。これらは配列が部分的にしか埋まっていなくてよく、実際に使うエントリだけが有効であればよいことをドライバーに伝えます。
+
+[source,cpp]
+----
+void create_morph_descriptor_set_layout(
+    VkDevice device,
+    uint32_t max_morph_targets, // Upper bound on the total number of morph target buffers
+    VkDescriptorSetLayout& out_layout)
+{
+    // Binding 0: runtime-sized array of storage buffers (one per morph target)
+    VkDescriptorSetLayoutBinding binding {};
+    binding.binding            = 0;
+    binding.descriptorType     = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binding.descriptorCount    = max_morph_targets;
+    binding.stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorBindingFlags flags =
+        VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT |
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT           |
+        VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+
+    VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags {};
+    binding_flags.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+    binding_flags.bindingCount  = 1;
+    binding_flags.pBindingFlags = &flags;
+
+    VkDescriptorSetLayoutCreateInfo layout_info {};
+    layout_info.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layout_info.pNext        = &binding_flags;
+    layout_info.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    layout_info.bindingCount = 1;
+    layout_info.pBindings    = &binding;
+
+    vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &out_layout);
+}
+
+void update_morph_descriptors(
+    VkDevice device,
+    VkDescriptorSet descriptor_set,
+    const std::vector<VkBuffer>& morph_buffers)
+{
+    std::vector<VkDescriptorBufferInfo> buffer_infos;
+    std::vector<VkWriteDescriptorSet> writes;
+
+    for (size_t i = 0; i < morph_buffers.size(); ++i) {
+        VkDescriptorBufferInfo info {};
+        info.buffer = morph_buffers[i];
+        info.offset = 0;
+        info.range  = VK_WHOLE_SIZE;
+        buffer_infos.push_back(info);
+
+        VkWriteDescriptorSet write {};
+        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet          = descriptor_set;
+        write.dstBinding      = 0;
+        write.dstArrayElement = static_cast<uint32_t>(i);
+        write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+        write.pBufferInfo     = &buffer_infos.back();
+        writes.push_back(write);
+    }
+
+    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+----
+
+=== モーフコンピュートパイプラインの作成
+
+拡張コンピュートシェーダーを実行するには、バインドレスディスクリプタセットを含むパイプラインが必要です。パイプラインレイアウトは、セット 1 のバインド 0 のバインドレス配列（`[[vk::binding(0, 1)]]` 宣言に対応）を考慮する必要があります。
+
+[source,cpp]
+----
+void create_morph_pipeline(
+    VkDevice device,
+    VkDescriptorSetLayout base_layout,  // Binding set 0 (input/output vertices, joint matrices)
+    VkDescriptorSetLayout morph_layout, // Binding set 1 (bindless morph buffers)
+    VkShaderModule shader_module,
+    VkPipelineLayout& out_layout,
+    VkPipeline& out_pipeline)
+{
+    // 1. Pipeline Layout
+    std::vector<VkDescriptorSetLayout> layouts = { base_layout, morph_layout };
+
+    VkPushConstantRange push_range {};
+    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_range.offset     = 0;
+    push_range.size       = sizeof(PushConstants);
+
+    VkPipelineLayoutCreateInfo layout_info {};
+    layout_info.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = static_cast<uint32_t>(layouts.size());
+    layout_info.pSetLayouts    = layouts.data();
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges    = &push_range;
+
+    vkCreatePipelineLayout(device, &layout_info, nullptr, &out_layout);
+
+    // 2. Compute Pipeline
+    VkComputePipelineCreateInfo pipeline_info {};
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.layout = out_layout;
+    pipeline_info.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline_info.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_info.stage.module = shader_module;
+    pipeline_info.stage.pName  = "main";
+
+    vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &out_pipeline);
+}
+----
+
+このレイアウトからディスクリプタセットを割り当てる際、必要なディスクリプタ数（`max_morph_targets` より少なくてよい）を指定します。割り当て後、上記のとおり `vkUpdateDescriptorSets` で配列を埋めます。これは読み込み時の一度きりのセットアップです。バッファ自体は変わらず、ブレンドに使うウェイトだけが変わります。
+
+== モーフターゲットアニメーション
+
+ランタイムでモーフウェイトを駆動するには、`weights` パスを持つ glTF アニメーションチャネルを使います。translation（vec3）や rotation（quat）と異なり、モーフウェイトチャネルはスカラー値（同じチャネルで複数モーフターゲットをアニメートする場合はスカラー配列）を生成します。
+
+[source,cpp]
+----
+void update_morph_weights(
+    const AnimationChannel& channel,
+    const AnimationSampler& sampler,
+    float current_time,
+    std::vector<float>& mesh_weights)
+{
+    if (channel.path != AnimationChannel::WEIGHTS) return;
+
+    // Find the keyframe interval [t0, t1]
+    uint32_t k = find_keyframe(sampler, current_time);
+    float t0 = sampler.inputs[k];
+    float t1 = sampler.inputs[k+1];
+    float factor = (current_time - t0) / (t1 - t0);
+
+    // Sample the weights for all targets in this mesh
+    uint32_t target_count = mesh_weights.size();
+    for (uint32_t i = 0; i < target_count; ++i) {
+        float w0 = sampler.values[k * target_count + i].x;
+        float w1 = sampler.values[(k+1) * target_count + i].x;
+
+        // Linear interpolation is typically sufficient for facial expressions
+        mesh_weights[i] = glm::mix(w0, w1, factor);
+    }
+}
+----
+
+これらのウェイトは `PushConstants` に詰め、コンピュートシェーダーに送ります。
+
+== 拡張コンピュートシェーダー
+
+第 3 章のスキニングコンピュートシェーダーを、スケルタルスキニングの前にモーフターゲット変位を適用するよう拡張する必要があります。モーフ適用とスケルタルスキニングは同じ頂点バッファに対する線形演算なので、きれいに合成できます。まずモーフを適用（バインドポーズで頂点を動かす）、次にスケルタルスキニング（モーフしたバインドポーズをアニメーションのワールドポーズへ変換）です。
+
+以下は Slang の拡張シェーダーです。主な追加は `morphTargets` バインドレスバッファ配列、`MorphWeightBlock` パラメータ、モーフ蓄積ループです。
+
+[source,slang]
+----
+// morph_accumulate.slang — combines morph target accumulation with skeletal skinning.
+// Requires: VK_EXT_descriptor_indexing, runtimeDescriptorArray.
+
+// Same C-array struct layout as skinning.slang (matches GPU buffer memory layout).
+struct InputVertex  { float p[3]; float n[3]; float uv[2]; float t[4]; };
+struct OutputVertex { float p[3]; float n[3]; float uv[2]; float t[4]; };
+
+// Set 0: per-mesh buffers (same 5-binding layout as the base skinning shader)
+[[vk::binding(0, 0)]] StructuredBuffer<InputVertex>    base_vertices;
+[[vk::binding(1, 0)]] RWStructuredBuffer<OutputVertex> output_vertices;
+[[vk::binding(2, 0)]] StructuredBuffer<float4x4>       joint_matrices;
+[[vk::binding(3, 0)]] StructuredBuffer<uint4>          joint_indices;
+[[vk::binding(4, 0)]] StructuredBuffer<float4>         joint_weights;
+
+// Set 1: runtime-length array of morph delta buffers (one StructuredBuffer per target).
+// MorphDelta uses a C-array to match GPU buffer layout.
+struct MorphDelta { float d[3]; };
+[[vk::binding(0, 1)]] StructuredBuffer<MorphDelta> morph_targets[];
+
+// MorphWeightBlock must match SkinPushConstants::MorphWeightBlock in renderer_advanced_types.h.
+struct MorphWeightBlock {
+    float    weights[24];     // Blending weights for the active targets
+    uint32_t active_count;    // How many entries in weights[] are valid
+    uint32_t apply_skinning;  // 1 = also apply skeletal skinning, 0 = morph only
+    uint32_t pad[2];
+};
+
+struct PushConstants {
+    uint32_t         vertex_count;
+    uint32_t         morph_indices[24]; // Which descriptor slot each active target lives in
+    MorphWeightBlock morph_weights;
+};
+[[vk::push_constant]] PushConstants pc;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    uint vertex_idx = dispatch_id.x;
+    if (vertex_idx >= pc.vertex_count) return;
+
+    InputVertex base = base_vertices[vertex_idx];
+    float3 base_pos = float3(base.p[0], base.p[1], base.p[2]);
+    float3 base_nrm = float3(base.n[0], base.n[1], base.n[2]);
+    float4 base_tan = float4(base.t[0], base.t[1], base.t[2], base.t[3]);
+
+    // --- Pass 1: morph target accumulation ---
+    float3 morphed_position = base_pos;
+    float3 morphed_normal   = base_nrm;
+
+    for (uint m = 0; m < pc.morph_weights.active_count; ++m) {
+        float weight = pc.morph_weights.weights[m];
+        if (abs(weight) < 1e-5f) continue;
+
+        uint slot = pc.morph_indices[m];
+        // NonUniformResourceIndex: different threads may use different descriptor slots.
+        MorphDelta delta_raw = morph_targets[NonUniformResourceIndex(slot)][vertex_idx];
+        float3 delta = float3(delta_raw.d[0], delta_raw.d[1], delta_raw.d[2]);
+        morphed_position += weight * delta;
+    }
+
+    // --- Pass 2: skeletal skinning (same LBS as skinning.slang) ---
+    uint4  j_idx = joint_indices[vertex_idx];
+    float4 j_w   = joint_weights[vertex_idx];
+
+    float4x4 skin_matrix =
+        j_w.x * joint_matrices[j_idx.x] +
+        j_w.y * joint_matrices[j_idx.y] +
+        j_w.z * joint_matrices[j_idx.z] +
+        j_w.w * joint_matrices[j_idx.w];
+
+    float3x3 skin_rot = float3x3(
+        skin_matrix[0].xyz, skin_matrix[1].xyz, skin_matrix[2].xyz);
+
+    float3 final_position = morphed_position;
+    float3 final_normal   = morphed_normal;
+    float3 final_tangent  = base_tan.xyz;
+    if (pc.morph_weights.apply_skinning != 0u) {
+        final_position = mul(skin_matrix, float4(morphed_position, 1.0)).xyz;
+        final_normal   = normalize(mul(skin_rot, morphed_normal));
+        final_tangent  = normalize(mul(skin_rot, base_tan.xyz));
+    }
+
+    // Write to output buffer element-by-element (C-array structs require this).
+    OutputVertex out;
+    out.p[0] = final_position.x;  out.p[1] = final_position.y;  out.p[2] = final_position.z;
+    out.n[0] = final_normal.x;    out.n[1] = final_normal.y;    out.n[2] = final_normal.z;
+    out.t[0] = final_tangent.x;   out.t[1] = final_tangent.y;
+    out.t[2] = final_tangent.z;   out.t[3] = base_tan.w;
+    out.uv[0] = base.uv[0];       out.uv[1] = base.uv[1];
+
+    output_vertices[vertex_idx] = out;
+}
+----
+
+`NonUniformResourceIndex` アノテーションが、バインドレスインデックスを正しくする重要な要素です。これがないと、GPU ドライバーはウェーブ（ロックステップで実行するスレッド群）内のすべてのスレッドが同じディスクリプタインデックスにアクセスすると仮定する可能性があります。同一ディスパッチで異なるキャラクターをスキニングするときは誤りです。`NonUniformResourceIndex` はコンパイラにインデックスへ `NonUniform` 装飾を付けるよう指示し、ハードウェアがスレッドごとのばらつきを正しく扱う非一様なテクスチャ/バッファフェッチを行います。
+
+== ディスパッチループへの統合
+
+モーフシステムはフレームループに自然に組み込めます。
+
+1. **ウェイトの更新。** アニメーションシステムが `WEIGHTS` アニメーションチャネルを進め、メッシュごとのモーフウェイト配列に新しい float 値を書き込みます。
+2. **非アクティブターゲットのカリング。** しきい値（通常 0.005）未満のウェイトのモーフターゲットはディスパッチから除外します。アクティブなターゲットだけからコンパクトな `morph_indices` と `weights` 配列を構築します。
+3. **プッシュ定数。** `PushConstants` 構造体に、アクティブターゲット数、アクティブバッファのディスクリプタインデックス、ウェイトを入れます。
+4. **ディスパッチ。** ディスクリプタセット（すべてのモーフターゲットバッファが登録済み）をバインドし、プッシュ定数を渡し、コンピュートシェーダーをディスパッチします。頂点あたり 1 スレッドです。
+5. **バリア。** ラスタライザやレイトレーシングパスが出力バッファを読む前に、出力バッファへ `VkBufferMemoryBarrier2` を発行します（第 3 章と同様）。
+
+注意が必要なのはフレームごとのプッシュ定数サイズです。最大 24 個のアクティブモーフターゲットでは、`PushConstants` は 24 インデックス（96 バイト）に `MorphWeightBlock` の 24 ウェイト（96 バイト）とメタデータ—合計おおよそ 200 バイトです。Vulkan 仕様はプッシュ定数空間の最小 128 バイトを保証しますが、多くのデスクトップ GPU は 256 バイト以上をサポートします。24 ターゲット上限はその予算内に収めるためです。同時により多くのターゲットが必要なら、ウェイトデータを小さなユニフォームバッファに移してください。
+
+== モーフターゲットとスケルタルリグの協調
+
+最後の問いは、モーフターゲットとジョイントスケルトンがどう協調するかです。キャラクターが口を開けるとき、モーフターゲット（唇の滑りと歯の露出といった複雑な非剛体変形）とジョイント回転（下顎骨を下に回して下顎を開く）の両方が関わります。2 つのシステムは正しい順序で適用され、ベースポーズで一致している必要があります。
+
+ルールは: **バインドポーズでモーフを適用し、その後スケルタルスキニングを適用する。** バインドポーズは Blender でアーティストが設定するレスト構成です。モーフターゲットはこのポーズからの変位として定義されます。スケルタルの逆バインド行列もこのポーズ基準です。モーフを先に適用し（本シェーダーのとおり）、逆バインド行列でジョイント影響の重み付けを行えば、結果は数学的に正しいです。バインドポーズのモーフ幾何がアニメーションポーズで変換され、最終的なアニメーション＋モーフメッシュが得られます。
+
+順序を誤る—スケルタルスキニングの後にモーフターゲットを適用する、またはバインド空間ではなくワールド空間で適用する—と、顔の幾何が伸びたり下顎骨に追従しなかったりするスミアアーティファクトが出ます。
+
+xref:Advanced_glTF/Morph_Targets_Facial_Animation/02_shape_key_ingestion.adoc[前へ: シェイプキー取り込み] | xref:Advanced_glTF/Morph_Targets_Facial_Animation/04_conclusion.adoc[次へ: まとめ]

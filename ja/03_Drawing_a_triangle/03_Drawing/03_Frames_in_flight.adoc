@@ -1,0 +1,130 @@
+:pp: {plus}{plus}
+
+= フレームインフライト
+
+いまのレンダーループには明らかな欠陥があります。次のフレームのレンダリングを始める前に前のフレームの完了を待つ必要があり、ホストが不必要にアイドルになります。
+
+// insert diagram showing our current render loop and the 'multi frame in flight' render loop
+
+これを直す方法は、一度に複数のフレームを_インフライト_にすること、つまり、あるフレームのレンダリングが次のフレームの記録を妨げないようにすることです。どうやるのでしょうか。レンダリング中にアクセス・変更されるリソースはすべて複製する必要があります。したがって、複数のコマンドバッファ、セマフォ、フェンスが必要です。後の章では他のリソースの複数インスタンスも追加するので、この概念は再び現れます。
+
+まず、同時に処理すべきフレーム数を定義する定数をプログラム先頭に追加します。
+
+[,c++]
+----
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+----
+
+2を選ぶのは、CPUがGPUより_あまりに_先走りしないようにするためです。2つのフレームインフライトなら、CPUとGPUはそれぞれ自分の作業を同時に進められます。CPUが早く終われば、GPUのレンダリング完了を待ってからさらに作業を投入します。3つ以上のフレームインフライトだと、CPUがGPUより先に進み、レイテンシのフレームが加算され得ます。一般に余分なレイテンシは望ましくありません。ただし、フレームインフライト数をアプリケーションが制御できることも、Vulkanが明示的であることの一例です。
+
+各フレームは独自のコマンドバッファ、セマフォのセット、フェンスを持つべきです。名前を変え、オブジェクトの``std::vector``に変更します。
+
+[,c++]
+----
+std::vector<vk::raii::CommandBuffer> commandBuffers;
+
+...
+
+std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
+std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
+std::vector<vk::raii::Fence> inFlightFences;
+----
+
+次に複数のコマンドバッファを作成する必要があります。`createCommandBuffer`を`createCommandBuffers`にリネームします。次に、コマンドバッファのベクトルを`MAX_FRAMES_IN_FLIGHT`のサイズにリサイズし、その数のコマンドバッファを含むよう`vk::CommandBufferAllocateInfo`を変更し、宛先をコマンドバッファのベクトルに変えます。
+
+[,c++]
+----
+void createCommandBuffers()
+{
+		vk::CommandBufferAllocateInfo allocInfo{.commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = MAX_FRAMES_IN_FLIGHT};
+    commandBuffers = vk::raii::CommandBuffers( device, allocInfo );
+}
+----
+
+`createSyncObjects`関数は、すべてのオブジェクトを作成するよう変更すべきです。
+
+[,c++]
+----
+void createSyncObjects()
+{
+		assert(presentCompleteSemaphores.empty() && renderFinishedSemaphores.empty() && inFlightFences.empty());
+
+		for (size_t i = 0; i < swapChainImages.size(); i++)
+		{
+			renderFinishedSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+		}
+
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			presentCompleteSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+			inFlightFences.emplace_back(device, vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
+		}
+}
+----
+
+毎フレーム正しいオブジェクトを使うため、現在のフレームを追跡する必要があります。その目的でフレームインデックスを使います。
+
+[,c++]
+----
+uint32_t frameIndex = 0;
+----
+
+`drawFrame`関数を、正しいオブジェクトを使うよう変更できます。
+
+[,c++]
+----
+void drawFrame() {
+		auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
+		if (fenceResult != vk::Result::eSuccess)
+		{
+			throw std::runtime_error("failed to wait for fence!");
+		}	
+		device.resetFences(*inFlightFences[frameIndex]);
+
+		auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+
+		commandBuffers[frameIndex].reset();
+		recordCommandBuffer(imageIndex);
+
+		vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
+		const vk::SubmitInfo   submitInfo{.waitSemaphoreCount   = 1,
+		                                  .pWaitSemaphores      = &*presentCompleteSemaphores[frameIndex],
+		                                  .pWaitDstStageMask    = &waitDestinationStageMask,
+		                                  .commandBufferCount   = 1,
+		                                  .pCommandBuffers      = &*commandBuffers[frameIndex],
+		                                  .signalSemaphoreCount = 1,
+		                                  .pSignalSemaphores    = &*renderFinishedSemaphores[imageIndex]};
+		queue.submit(submitInfo, *inFlightFences[frameIndex]);
+}
+----
+
+もちろん、毎回次のフレームへ進むことも忘れてはいけません。
+
+[,c++]
+----
+void drawFrame() {
+    ...
+
+    frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
+}
+----
+
+剰余（%）演算子を使うことで、`MAX_FRAMES_IN_FLIGHT`個のフレームをエンキューするたびにフレームインデックスがループすることを保証します。
+
+////
+Possibly use swapchain-image-count for renderFinished semaphores, as it can't
+be known with a fence whether the semaphore is ready for re-use.
+////
+
+これで、エンキューされる作業が`MAX_FRAMES_IN_FLIGHT`フレームを超えず、これらのフレームが互いに踏みつけないことを保証する必要な同期をすべて実装しました。最終クリーンアップなど、コードの他の部分が`vk::raii::Device::waitIdle`のようなより粗い同期に頼るのは問題ありません。性能要件に基づいてどのアプローチを使うかを決めるべきです。
+
+加えて、ここで示したバイナリセマフォの代わりにタイムラインセマフォを使うこともできます。タイムラインセマフォの使い方の例はxref:../../11_Compute_Shader.adoc[コンピュートシェーダの章]を見てください。その例のようにコンピュートキューとグラフィックスキューを扱うとき、タイムラインセマフォは特に有用です。この単純なバイナリセマフォの方法は、より伝統的な同期アプローチと考えられます。
+
+例を通じて同期についてさらに学ぶには、Khronosによるhttps://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples#swapchain-image-acquire-and-present[この包括的な概要]を見てください。
+
+xref:../03_Drawing_a_triangle/04_Swap_chain_recreation.adoc[次の章]では、行儀の良いVulkanプログラムに必要なもう一つの小さな事柄を扱います。
+
+link:/attachments/16_frames_in_flight.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

@@ -1,0 +1,114 @@
+= ダイナミックレンダリング
+
+*目的*: ベースプロジェクトが *ダイナミックレンダリング* を使っていることを確認し、RenderDoc での検証方法を理解する。
+
+ダイナミックレンダリングでは、もはや VkRenderPass や VkFrameBuffer を作成しません。代わりに `vkCmdBeginRenderingKHR` でレンダリングを開始し、アタッチメントをその場で指定します。これによりコードの柔軟性が高まり（サブパスを事前宣言する必要がない）、現在 Vulkan における「モダン」な描画方法となっています。
+
+== タスク 1: ダイナミックレンダリングのセットアップを確認する
+
+提供コードベースで、グラフィックスパイプラインの初期化を探してください。
+
+[,c{pp}]
+----
+/* TASK01: Check the setup for dynamic rendering
+ *
+ * This new struct replaces what previously was the render pass in the pipeline creation.
+ * Note how this structure is now linked in .pNext below, and .renderPass is not used.
+ */
+vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
+    .colorAttachmentCount = 1,
+    .pColorAttachmentFormats = &swapChainImageFormat,
+    .depthAttachmentFormat = depthFormat
+};
+
+vk::GraphicsPipelineCreateInfo pipelineInfo{
+    .pNext = &pipelineRenderingCreateInfo,
+    .stageCount = 2,
+    .pStages = shaderStages,
+    .pVertexInputState = &vertexInputInfo,
+    .pInputAssemblyState = &inputAssembly,
+    .pViewportState = &viewportState,
+    .pRasterizationState = &rasterizer,
+    .pMultisampleState = &multisampling,
+    .pDepthStencilState = &depthStencil,
+    .pColorBlendState = &colorBlending,
+    .pDynamicState = &dynamicState,
+    .layout = pipelineLayout,
+    .renderPass = nullptr
+};
+
+graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+----
+
+その後、レンダリングを開始するコマンドバッファ記録部分です。
+
+[,c{pp}]
+----
+/* TASK01: Check the setup for dynamic rendering
+ *
+ * With dynamic rendering, we specify the image view and load/store operations directly
+ * in the vk::RenderingAttachmentInfo structure.
+ * This approach eliminates the need for explicit render pass and framebuffer objects,
+ * simplifying the code and providing flexibility to change attachments at runtime.
+ */
+
+vk::RenderingAttachmentInfo colorAttachmentInfo = {
+    .imageView = swapChainImageViews[imageIndex],
+    .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .loadOp = vk::AttachmentLoadOp::eClear,
+    .storeOp = vk::AttachmentStoreOp::eStore,
+    .clearValue = clearColor
+};
+
+vk::RenderingAttachmentInfo depthAttachmentInfo = {
+    .imageView = depthImageView,
+    .imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+    .loadOp = vk::AttachmentLoadOp::eClear,
+    .storeOp = vk::AttachmentStoreOp::eDontCare,
+    .clearValue = clearDepth
+};
+
+// The vk::RenderingInfo structure combines these attachments with other rendering parameters.
+vk::RenderingInfo renderingInfo = {
+    .renderArea = { .offset = { 0, 0 }, .extent = swapChainExtent },
+    .layerCount = 1,
+    .colorAttachmentCount = 1,
+    .pColorAttachments = &colorAttachmentInfo,
+    .pDepthAttachment = &depthAttachmentInfo
+};
+
+// Note: .beginRendering replaces the previous .beginRenderPass call.
+commandBuffers[frameIndex].beginRendering(renderingInfo);
+----
+
+より詳しい文脈は、以前のチュートリアルの xref:../../03_Drawing_a_triangle/02_Graphics_pipeline_basics/03_Dynamic_rendering.adoc[章] を参照してください。
+
+=== RenderDoc でのダイナミックレンダリング
+
+RenderDoc でアプリケーションを起動し、フレームをキャプチャします。
+
+. 実行ファイルパスを指定: `Vulkan-Tutorial\attachments\build\38_ray_tracing\Debug\38_ray_tracing.exe`。
+. 作業ディレクトリを指定: `Vulkan-Tutorial\attachments\build\38_ray_tracing`。
+. アプリケーションを起動する。
+
+image::../../../images/38_TASK01_renderdoc_launch.png[]
+
+Event Browser では、ダイナミックレンダリングが正しくセットアップされていることを示す呼び出しが見えます。
+
+. `vkCmdBeginRenderingKHR` と `vkCmdEndRenderingKHR`。
+. 旧来のレンダーパス／フレームバッファの概念を置き換える `VkRenderingInfoKHR`。
+. `VkRenderingAttachmentInfo` 経由で設定されたカラー（および深度）アタッチメント。
+
+image::../../../images/38_TASK01_renderdoc_events.png[]
+
+RenderDoc の Texture Viewer では、各時点のカラーおよび深度アタッチメントを検査できます。
+
+image::../../../images/38_TASK01_renderdoc_color.gif[]
+
+NOTE: ダイナミックレンダリングは CPU オーバーヘッドを削減し、`VK_KHR_dynamic_rendering_local_read` 拡張と組み合わせると、フルのレンダーパスなしでサブパス風のタイルローカル読み取りができます。これは遅延シェーディングなどのタイラー向け技法で有用で、前パスのアタッチメントをタイル上で読み取れ、余分なメモリ帯域を使わずに済みます。ここでは遅延レンダラーは実装しませんが、モバイル向けの利点として覚えておいてください。
+
+このステップの後、ダイナミックレンダリングが正しくセットアップされていることに自信を持てるはずです。次はレイトレーシング機能に進みます。
+
+== ナビゲーション
+- 前へ: xref:./00_Overview.adoc[概要]
+- 次へ: xref:./02_Acceleration_structures.adoc[アクセラレーション構造]

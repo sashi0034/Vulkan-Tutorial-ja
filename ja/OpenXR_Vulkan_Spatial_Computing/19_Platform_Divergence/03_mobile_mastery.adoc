@@ -1,0 +1,52 @@
+:pp: {plus}{plus}
+= モバイル習得: 熱壁の克服
+
+モバイル空間コンピューティングは、極限の効率の訓練です。スタンドアロンヘッドセットでは、エンジン全体・トラッキング・表示を、およそ 5〜10 ワットの電力予算で動かさなければなりません。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムがおそらくやっていること**。
+
+スタンドアロンモバイルランタイムは、熱スロットリング、ダイレクト・トゥ・ディスプレイのスキャンアウト、合成フレーム生成（SpaceWarp）といった重いアーキテクチャ作業を裏で管理します。Vulkan のタイルベースレンダリング機能を使い、エンジンをこれらのランタイム挙動に揃え、最大性能を引き出します。
+
+== 概念: Tile-Based Rendering（TBR）
+
+ほとんどのモバイル GPU（Qualcomm、Arm、Imagination など）は **Tile-Based Rendering** アーキテクチャを使います。画面全体を一度に描く代わりに、GPU は画面を小さなタイル（例: 16x16 ピクセル）に分割します。各タイルを高速・低電力のオンチップメモリ（**LDS** または **SRAM**）内で完全に処理してから、最終結果をメインメモリへ書き戻します。
+
+モバイル空間コンピューティングでは、**破棄することが勝利**です。
+
+[source,cpp]
+----
+// Configuring optimal mobile attachments using designated initializers
+vk::RenderingAttachmentInfo depthAttachment{
+    .imageView = *depthView,
+    .imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+    .loadOp = vk::AttachmentLoadOp::eClear,
+    .storeOp = vk::AttachmentStoreOp::eDontCare, // CRITICAL: Discard depth after use
+    .clearValue = vk::ClearValue{.depthStencil = {1.0f, 0}}
+};
+----
+
+Vulkan 1.3 では、**Dynamic Rendering Local Read** 拡張（`VK_KHR_dynamic_rendering_local_read`）を使い、メイン VRAM に触れずに同じタイル内で色や深度値を読み戻せます。ディファードシェーディングに不可欠で、操作全体をオンチップに保てます。
+
+== Application SpaceWarp（ASW）: 合成フレーム
+
+モバイルで滑らかな 90Hz 体験を維持するため、しばしば **Application SpaceWarp** を使います。これによりエンジンは半フレームレート（例: 45 FPS）で描画し、XR ランタイムが毎秒フレームを合成生成します。
+
+*   **仕組み**: エンジンが **モーションベクトル** と深度マップをランタイムに提供する。
+*   **結果**: GPU は半分のフレームだけ重いシェーディングを行い、より複雑なシーンと高い忠実度が可能になる。
+
+== 発展: タイルローカルディファードシェーディングとスレッド親和性
+
+Vulkan により、標準ループを超えてモバイルの「熱壁」を克服できます。
+
+*   **タイルローカルディファードシェーディング**: Vulkan の **Input Attachments** を使い、複雑なライティングとポストプロセスを高速オンチップメモリ内で完全に行い、高価な「メインメモリ税」を避けられる。
+*   **リアルタイムスレッド親和性**: Vulkan の **Priority Queues** を使い、エンジンのコマンド提出に「リアルタイム」優先度を明示的に要求し、バックグラウンドのシステム更新で空間レンダリングが遅れないことを保証できる——標準が保証しない水準の協調。
+
+== 効率的な空間同期
+
+モバイルヘッドセットは **Unified Memory** を使い、CPU と GPU が同じ物理 RAM を共有します。ゼロコピー引き継ぎは単純化されますが、**メモリ帯域** をめぐる競合も意味します。すべてのテクスチャサンプルとバッファ書き込みが正当化されなければなりません。
+
+TIP: モバイル最適化とタイリングの詳細については、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#renderpass-load-store-ops[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/19_Platform_Divergence/02_desktop_high_end.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/19_Platform_Divergence/04_incorporating_into_the_engine.adoc[Next]

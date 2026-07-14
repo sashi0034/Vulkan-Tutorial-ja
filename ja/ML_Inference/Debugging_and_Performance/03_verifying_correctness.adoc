@@ -1,0 +1,290 @@
+= ML 正しさの検証: 数値的真実の探求
+:pp: ++
+:stem: latexmath
+
+Vulkan 固有のバグは修正しました——validation layer は静か、RenderDoc はディスクリプタセットが正しくバインドされていることを示し、コマンドバッファは問題なく submit されます。しかし画像分類器はまだ「ゴールデンレトリバー」の画像を「トースター」と予測しています。
+
+ML 開発で最も frustrating な段階です: **静かな数値失敗**。実装は「正しい」Vulkan プログラムですが、「誤った」数学モデルです。クラッシュと違い、数値バグは世界を止めず、単に腐敗させます。
+
+本章では数学が正しいことを証明する方法を学びます。PyTorch の高レベル世界と Vulkan SPIR-V カーネルの低レベル世界を、数学的検証で実装が現実から乖離する正確な点を見つけます。
+
+== 真実の哲学: なぜ「だいたい正しい」は誤りか
+
+グラフィックスではピクセルがわずかに誤った青でも誰も死にません。機械学習では「わずかに誤り」が壊滅的です。医療画像ツールや自律ドローンを作るなら、深いレイヤの 0.1% の数値ドリフトが「腫瘍」と「健康」、「障害物」と「晴れた空」の分類を反転させ得ます。
+
+ML のバグは **病的** です。ニューラルネットワークは本質的に長い行列積の連鎖なので、連鎖の始めのわずかな誤差は雪だるまのように。最後にはゴミの雪崩になります。
+
+信頼できる AI を構築するには科学者の心構えが必要です: **実装は仮説、ゴールデン参照が真実です。**
+
+== ゴールデン参照戦略
+
+ニューラルネットワークをデバッグする唯一の方法は **ゴールデン参照**——暗黙のうちに信頼する既知正しい実装——と比較することです。通常は PyTorch、TensorFlow、または ONNX Runtime（CPU）で動く元モデルです。
+
+戦略は単純ですが厳密です。
+
+1.  **収穫**: ゴールデン参照から 1 回の順伝播ですべてのレイヤ出力を取り出す。
+2.  **比較**: 同じ入力で Vulkan 実装を実行し、対応する各コンピュートシェーダの出力を「ダンプ」する。
+3.  **二分探索**: 結果が乖離する **最初** のレイヤを見つける。バグはそのレイヤのシェーダか入力設定に必ずある。
+
+== 「正しさ」の定量化: 誤差指標
+
+比較の前に「同じ」の数学的定義が必要です。浮動小数では 2 数が完全一致することは稀です。誤差を定量化します。
+
+=== 1. 平均絶対誤差（MAE）
+最も単純な指標。結果と真実の平均「距離」を示します。
+
+[latexmath]
+++++
+MAE = \frac{1}{N} \sum_{i=1}^{N} |y_i - \hat{y}_i|
+++++
+
+*   **使うとき**: 一般的な健全性チェック。解釈が容易（例: 「平均ピクセル誤差 0.001」）。
+*   **罠**: 残り 10 万ピクセルが完璧なら、1 つの「Infinity」や「NaN」を MAE が隠す。
+
+=== 2. 平均二乗誤差（MSE）
+MSE は差を二乗するため、大きな誤差を小さな誤差よりはるかに重く罰します。
+
+[latexmath]
+++++
+MSE = \frac{1}{N} \sum_{i=1}^{N} (y_i - \hat{y}_i)^2
+++++
+
+*   **使うとき**: 「外れ値」の検出。大半のピクセルが完璧でも 1 ピクセルが wildly 誤る（「firefly」）と、MAE は低くても MSE は急上昇。
+
+=== 3. ピーク信号対雑音比（PSNR）
+ML モデルが画像を再構成する（レイトレーシング章のデノイザーなど）ときによく使います。
+
+[latexmath]
+++++
+PSNR = 10 \cdot \log_{10}\left(\frac{MAX^2}{MSE}\right)
+++++
+
+*   **使うとき**: 高いほど良い。PSNR > 40dB は人間の目では視覚的に同一とみなされることが多い。
+
+== 「イプシロン」問題（latexmath:[\epsilon]）
+
+なぜ `if (a == b)` だけではダメか？
+
+浮動小数は近似です。Vulkan では GPU が Intel/AMD CPU と異なる「Fused Multiply-Add」（FMA）命令を使うかもしれません。丸めのわずかな差が数千演算で累積します。
+
+=== 絶対 vs 相対許容
+絶対差 latexmath:[10^{-5}] をチェックすると:
+
+*   値 `0.1` では差 `0.00001` は妥当。
+*   値 `1000.0` では差 `0.00001` は浮動小数精度の仕組み上 **不可能**（1000 付近の隣接 float の間隔は 0.00001 より大きい）。
+
+**ML 検証の黄金律**: **絶対** と **相対** 許容の組み合わせを使う。
+
+[source,cpp]
+----
+bool isCorrect(float vulkan, float golden, float absTol = 1e-5f, float relTol = 1e-4f) {
+    float diff = std::abs(vulkan - golden);
+    // Pass if EITHER the absolute distance is tiny
+    // OR the relative distance is small (handles large numbers)
+    return (diff <= absTol) || (diff <= relTol * std::abs(golden));
+}
+----
+
+== 真実の収穫: PyTorch テンプレート
+
+モデルを検証するには「地上真実生成器」として動くスクリプトが必要です。**Forward Hook** でモデルソースを変更せず中間データを取得します。
+
+[source,python]
+----
+import torch
+import torch.nn as nn
+import numpy as np
+import torchvision.models as models
+
+# 1. Load the model
+model = models.mobilenet_v2(pretrained=True)
+model.eval()
+
+# 2. Instrument the model (The "Hook" Pattern)
+activations = {}
+def get_activation(name):
+    def hook(model, input, output):
+        # DETACH is critical: prevents GPU memory leaks
+        # CPU converts to a format C++ can read easily
+        activations[name] = output.detach().cpu().numpy()
+    return hook
+
+# Register hooks for critical layers
+# You can find these names by running `print(model)`
+model.features[0].register_forward_hook(get_activation('layer_0_conv'))
+model.features[1].register_forward_hook(get_activation('layer_1_bottleneck'))
+model.classifier[1].register_forward_hook(get_activation('output_logits'))
+
+# 3. Create a Deterministic Input
+# Do NOT use random noise for verification! Use a fixed seed.
+torch.manual_seed(42)
+input_tensor = torch.randn(1, 3, 224, 224)
+
+# 4. Run Inference
+with torch.no_grad():
+    output = model(input_tensor)
+
+# 5. Save to Disk
+# NP.SAVE creates a binary file that is easy to map in C++
+np.save("ref_input.npy", input_tensor.numpy())
+for name, tensor in activations.items():
+    np.save(f"ref_{name}.npy", tensor)
+    print(f"Captured {name}: Shape {tensor.shape}")
+----
+
+== GPU からの読み取り: 同期ハンドシェイク
+
+「Vulkan の真実」を CPU に読み戻すのはバグが最も隠れやすい場所です。正しく同期しないと、結果ではなく未初期化ゴミや 3 フレーム前の結果を読んでいます。
+
+=== 多段階読み戻し
+Vulkan でバッファを安全に読むには 3 つの可視性ドメインを通ります。
+
+1.  **コンピュートドメイン**: GPU が `DEVICE_LOCAL` メモリに書いている。
+2.  **転送ドメイン**: GPU が `DEVICE_LOCAL` から `HOST_VISIBLE` へコピーしている。
+3.  **ホストドメイン**: CPU がマップしたメモリを読んでいる。
+
+[source,cpp]
+----
+void verifyBuffer(vk::Buffer deviceBuffer, vk::DeviceSize size, const std::string& name) {
+    // 1. BARRIER: Wait for compute writes to finish
+    vk::BufferMemoryBarrier computeBarrier{
+        .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+        .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+        .buffer = deviceBuffer,
+        .size = size
+    };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        {}, {}, computeBarrier, {});
+
+    // 2. COPY: Move to a staging buffer
+    cmd.copyBuffer(deviceBuffer, stagingBuffer, vk::BufferCopy(0, 0, size));
+
+    // 3. BARRIER: Ensure copy finishes before CPU maps memory
+    vk::BufferMemoryBarrier hostBarrier{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eHostRead,
+        .buffer = stagingBuffer,
+        .size = size
+    };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                        vk::PipelineStageFlagBits::eHost,
+                        {}, {}, hostBarrier, {});
+
+    // 4. SYNC: Wait for the entire command buffer to finish
+    graphicsQueue.submit(cmdBuffer, fence);
+    device.waitForFences(fence, VK_TRUE, UINT64_MAX);
+
+    // 5. READ: Map and compare
+    float* gpuData = static_cast<float*>(stagingMemory.mapMemory(0, size));
+    compareWithRef(gpuData, name);
+    stagingMemory.unmapMemory();
+}
+----
+
+== 体系的トラブルシューティング: 乖離探索
+
+最終予測が誤るなら、この経路を辿ります。
+
+=== 1. 前処理を確認
+`preprocessedInput` バッファをダンプ。`ref_input.npy` と一致するか？
+
+*   **よくあるバグ**: R/B チャンネル入れ替え。赤を青チャンネルに入れると高レベル特徴が完全に変わる。
+*   **よくあるバグ**: 正規化範囲。平均を引いて標準偏差で割ったか、[0, 1] にスケールしただけか？
+
+=== 2. 重みとレイアウトを確認
+Vulkan コンピュートカーネルは性能のため **Weight-Major** レイアウトを好むことが多く、ONNX/PyTorch は **Filter-Major** です。
+
+*   **Filter-Major (NCHW)**: `[Out_Channels, In_Channels, H, W]`
+*   **最適 GPU レイアウト**: `[H, W, In_Channels, Out_Channels]`
+*   **バグ**: シェーダのループ順に合わせて転置せず重みをアップロードすると、すべての畳み込みがゴミになる。
+
+=== 3. パディングとストライドを確認
+レイヤ 1 は一致するがレイヤ 2 が 1 ピクセルずれているなら、パディングロジックが誤り。
+
+*   **対称性**: パディングは `(1, 1, 1, 1)` か、誤って `(2, 0, 2, 0)` か？
+*   **丸め**: プーリングレイヤで出力次元を floor か ceil か？ Vulkan と PyTorch が一致する必要がある。
+
+== シェーダの数値安定性: 精度の保持
+
+数千値を合計する（大きな全結合レイヤなど）とき、演算順序が重要です。
+
+[latexmath]
+++++
+(a + b) + c \neq a + (b + c)
+++++
+
+Vulkan シェーダでは **共有メモリリダクション** で内積を計算するかもしれません。ワークグループサイズにより PyTorch の CPU とは異なる順序で合計する可能性があります。
+
+=== アキュムレータのトリック
+帯域幅節約のためモデル重みに `float16` を使うなら、**常に `float32` で累積** してください。
+
+[source,glsl]
+----
+// DANGEROUS: Accumulating in FP16 will lose precision rapidly
+float16_t sum = 0.0hf;
+for(...) sum += input[i] * weight[i];
+
+// CORRECT: Store inputs in FP16, but use FP32 for the math
+float sum = 0.0f;
+for(...) sum += float(input[i]) * float(weight[i]);
+----
+
+この 1 変更で latexmath:[MAE] を 2 桁改善できることがあります。
+
+== 誤差パターンの解釈: 診断表
+
+[cols="1,2,2"]
+|===
+| 誤差パターン | 想定原因 | 対策
+
+| **小さな定数オフセット**
+| 浮動小数リテラル精度（例: `0.1` ではなく `0.1f`）。
+| GLSL で明示的 `f` サフィックスを使う。
+
+| **レイヤごとに増大する誤差**
+| 累積精度損失（小さな数を数千回合計）。
+| 入力が `float16` でも `float32` で累積。
+
+| **巨大なランダム誤差**
+| ディスクリプタセット不一致または未初期化メモリ。
+| RenderDoc でバッファバインドを検証。
+
+| **ゼロ化された領域**
+| ワークグループディスパッチ数学（整数除算の切り捨て）。
+| `(N + Size - 1) / Size` 式を使う。
+
+| **チェッカーボードパターン**
+| メモリレイアウト不一致（HWC vs NCHW）。
+| `pixelIdx` 計算のストライドとオフセットを検証。
+|===
+
+== CI への検証統合
+
+プロの ML パイプラインはコミットごとに検証を実行します。C++ アプリに `--verify` フラグを追加すべきです。
+
+1.  PyTorch から収穫した `.npy` を読み込む。
+2.  Vulkan デバイスで 1 回推論を実行する。
+3.  各レイヤの latexmath:[MAE] を計算する。
+4.  すべてのレイヤが許容内のときだけ終了コード `0` で終了する。
+
+[source,bash]
+----
+# Example verification command
+./my_vulkan_ml --verify --ref_dir ./golden_references --abs_tol 1e-5 --rel_tol 1e-4
+----
+
+CI でこのコマンドが失敗したらビルドは拒否されます。あるブランチの性能最適化がモデル精度を密かに壊すのを防ぎます。
+
+== まとめ: 信頼せよ、しかし検証せよ
+
+検証は趣味人とプロ ML エンジニアの差です。厳密なレイヤごと比較により、ニューラルネットワークの「魔法」を解決可能な工学問題に変えます。
+
+*   PyTorch など信頼フレームワークから **地上真実を収穫** する。
+*   barrier と fence で Vulkan 読み戻しを **同期** する。
+*   MAE と MSE で成功を **定量化** する。
+*   ネットワークを **二分探索** し、最初の乖離点を特定する。
+
+次章では実装が 100% 正しいと仮定し、次の課題 **性能プロファイル** に進みます。
+
+xref:ML_Inference/Debugging_and_Performance/02_debugging_vulkan_compute.adoc[前へ: Vulkan コンピュートのデバッグ] | xref:ML_Inference/Debugging_and_Performance/04_performance_profiling.adoc[次へ: 性能プロファイル]

@@ -1,0 +1,260 @@
+:pp: {plus}{plus}
+
+= 固定機能
+
+古いグラフィックスAPIは、グラフィックスパイプラインのほとんどの段階にデフォルト状態を提供していました。Vulkanでは、ほとんどのパイプライン状態を明示する必要があり、不変のパイプライン状態オブジェクトに焼き込まれます。この章では、これらの固定機能操作を構成するすべての構造体を埋めます。
+
+== 動的状態
+
+パイプライン状態の*ほとんど*はパイプライン状態に焼き込む必要がありますが、描画時にパイプラインを再作成せずに*変更できる*状態も限られた量あります。例としては、ビューポートのサイズ、線幅、ブレンド定数があります。動的状態を使い、これらのプロパティを外に出したい場合は、次のように`vk::PipelineDynamicStateCreateInfo`構造体を埋める必要があります。
+
+[,c++]
+----
+std::vector<vk::DynamicState> dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+
+vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
+----
+
+これによりこれらの値の構成は無視され、描画時にデータを指定できるように（そして必須に）なります。より柔軟なセットアップになり、ビューポートやシザー状態のように、パイプライン状態に焼き込むとセットアップが複雑になるものでは広く使われています。
+
+== 頂点入力
+
+`vk::PipelineVertexInputStateCreateInfo`構造体は、頂点シェーダに渡される頂点データの形式を記述します。おおまかに次の2通りで記述します。
+
+* バインディング: データの間隔と、データが頂点ごとなのかインスタンスごとなのか（https://en.wikipedia.org/wiki/Geometry_instancing[インスタンシング]を参照）
+* 属性の記述: 頂点シェーダに渡す属性の型、どのバインディングから読み込むか、どのオフセットか
+
+頂点データを頂点シェーダ内に直接ハードコードしているため、今のところ読み込む頂点データがないことを指定するようこの構造体を埋めます。頂点バッファの章でまた戻ってきます。
+
+[,c++]
+----
+vk::PipelineVertexInputStateCreateInfo vertexInputInfo;
+----
+
+`pVertexBindingDescriptions`と`pVertexAttributeDescriptions`メンバは、頂点データの読み込みに関する前述の詳細を記述する構造体の配列を指します。この構造体を、`shaderStages`配列の直後に`createGraphicsPipeline`関数へ追加してください。
+
+== 入力アセンブリ
+
+`vk::PipelineInputAssemblyStateCreateInfo`構造体は2つのことを記述します。頂点からどのようなジオメトリを描画するか、およびプリミティブリスタートを有効にするかです。前者は`topology`メンバで指定し、次のような値を取れます。
+
+* `vk::PrimitiveTopology::ePointList`: 頂点からの点
+* `vk::PrimitiveTopology::eLineList`: 2頂点ごとから再利用なしの線
+* `vk::PrimitiveTopology::eLineStrip`: 各線の終端頂点を次の線の始点として使う
+* `vk::PrimitiveTopology::eTriangleList`: 3頂点ごとから再利用なしの三角形
+* `vk::PrimitiveTopology::eTriangleStrip`: 各三角形の第2・第3頂点を、次の三角形の最初の2頂点として使う
+
+通常、頂点は頂点バッファからインデックス順に読み込まれますが、_要素バッファ_を使うと、使うインデックスを自分で指定できます。これにより頂点の再利用などの最適化が可能になります。`primitiveRestartEnable`メンバを`vk::True`に設定すると、特別なインデックス`0xFFFF`または`0xFFFFFFFF`を使って、`Strip`トポロジモードの線や三角形を分割できます。
+
+本チュートリアルでは三角形を描画するので、構造体には次のデータを使います。
+
+[,c++]
+----
+vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+----
+
+== ビューポートとシザー
+
+ビューポートは、出力がレンダリングされるフレームバッファの領域を基本的に記述します。ほぼ常に`(0, 0)`から`(width, height)`であり、本チュートリアルでも同様です。
+
+[,c++]
+----
+vk::Viewport viewport{0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f};
+----
+
+スワップチェーンとその画像のサイズが、ウィンドウの`WIDTH`と`HEIGHT`と異なる場合があることを覚えておいてください。スワップチェーン画像は後でフレームバッファとして使うので、そのサイズに合わせるべきです。
+
+`minDepth`と`maxDepth`の値は、フレームバッファで使う深度値の範囲を指定します。これらの値は`[0.0f, 1.0f]`の範囲内である必要がありますが、`minDepth`が`maxDepth`より大きくても構いません。特別なことをしないなら、標準値の`0.0f`と`1.0f`を使うべきです。
+
+ビューポートが画像からフレームバッファへの変換を定義するのに対し、シザー矩形は実際にピクセルが格納される領域を定義します。ラスタライザはシザー矩形の外側のピクセルを破棄します。変換ではなくフィルタのように働きます。違いは以下に示します。左のシザー矩形は、ビューポートより大きければ、その画像になる多くの可能性の一つにすぎないことに注意してください。
+
+image::/images/viewports_scissors.png[]
+
+フレームバッファ全体に描画したいなら、それを完全に覆うシザー矩形を指定します。
+
+[,c++]
+----
+vk::Rect2D scissor{vk::Offset2D{ 0, 0 }, swapChainExtent};
+----
+
+ビューポートとシザー矩形は、パイプラインの静的な一部として指定するか、コマンドバッファで設定する動的状態として指定できます。前者は他の状態とより一貫していますが、ビューポートとシザー状態を動的にすると柔軟性が大きく増すので便利なことが多いです。これは広く使われており、すべての実装が性能ペナルティなしにこの動的状態を扱えます。
+
+動的なビューポートとシザー矩形を選ぶ場合、パイプライン用にそれぞれの動的状態を有効にする必要があります。
+
+[,c++]
+----
+std::vector<vk::DynamicState> dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+
+vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
+----
+
+そしてパイプライン作成時には個数だけを指定すれば済みます。
+
+[,c++]
+----
+vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1, .scissorCount = 1};
+----
+
+実際のビューポートとシザー矩形は、後で描画時に設定します。
+
+動的状態を使うと、単一のコマンドバッファ内で異なるビューポートやシザー矩形を指定することさえ可能です。
+
+動的状態を使わない場合、ビューポートとシザー矩形は`vk::PipelineViewportStateCreateInfo`構造体を使ってパイプライン内に設定する必要があります。これにより、このパイプラインのビューポートとシザー矩形は不変になります。これらの値を変えるには、新しい値で新しいパイプラインを作成する必要があります。
+
+[,c++]
+----
+vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1, .pViewports = &viewport, .scissorCount = 1, .pScissors = &scissor};
+----
+
+設定方法に関わらず、一部のグラフィックスカードでは複数のビューポートとシザー矩形を使えるため、構造体のメンバはそれらの配列を参照します。複数を使うにはGPU機能の有効化が必要です（論理デバイスの作成を参照）。
+
+== ラスタライザ
+
+ラスタライザは、頂点シェーダからの頂点で形作られたジオメトリを受け取り、フラグメントシェーダが色付けするフラグメントに変換します。またhttps://en.wikipedia.org/wiki/Z-buffering[深度テスト]、https://en.wikipedia.org/wiki/Back-face_culling[面カリング]、シザーテストも行い、多角形全体を埋めるフラグメントを出力するか、辺だけを出力するか（ワイヤフレームレンダリング）を構成できます。これらすべてを`vk::PipelineRasterizationStateCreateInfo`構造体で構成します。
+
+[,c++]
+----
+vk::PipelineRasterizationStateCreateInfo rasterizer{.depthClampEnable        = vk::False,
+                                                    .rasterizerDiscardEnable = vk::False,
+                                                    .polygonMode             = vk::PolygonMode::eFill,
+                                                    .cullMode                = vk::CullModeFlagBits::eBack,
+                                                    .frontFace               = vk::FrontFace::eClockwise,
+                                                    .depthBiasEnable         = vk::False,
+                                                    .lineWidth               = 1.0f};
+----
+
+`depthClampEnable`が`vk::True`の場合、ニア平面とファー平面を超えたフラグメントは破棄されるのではなく、それらにクランプされます。シャドウマップのような特殊なケースで役立ちます。これを使うにはGPU機能の有効化が必要です。
+
+`rasterizerDiscardEnable`が`vk::True`の場合、ジオメトリはラスタライザ段階を通過しません。実質的にフレームバッファへの出力を無効にします。
+
+`polygonMode`は、ジオメトリに対してフラグメントがどう生成されるかを決めます。次のモードが利用できます。
+
+* `vk::PolygonMode::eFill`: 多角形の領域をフラグメントで埋める
+* `vk::PolygonMode::eLine`: 多角形の辺を線として描画する
+* `vk::PolygonMode::ePoint`: 多角形の頂点を点として描画する
+
+fill以外のモードを使うにはGPU機能の有効化が必要です。
+
+`cullMode`変数は、使う面カリングの種類を決めます。カリングを無効にしたり、前面をカリングしたり、背面をカリングしたり、両方をカリングしたりできます。
+
+`frontFace`変数は、前面とみなす面の頂点順を指定し、時計回りまたは反時計回りにできます。
+
+ラスタライザは、定数値を加えたり、フラグメントの傾きに基づいてバイアスしたりして深度値を変えられます。シャドウマッピングで使われることがありますが、ここでは使いません。`depthBiasEnable`を`vk::False`に設定してください。
+
+`lineWidth`メンバは単純で、フラグメント数で線の太さを記述します。サポートされる最大線幅はハードウェアに依存し、`1.0f`より太い線には`wideLines` GPU機能の有効化が必要です。
+
+== マルチサンプリング
+
+`vk::PipelineMultisampleStateCreateInfo`構造体はマルチサンプリングを構成します。これはhttps://en.wikipedia.org/wiki/Multisample_anti-aliasing[アンチエイリアシング]を行う方法の一つです。同じピクセルにラスタライズされる複数の多角形のフラグメントシェーダ結果を組み合わせることで動作します。主に辺に沿って起き、最も目立つエイリアシングアーティファクトもそこで起きます。1つの多角形だけがピクセルに対応する場合はフラグメントシェーダを複数回実行する必要がないため、より高解像度に描画してからダウンスケールするより大幅に安価です。有効化にはGPU機能の有効化が必要です。
+
+[,c++]
+----
+vk::PipelineMultisampleStateCreateInfo multisampling{.rasterizationSamples = vk::SampleCountFlagBits::e1, .sampleShadingEnable = vk::False};
+----
+
+マルチサンプリングは後の章で再訪します。今は無効のままにします。
+
+== 深度とステンシルテスト
+
+深度および／またはステンシルバッファを使う場合は、`vk::PipelineDepthStencilStateCreateInfo`を使って深度とステンシルテストも構成する必要があります。今は持っていないので、そのような構造体へのポインタの代わりに単に`nullptr`を渡せます。深度バッファリングの章でまた戻ってきます。
+
+== カラーブレンディング
+
+フラグメントシェーダが色を返したあと、それをフレームバッファにすでに入っている色と組み合わせる必要があります。この変換はカラーブレンディングとして知られ、次の2つの方法があります。
+
+* 古い値と新しい値を混ぜて最終色を作る
+* ビット演算で古い値と新しい値を組み合わせる
+
+カラーブレンディングを構成する構造体には2種類あります。最初の構造体`vk::PipelineColorBlendAttachmentState`はアタッチされたフレームバッファごとの構成を含み、2つ目の構造体`vk::PipelineColorBlendStateCreateInfo`は_グローバル_なカラーブレンディング設定を含みます。今回はフレームバッファは1つだけです。
+
+[,c++]
+----
+vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+    .blendEnable    = vk::False,	    
+    .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+----
+
+このフレームバッファごとの構造体で、カラーブレンディングの最初の方法を構成できます。行われる操作は、次の疑似コードで最もよく示されます。
+
+[,c++]
+----
+if (blendEnable) {
+    finalColor.rgb = (srcColorBlendFactor * newColor.rgb) <colorBlendOp> (dstColorBlendFactor * oldColor.rgb);
+    finalColor.a = (srcAlphaBlendFactor * newColor.a) <alphaBlendOp> (dstAlphaBlendFactor * oldColor.a);
+} else {
+    finalColor = newColor;
+}
+
+finalColor = finalColor & colorWriteMask;
+----
+
+`blendEnable`が`vk::False`なら、フラグメントシェーダからの新しい色は変更されずに通ります。そうでなければ、2つの混合操作が行われて新しい色が計算されます。結果の色は`colorWriteMask`とANDされ、実際に通るチャネルが決まります。
+
+カラーブレンディングの最も一般的な使い方はアルファブレンディングの実装で、不透明度に基づいて新しい色を古い色とブレンドします。その場合の`finalColor`は次のように計算されるべきです。
+
+[,c++]
+----
+finalColor.rgb = newAlpha * newColor + (1 - newAlpha) * oldColor;
+finalColor.a = newAlpha.a;
+----
+
+これは次のパラメータで実現できます。
+
+[,c++]
+----
+vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+    .blendEnable         = vk::True,
+    .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+    .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+    .colorBlendOp        = vk::BlendOp::eAdd,
+    .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+    .dstAlphaBlendFactor = vk::BlendFactor::eZero,
+    .alphaBlendOp        = vk::BlendOp::eAdd,
+    .colorWriteMask      = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+----
+
+可能な操作はすべて、仕様の`vk::BlendFactor`と`vk::BlendOp`列挙にあります。
+
+2つ目の構造体は、すべてのフレームバッファ用の構造体配列を参照し、前述の計算でブレンド係数として使えるブレンド定数を設定できます。
+
+[,c++]
+----
+vk::PipelineColorBlendStateCreateInfo colorBlending{
+    .logicOpEnable = vk::False, .logicOp = vk::LogicOp::eCopy, .attachmentCount = 1, .pAttachments = &colorBlendAttachment};
+----
+
+ブレンディングの2つ目の方法（ビット演算の組み合わせ）を使いたい場合は、`logicOpEnable`を`vk::True`に設定します。ビット演算はその後`logicOp`フィールドで指定できます。これにより、アタッチされたすべてのフレームバッファで`blendEnable`を`vk::False`にしたかのように、最初の方法は自動的に無効になることに注意してください。このモードでも、フレームバッファのどのチャネルが実際に影響を受けるかを決めるために`colorWriteMask`が使われます。ここでしたように両方のモードを無効にすることも可能で、その場合フラグメントの色は変更されずにフレームバッファへ書き込まれます。
+
+== パイプラインレイアウト
+
+シェーダでは`uniform`値を使えます。これは動的状態変数に似たグローバルで、描画時に変更して、シェーダを再作成せずに挙動を変えられます。頂点シェーダに変換行列を渡したり、フラグメントシェーダでテクスチャサンプラを作ったりするのに一般的に使われます。
+
+これらのuniform値は、`vk::PipelineLayout`オブジェクトを作成してパイプライン作成時に指定する必要があります。将来の章まで使いませんが、空のパイプラインレイアウトを作成する必要はあります。
+
+後で他の関数から参照するので、このオブジェクトを保持するクラスメンバを作成します。
+
+[,c++]
+----
+vk::raii::PipelineLayout pipelineLayout = nullptr;
+----
+
+そして`createGraphicsPipeline`関数内でオブジェクトを作成します。
+
+[,c++]
+----
+vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 0, .pushConstantRangeCount = 0};
+
+pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
+----
+
+構造体は_プッシュ定数_も指定します。これはシェーダに動的な値を渡す別の方法で、将来の章で取り上げるかもしれません。
+
+== まとめ
+
+固定機能の状態は以上です。ゼロからすべてをセットアップするのは多くの作業ですが、利点は、グラフィックスパイプラインで起きていることのほぼすべてを把握できたことです。特定のコンポーネントのデフォルト状態が想定と違うために予期しない挙動に遭遇する可能性が減ります。
+
+xref:./03_Dynamic_rendering.adoc[次のステップ]では、アタッチメントが何をどう使われるかをグラフィックスパイプラインに伝えるため、ダイナミックレンダリングをセットアップします。
+
+link:/attachments/10_fixed_functions.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

@@ -1,0 +1,68 @@
+:pp: {plus}{plus}
+= インセット付きプライマリステレオ
+
+**Quad-View** アーキテクチャでは、各眼が 2 枚の重なる画像を見ます。**プライマリビュー** は周辺向けの広く低解像度の画像で、**インセットビュー** はユーザーの視線中心に置かれた小さく高解像度の画像です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+フォビエイテッドレンダリング向けのクアドラプルビュー構成は、対応ハードウェアにおける OpenXR の標準プロセスです。プライマリとインセットの両ビューを正しくターゲットするため、ランタイムのビュー構成 API と Vulkan のマルチビュー機能を使わなければなりません。
+
+== ピクセル密度の問題
+
+クアッドビューを理解するには、現代ディスプレイのハードウェア限界を考えてください。典型的な眼あたり 4K ヘッドセットを 110 度 FOV に広げると、おおよそ 20–25 **PPD**（Pixels Per Degree）になります。人間の「網膜」解像度は 60 PPD に近いです。
+
+ディスプレイ全体の解像度を二倍にする代わりに、**フォビエイテッドレンダリング** を使います。眼が見ている場所に高密度の「インセット」（60 PPD）を描き、周辺には低密度の「プライマリ」（20 PPD）を描きます。
+
+ランタイムは IR アイトラッキングセンサーとフレームタイミングの複雑な融合を処理してこれらのインセットを揃え、ジャリングな境界を防ぐため端を自動的に「フェザー」します。
+
+== 固定 vs. 動的フォビエーション
+
+1.  **固定フォビエーション（FFR）**: 高ディテールのインセットがレンズ中心に固定される。
+2.  **動的フォビエーション（DFR）**: 高ディテールのインセットがアイトラッキングに基づきリアルタイムに動く。
+
+[source,cpp]
+----
+// Defining the View Config for Quad-Views (N=4) using designated initializers
+// Indices 0,1 are the wide base views; 2,3 are high-detail foveal insets.
+XrViewConfigurationView configViews[4] = {
+    { .type = XR_TYPE_VIEW_CONFIGURATION_VIEW, .recommendedImageRectWidth = 1920, .recommendedImageRectHeight = 1080 },
+    { .type = XR_TYPE_VIEW_CONFIGURATION_VIEW, .recommendedImageRectWidth = 1920, .recommendedImageRectHeight = 1080 },
+    { .type = XR_TYPE_VIEW_CONFIGURATION_VIEW, .recommendedImageRectWidth = 1024, .recommendedImageRectHeight = 1024 },
+    { .type = XR_TYPE_VIEW_CONFIGURATION_VIEW, .recommendedImageRectWidth = 1024, .recommendedImageRectHeight = 1024 }
+};
+----
+
+== Slang での Quad-View 描画
+
+エンジンは 4 つの異なるビュー行列を管理します。Slang では、単一パスですべての 4 レイヤーへのブロードキャストを扱います。
+
+[source,slang]
+----
+// Slang Shader Handling N=4 Views
+struct QuadViewData {
+    float4x4 viewProjection;
+};
+
+StructuredBuffer<QuadViewData> allViews; // 4 Views total
+
+VertexOutput main(uint viewID : SV_ViewID, float3 pos : POSITION) {
+    VertexOutput output;
+    // The GPU broadcasts the same geometry to 4 different viewports/layers
+    output.position = mul(allViews[viewID].viewProjection, float4(pos, 1.0));
+    output.viewID = viewID;
+    return output;
+}
+----
+
+== 発展: 動的インセットスケーリングと VRS
+
+Vulkan では、OpenXR のクアッドビュー標準を超えてフォビエイテッドレンダリングを押し進められます。
+
+*   **Fragment Density Maps**: OpenXR は固定スワップチェーンサイズを期待しますが、Vulkan の **Fragment Density Maps** を使い、リサイズされたインセットを「偽装」できます。より小さなサブリージョンへ描画し、サンプリング時に密度マップでスケールすることで、スワップチェーン再作成なしに中心窩解像度を調整できます。
+*   **Variable Rate Shading（VRS）**: Vulkan の VRS を使い、周辺の高解像度ジオメトリを維持しつつシェーディングコストを削減し、フラグメント密度が低くても幾何エッジをシャープに保てます。
+
+TIP: フォビエイテッドレンダリングとクアッドビューの詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#XR_VARJO_quad_views[XR_VARJO_quad_views Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/09_Quad_Views_Foveated/01_introduction.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/09_Quad_Views_Foveated/03_multi_layer_composition.adoc[次へ]

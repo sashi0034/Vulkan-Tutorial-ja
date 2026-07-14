@@ -1,0 +1,82 @@
+:pp: {plus}{plus}
+= シーン理解のエンジンへの組み込み
+
+**シーン理解** を統合すると、`simple_game_engine` は物理の部屋を動的幾何として扱えます。OpenXR 空間データとエンジンの `Entity`／`MeshComponent` 系を橋渡しすることで実現します。実装例は link:../../../attachments/openxr_engine/xr_context.cpp[xr_context.cpp] にあります。
+
+== 空間メッシュのライフサイクル追跡
+
+`engine.cpp` の `Engine::update()` ループ内に、更新された空間メッシュを OpenXR に問い合わせる同期ステップを追加します。これにより、部屋がスキャンされるにつれ仮想物体が相互作用します。
+
+専用メソッド `Engine::updateSpatialMeshes()` を作成し、ランタイムのメッシュストリームを反復します。
+
+[source,cpp]
+----
+// engine.cpp
+// Supporting Struct: Spatial Mesh Bridge
+struct XrSpatialMesh {
+    XrUuidMSFT meshGuid;
+    std::vector<glm::vec3> vertices;
+    std::vector<uint32_t> indices;
+    glm::mat4 transform;
+};
+
+void Engine::updateSpatialMeshes() {
+    if (!xrMode) return;
+
+    // 1. Retrieve current spatial meshes from the OpenXR context
+    auto xrMeshes = xrContext.getLatestSpatialMeshes();
+
+    for (const auto& xrMesh : xrMeshes) {
+        // 2. Map the XR mesh ID to an Engine Entity
+        // We use a internal map: std::unordered_map<XrUuidMSFT, Entity*>
+        Entity* spatialEntity = getOrCreateSpatialEntity(xrMesh.meshGuid);
+
+        auto* meshComp = spatialEntity->getComponent<MeshComponent>();
+        auto* transform = spatialEntity->getComponent<TransformComponent>();
+
+        // 3. Update the GPU resources via our Renderer
+        // This transfers raw XrVector3f data into our vk::raii::Buffer
+        renderer->updateDynamicMesh(
+            meshComp->getBuffer(),
+            xrMesh.vertices,
+            xrMesh.indices
+        );
+
+        // 4. Update the transform to match the physical room coordinates
+        // OpenXR spatial data is already provided as a 4x4 matrix
+        transform->setLocalMatrix(xrMesh.transform);
+    }
+}
+----
+
+== セマンティック知性の適用
+
+`mesh_component.h` では、コンポーネントを拡張して **セマンティックラベル** を格納します。これにより物理と AI 系が、特定の幾何片が「床」「テーブル」「壁」を表すかどうかを問い合わせられます。
+
+エンジンが新しいメッシュを検出したら、`engine.cpp` でそのプロパティを割り当てます。
+
+[source,cpp]
+----
+// engine.cpp
+void Engine::configureSpatialEntity(Entity* entity, XrSceneComponentTypeMSFT type) {
+    auto* meshComp = entity->getComponent<MeshComponent>();
+
+    if (type == XR_SCENE_COMPONENT_TYPE_PLANE_MSFT) {
+        // High-level plane: Perfect for floor-based AI navigation
+        meshComp->setSemanticTag("Floor");
+        entity->addComponent<RigidBodyComponent>(Physics::Static);
+    } else if (type == XR_SCENE_COMPONENT_TYPE_OBJECT_MSFT) {
+        // Physical object: Enable shadows and complex physics
+        meshComp->setSemanticTag("Prop");
+        entity->addComponent<RigidBodyComponent>(Physics::Kinematic);
+    }
+}
+----
+
+== アーキテクチャ上の利点: 統一パイプライン
+
+空間データを既存の `Entity` 系へ写すことで、現実世界向けの「特別な」レンダラは不要です。`renderer_rendering.cpp` の **PBR**（Physically Based Rendering）パイプラインは、これらの空間エンティティを標準幾何として見るだけです。仮想光を受け、仮想シャドウを落とし、透過パス向けの深度情報を自動で提供します。
+
+この「統一幾何」アプローチが、説得力のある Mixed Reality の基礎であり、物理の部屋と仮想アセットを単一の一貫したシーンとして扱えます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/03_zero_copy_hand_off.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/17_ML_Inference_Spatial/01_introduction.adoc[Next]

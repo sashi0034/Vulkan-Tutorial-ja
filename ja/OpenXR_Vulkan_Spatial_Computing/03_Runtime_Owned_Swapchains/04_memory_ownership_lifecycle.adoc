@@ -1,0 +1,105 @@
+:pp: {plus}{plus}
+= メモリ所有権ライフサイクル
+
+標準のデスクトップ Vulkan アプリケーションでは、`vkAcquireNextImageKHR` でスワップチェーンからイメージインデックスを取得します。完了後は `vkQueuePresentKHR` を呼びます。OpenXR では、より明示的な 3 ステップのライフサイクル——**Wait**、**Acquire**、**Release**——に置き換えられます。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+Wait-Acquire-Release サイクルは、OpenXR フレーム処理の中核同期メカニズムです。正しく実装することは、あらゆる高性能空間エンジンにとって必須です。
+
+== 3 ステップのダンス: コンポジタとの同期
+
+GPU の準備ができ次第イメージを扱えるデスクトップウィンドウと異なり、XR ヘッドセットは厳格で時間に敏感なディスプレイです。コンポジタは **非同期リプロジェクション** などの高頻度タスクを管理しつつ、次の 3 ステップライフサイクルでエンジンのレンダリングパイプラインを効率的に保ちます。
+
+1.  **Wait**: 「描画を始められるイメージはあるか？」
+2.  **Acquire**: 「そのイメージのインデックスを渡し、私の使用のためにロックしてほしい。」
+3.  **Release**: 「描画は終わった。今すぐ返してよい。」
+
+このダンスにより、エンジンとコンポジタが同時に同じメモリにアクセスしようとせず、「ティアリング」や「スタッタリング」を防ぎます。
+
+== 1. Wait（`xrWaitSwapchainImage`）
+
+最初のステップは `xrWaitSwapchainImage` です。この呼び出しはブロッキング操作で、スワップチェーンの次のイメージへの書き込みを始めてよい準備が XR ランタイム側で整うまで待ちます。
+
+[source,cpp]
+----
+XrSwapchainImageWaitInfo waitInfo{
+    .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+    .timeout = XR_INFINITE_DURATION
+};
+xrWaitSwapchainImage(xrSwapchain, &waitInfo);
+----
+
+**ペーシングと枯渇**: エンジンがヘッドセットのリフレッシュレートより速く描画している場合、`xrWaitSwapchainImage` はエンジンスレッドをブロックし、自然なペーシング機構として働きます。ただし、イメージをタイムリーにリリースしないと、この呼び出しは無限にブロックし、エンジン全体がストールします。
+
+== 2. Acquire（`xrAcquireSwapchainImage`）
+
+ウェイトが満たされると、`xrAcquireSwapchainImage` を呼びます。この関数は、スワップチェーン内のどのイメージインデックスへ描画すべきかを特定します。
+
+[source,cpp]
+----
+uint32_t imageIndex;
+XrSwapchainImageAcquireInfo acquireInfo{
+    .type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO
+};
+xrAcquireSwapchainImage(xrSwapchain, &acquireInfo, &imageIndex);
+----
+
+この呼び出しの後、アプリケーションは `imageIndex` のイメージを正式に「所有」します。これは、コンポジタがこの特定の VRAM からもう読んでいないという Vulkan レベルの保証です。
+
+== 3. 同期とレイアウト遷移
+
+OpenXR が所有権を管理していても、Vulkan 側の同期は依然として我々の責任です。使用前にイメージを `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` へ遷移させるため、**Synchronization 2**（Vulkan 1.3）を使います。
+
+[source,cpp]
+----
+vk::ImageMemoryBarrier2 barrier{
+    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .srcAccessMask = {},
+    .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+    .oldLayout = vk::ImageLayout::eUndefined,
+    .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .image = framebuffers[imageIndex].image,
+    .subresourceRange = {
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    }
+};
+
+vk::DependencyInfo depInfo{
+    .imageMemoryBarrierCount = 1,
+    .pImageMemoryBarriers = &barrier
+};
+commandBuffer.pipelineBarrier2(depInfo);
+----
+
+== 4. Release（`xrReleaseSwapchainImage`）
+
+最後に、コマンドバッファが GPU に投入された後、`xrReleaseSwapchainImage` を呼びます。これは XR ランタイムに「このイメージへの書き込みは終わった。合成のために返してよい」と伝えます。
+
+[source,cpp]
+----
+XrSwapchainImageReleaseInfo releaseInfo{
+    .type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO
+};
+xrReleaseSwapchainImage(xrSwapchain, &releaseInfo);
+----
+
+**非同期リプロジェクション**: イメージを `Release` した後、ランタイムはそれを自前の高優先度キューに取り込みます。エンジンが次のフレーム期限を逃すと、ランタイムは *最後に* リリースされたイメージを取り、ユーザーの最新の頭の動きに基づいて「ワープ」し、性能低下中でも快適さを維持します。
+
+== 発展: 非同期コンピュートの調整
+
+OpenXR が取得サイクルを管理する一方、Vulkan の **タイムラインセマフォ** により、自前の非同期コンピュートや物理キューとの粒度の細かい同期関係を作れます。
+
+*   **粒度の細かいリリース**: レンダーパスと二次コンピュートパス（フレームデータに基づくリアルタイム音声合成など）の両方が完了した後にのみイメージをリリースするよう保証できます。
+*   **レイテンシ監視**: Vulkan の **Query Pool** を使い、自前の GPU タイミングを監視し、エンジンのストールを避けるのに十分な速さでリソースをリリースしていることを確認できます。
+
+TIP: 詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#xrWaitSwapchainImage[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/03_raii_resource_integration.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/05_incorporating_into_the_engine.adoc[次へ]

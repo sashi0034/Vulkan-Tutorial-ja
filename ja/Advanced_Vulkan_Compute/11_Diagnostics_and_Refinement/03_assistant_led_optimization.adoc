@@ -1,0 +1,90 @@
+:pp: {plus}{plus}
+= AI 支援最適化と改善
+
+GPU コンピュートの分野は急速に進化しており、高度な Vulkan コンピュートの複雑さそのものが圧倒的に感じられることがあります。大規模言語モデル（LLM）は最適化中の壁打ち相手になり得ますが——GPU 固有の作業への有用性は、モデルとプロンプト品質によって大きく異なります。
+
+== どのモデルを使うか
+
+2026 年半ば時点で、Vulkan と GPU コンピュート作業に最も確実に有用なフロンティアモデルは次のとおりです。
+
+* **Claude Opus / Sonnet**（Anthropic）— パイプラインステージとメモリレイアウトについてのコード分析と多段階推論に強い。
+* **GPT-5.5**（OpenAI）— GPU アーキテクチャの幅広い知識。Slang/HLSL 組み込みについては一貫性に欠けるが、一般パターンには堅実。
+* **Gemini 3.1 Pro / 3.1 Flash**（Google）— 大きなコンテキストウィンドウが、完全なシェーダファイルやバリデーションレイヤ出力の貼り付けに有用。
+
+[NOTE]
+====
+Vulkan 向けの LLM 品質はばらつきがあります。一般的な失敗モードには、幻覚した拡張名、不正な同期スコープ推論、Vulkan 1.0 時代の慣習に基づく古い助言が含まれます。すべての提案を解ではなく出発点として扱ってください。
+====
+
+== 新しいワークフロー
+
+LLM は、自分で候補ボトルネックを特定した後のセカンドパスツールとして最もよく働きます。問題のあるシェーダをプロファイラ出力やバリデーション警告と一緒に貼り付け、一般レビューではなく狙いを定めた分析を求めてください。
+
+=== 例: 素朴からウェーブ意識へ
+
+単一スレッドがすべての仕事を直列に行う素朴なプレフィックス和を考えてください。
+
+[source,slang]
+----
+// 素朴なアプローチ: 1 スレッドがバッファ全体を直列化
+void computeMain(uint3 globalID : SV_DispatchThreadID) {
+    if (globalID.x == 0) {
+        uint total = 0;
+        for (uint i = 0; i < bufferSize; i++) {
+            total += data[i];
+            data[i] = total;
+        }
+    }
+}
+----
+
+これをフロンティアモデルに貼り付け、プロンプト _"This Slang shader runs on Vulkan. Refactor the prefix sum to exploit Wave/Subgroup operations and eliminate the serial loop"_ を与えると、典型的に並列版が生成されます。出力が正しいかはプロンプトとモデルの Slang/HLSL Wave 組み込み訓練に大きく依存します——常に結果をコンパイルしプロファイルしてください。
+
+正しいリファクタリングは次のように見えますが、モデルが inclusive/exclusive セマンティクスを入れ替えていないか、サブグループサイズより大きいバッファ向けのクロスサブグループリダクションを省略していないかを検証してください。
+
+[source,slang]
+----
+// ウェーブ並列プレフィックス和 — ハードウェア向けのサブグループサイズ仮定を検証
+void computeMain(uint3 globalID : SV_DispatchThreadID) {
+    uint val = data[globalID.x];
+
+    // サブグループ内の inclusive プレフィックス和
+    uint inclusive_sum = WavePrefixSum(val) + val;
+
+    // このサブグループの合計 — WaveGetLaneCount() より大きいバッファでは
+    // 隣接サブグループの合計と結合しなければならない
+    uint subgroup_total = WaveReadLaneAt(inclusive_sum, WaveGetLaneCount() - 1);
+
+    // ... ワークグループをまたいでサブグループ合計を結合するさらなる論理 ...
+    data[globalID.x] = inclusive_sum;
+}
+----
+
+== シェーダ向けの効果的なプロンプト
+
+一般的なプロンプトは一般的な答えを生みます。有用な出力を得るには、次を含めてください。
+
+* **ターゲット API とシェーディング言語** — 「GPU シェーダ」ではなく「Vulkan 1.3 with Slang」。
+* **ハードウェア層** — デスクトップディスクリート、モバイル（Arm Mali/Qualcomm Adreno）、または組み込み（RDNA 統合）。
+* **具体的な症状** — プロファイラメトリクス、バリデーションレイヤメッセージ、または失敗テストケース。
+* **関連する Vulkan 用語** — サブグループ、LDS、Buffer Device Address、パイプラインバリア——一般的な CPU 最適化助言ではなく正確な答えへモデルを導くため。
+
+高品質な出力を生みがちなプロンプト例:
+
+* _"Refactor this Slang shader to use `WavePrefixSum` for better throughput on a RDNA3 GPU with 64-lane subgroups."_
+* _"Identify potential bank conflicts in this groupshared memory access pattern on Arm Mali. Show the access stride that causes conflicts."_
+* _"How can I use Buffer Device Address to replace this descriptor set in a Vulkan 1.3 bindless pipeline?"_
+
+== 黄金律: 信頼しつつ検証
+
+AI モデルは起草ツールであり、権威ではありません。
+
+1. **正しさを検証**: AI 生成の同期コードは微妙なハザードの頻出源です。ベンチマーク前に、提案されたシェーダを **GPU-Assisted Validation**（第 11 章セクション 2）に通してください。
+2. **性能をプロファイル**: 構文的に正しい Wave リファクタでも、サブグループサイズの仮定が間違っているか、メモリアクセスパターンが発散を導入すると、特定ハードウェアでは遅くなり得ます。**発散監査** や **命令スループット分析**（第 11 章セクション 1）で提案を検証してください。
+3. **拡張名を確認**: モデルはもっともらしい Vulkan 拡張名を時折捏造します。ビルドに追加する前に、あらゆる `VK_EXT_*` や `VK_KHR_*` の提案を https://registry.khronos.org/vulkan/[Khronos Vulkan Registry] と照合してください。
+
+== ループを閉じる
+
+AI 支援は、出力を評価できるほど自分のメンタルモデルがすでに強いときに最も価値があります。本シリーズでカバーした技法——サブグループ演算、メモリモデル、発散分析、バリデーションレイヤ——は、効果的にプロンプトし、モデルが間違ったときのエラーを捕捉するために必要なまさにその語彙です。次の章では、これらの基盤を、最も広く展開されている Vulkan ハードウェア——モバイルと組み込みデバイス——へ持ち込みます。
+
+xref:Advanced_Vulkan_Compute/11_Diagnostics_and_Refinement/02_compute_validation.adoc[前へ: コンピュートバリデーション] | xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/01_introduction.adoc[次へ: モバイルと組み込みコンピュート]

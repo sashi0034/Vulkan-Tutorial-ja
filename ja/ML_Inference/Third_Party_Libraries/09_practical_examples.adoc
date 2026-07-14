@@ -1,0 +1,684 @@
+:pp: {plus}{plus}
+
+= 実践例
+
+== 導入
+
+理論と概念は essential ですが、動くコードに勝るものはありません。GPU リソース共有、データ転送最適化、統合パターンを学びました。次はこれらが実アプリでどう組み合わさるか。
+
+本章では ML 推論ライブラリと Vulkan アプリケーション統合の完全動作例を 3 つ提供します: 共有 GPU メモリ付き ONNX Runtime デスクトップアプリ、Android TensorFlow Lite モバイルアプリ、60 FPS リアルタイム推論パイプライン。各例にフルコード、詳細説明、一般的落とし穴と解決策。
+
+ toy 例ではありません——独自アプリに適応可能な本番 ready パターン。コンパイル実行可能な完全さと理解可能な焦点のバランス。始めましょう。
+
+== 例 1: ONNX Runtime によるデスクトップ物体検出
+
+最初の例は最も common デスクトップシナリオ: OpenCL 実行プロバイダ ONNX Runtime でレンダリフレーム物体検出、Vulkan と OpenCL 間 GPU メモリ共有。
+
+=== シナリオ
+
+3D シーンレンダリングゲーム/グラフィックスアプリ。各フレーム物体検出——ゲームプレイ、分析、デバッグ。素朴（レンダリ→CPU readback→ML upload→推論→readback）は遅すぎる。GPU メモリ直接共有。
+
+=== アーキテクチャ概要
+
+コード前に pieces の関係。Vulkan と OpenCL が GPU メモリ（バトン）を受け渡す relay race——物理 baton ではなくセマフォで「完了、次へ」signal。
+
+フロー:
+
+Vulkan が外部メモリ対応特殊 texture に 3D シーンレンダリ。完了でセマフォ signal。OpenCL が待ち ONNX Runtime に「データ ready」。ONNX Runtime が shared texture 上で直接推論——CPU copy/upload なし。完了で OpenCL が別セマフォ signal。Vulkan が待ち結果使用。
+
+美点: すべて GPU 上。ゼロ CPU 往復。データ GPU メモリから離れず、CPU は作業調整のみデータ移動なし。
+
+=== ステップ 1: 共有メモリセットアップ
+
+基盤は OpenCL がアクセス可能 Vulkan image。typical ではない——「他 API がこのメモリにアクセス」フラグ必要。Windows Win32 handle export、Linux fd export。同物理 GPU メモリ参照手段。
+
+[source,cpp]
+----
+class SharedRenderTarget {
+public:
+    vk::raii::Image image = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
+    vk::raii::ImageView imageView = nullptr;
+
+#ifdef _WIN32
+    HANDLE memoryHandle;
+#else
+    int memoryFd;
+#endif
+
+    void create(const vk::raii::Device& device, const vk::raii::PhysicalDevice& physicalDevice,
+                uint32_t width, uint32_t height) {
+        // 外部メモリ対応 image 作成
+        vk::ExternalMemoryImageCreateInfo externalInfo{
+#ifdef _WIN32
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32
+#else
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+#endif
+        };
+
+        vk::ImageCreateInfo imageInfo{
+            .pNext = &externalInfo,
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                     vk::ImageUsageFlagBits::eSampled,
+            .sharingMode = vk::SharingMode::eExclusive,
+            .initialLayout = vk::ImageLayout::eUndefined
+        };
+
+        image = vk::raii::Image(device, imageInfo);
+
+        // export 対応メモリ割り当て
+        vk::MemoryRequirements memReqs = image.getMemoryRequirements();
+
+        vk::ExportMemoryAllocateInfo exportAllocInfo{
+            .handleTypes = externalInfo.handleTypes
+        };
+
+        vk::MemoryAllocateInfo allocInfo{
+            .pNext = &exportAllocInfo,
+            .allocationSize = memReqs.size,
+            .memoryTypeIndex = findMemoryType(physicalDevice, memReqs.memoryTypeBits,
+                                             vk::MemoryPropertyFlagBits::eDeviceLocal)
+        };
+
+        memory = vk::raii::DeviceMemory(device, allocInfo);
+        image.bindMemory(*memory, 0);
+
+        // メモリハンドル export
+#ifdef _WIN32
+        vk::MemoryGetWin32HandleInfoKHR handleInfo{
+            .memory = *memory,
+            .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32
+        };
+        memoryHandle = device.getMemoryWin32HandleKHR(handleInfo);
+#else
+        vk::MemoryGetFdInfoKHR fdInfo{
+            .memory = *memory,
+            .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+        };
+        memoryFd = device.getMemoryFdKHR(fdInfo);
+#endif
+
+        // image view 作成
+        vk::ImageViewCreateInfo viewInfo{
+            .image = *image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+        };
+
+        imageView = vk::raii::ImageView(device, viewInfo);
+        // RAII が Vulkan リソース自動クリーンアップ
+    }
+};
+----
+
+=== ステップ 2: OpenCL への import
+
+export handle 済み Vulkan image を OpenCL に通知。OpenCL「外部メモリ」が他 API handle を wrap。import して同物理 GPU メモリ参照 OpenCL image。
+
+Vulkan 語と OpenCL 語の翻訳。同物理メモリ、異なる語彙。
+
+[source,cpp]
+----
+class OpenCLSharedMemory {
+public:
+    cl_mem clImage;
+    cl_context clContext;
+
+    void importFromVulkan(const SharedRenderTarget& vulkanTarget,
+                         uint32_t width, uint32_t height,
+                         cl_context context) {
+        clContext = context;
+
+        // cl_khr_external_memory で外部メモリ import
+        cl_mem_properties_khr props[] = {
+#ifdef _WIN32
+            CL_EXTERNAL_MEMORY_HANDLE_OPAQUE_WIN32_KHR,
+            (cl_mem_properties_khr)vulkanTarget.memoryHandle,
+#else
+            CL_EXTERNAL_MEMORY_HANDLE_OPAQUE_FD_KHR,
+            (cl_mem_properties_khr)vulkanTarget.memoryFd,
+#endif
+            0
+        };
+
+        cl_image_format format;
+        format.image_channel_order = CL_RGBA;
+        format.image_channel_data_type = CL_UNORM_INT8;
+
+        cl_image_desc desc = {};
+        desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+        desc.image_width = width;
+        desc.image_height = height;
+        desc.image_depth = 1;
+        desc.image_array_size = 1;
+        desc.image_row_pitch = 0;
+        desc.image_slice_pitch = 0;
+        desc.num_mip_levels = 0;
+        desc.num_samples = 0;
+
+        cl_int err;
+        clImage = clCreateImageWithProperties(
+            clContext, props, CL_MEM_READ_WRITE, &format, &desc, nullptr, &err);
+    }
+};
+----
+
+=== ステップ 3: 同期セットアップ
+
+メモリ共有は半分。タイミング調整も——Vulkan 推論読み取り中レンダリ不可、OpenCL レンダリ完了前推論開始不可。セマフォ。
+
+メモリと同様 handle export/import。Vulkan レンダリ完了 signal→OpenCL wait→推論→OpenCL signal→Vulkan wait。 choreographed dance。
+
+[source,cpp]
+----
+class ExternalSemaphore {
+public:
+    vk::raii::Semaphore vkSemaphore = nullptr;
+    cl_semaphore_khr clSemaphore;
+
+    void create(const vk::raii::Device& device, cl_context clContext) {
+        vk::ExportSemaphoreCreateInfo exportInfo{
+#ifdef _WIN32
+            .handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32
+#else
+            .handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd
+#endif
+        };
+
+        vk::SemaphoreCreateInfo semInfo{
+            .pNext = &exportInfo
+        };
+
+        vkSemaphore = vk::raii::Semaphore(device, semInfo);
+
+#ifdef _WIN32
+        vk::SemaphoreGetWin32HandleInfoKHR handleInfo{
+            .semaphore = *vkSemaphore,
+            .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32
+        };
+
+        HANDLE semHandle = device.getSemaphoreWin32HandleKHR(handleInfo);
+
+        cl_semaphore_properties_khr props[] = {
+            CL_SEMAPHORE_EXPORT_HANDLE_TYPES_KHR,
+            CL_SEMAPHORE_HANDLE_OPAQUE_WIN32_KHR,
+            (cl_semaphore_properties_khr)semHandle,
+            0
+        };
+#else
+        vk::SemaphoreGetFdInfoKHR fdInfo{
+            .semaphore = *vkSemaphore,
+            .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd
+        };
+
+        int semFd = device.getSemaphoreFdKHR(fdInfo);
+
+        cl_semaphore_properties_khr props[] = {
+            CL_SEMAPHORE_EXPORT_HANDLE_TYPES_KHR,
+            CL_SEMAPHORE_HANDLE_OPAQUE_FD_KHR,
+            (cl_semaphore_properties_khr)semFd,
+            0
+        };
+#endif
+
+        cl_int err;
+        clSemaphore = clCreateSemaphoreWithPropertiesKHR(clContext, props, &err);
+    }
+};
+----
+
+=== ステップ 4: 推論実行
+
+shared メモリと同期 ready。ONNX Runtime OpenCL 実行プロバイダ、shared メモリ入力。ONNX Runtime は OpenCL メモリから直接テンソル作成——独自バッファへ copy 不要。
+
+[source,cpp]
+----
+class ObjectDetector {
+private:
+    Ort::Env env;
+    Ort::Session session;
+    Ort::SessionOptions sessionOptions;
+    cl_command_queue clQueue;
+
+public:
+    ObjectDetector(const std::string& modelPath, cl_command_queue queue)
+        : env(ORT_LOGGING_LEVEL_WARNING, "ObjectDetector"), clQueue(queue) {
+
+        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        session = Ort::Session(env, modelPath.c_str(), sessionOptions);
+    }
+
+    void runInference(const OpenCLSharedMemory& sharedMem,
+                     const ExternalSemaphore& renderComplete,
+                     const ExternalSemaphore& inferenceComplete,
+                     uint32_t width, uint32_t height) {
+
+        clEnqueueWaitSemaphoresKHR(clQueue, 1, &renderComplete.clSemaphore,
+                                   nullptr, 0, nullptr, nullptr);
+
+        std::vector<int64_t> inputShape = {1, 3, height, width};
+        Ort::MemoryInfo memInfo("OpenCL", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+
+        // 実務: RGBA→モデル期待形式（RGB、正規化等）変換が必要かも。OpenCL カーネル前処理。
+
+        auto inputTensor = Ort::Value::CreateTensor(memInfo,
+            reinterpret_cast<float*>(sharedMem.clImage),
+            width * height * 3,
+            inputShape.data(), inputShape.size(),
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+
+        const char* inputNames[] = {"input"};
+        const char* outputNames[] = {"output"};
+
+        auto outputs = session.Run(Ort::RunOptions{nullptr},
+                                  inputNames, &inputTensor, 1,
+                                  outputNames, 1);
+
+        clEnqueueSignalSemaphoresKHR(clQueue, 1, &inferenceComplete.clSemaphore,
+                                     nullptr, 0, nullptr, nullptr);
+    }
+};
+----
+
+=== ステップ 5: メインループ
+
+全 pieces の協調:
+
+[source,cpp]
+----
+void renderLoop() {
+    SharedRenderTarget renderTarget;
+    renderTarget.create(device, physicalDevice, 1920, 1080);
+
+    OpenCLSharedMemory clMemory;
+    clMemory.importFromVulkan(renderTarget, 1920, 1080, clContext);
+
+    ExternalSemaphore renderComplete, inferenceComplete;
+    renderComplete.create(device);
+    inferenceComplete.create(device);
+
+    ObjectDetector detector("yolov5.onnx");
+
+    while (!shouldClose()) {
+        vk::raii::CommandBuffer cmd = beginFrame();
+        renderScene(*cmd, *renderTarget.imageView);
+        endFrame(*cmd, *renderComplete.vkSemaphore);
+
+        detector.runInference(clMemory, renderComplete, inferenceComplete,
+                            1920, 1080);
+
+        vk::raii::CommandBuffer postCmd = beginCommandBuffer();
+        // ... 推論結果を可視化、ゲームプレイ等に使用 ...
+        submitWithWait(*postCmd, *inferenceComplete.vkSemaphore);
+
+        present();
+    }
+}
+----
+
+=== 要点
+
+問題: レンダリフレーム ML 推論は CPU-GPU 間 copy だと遅い。解: Vulkan と OpenCL 2 GPU API 協調、同物理メモリ。
+
+export 可能 Vulkan メモリ、handle（Win32/fd）で OpenCL 参照。外部セマフォ export/import で CPU なしタイミング調整。
+
+ payoff: 完全 GPU 上ゼロコピー推論。Vulkan レンダリ→signal→OpenCL 推論→signal→Vulkan 継続。CPU メモリ未接触。リアルタイム feasible/infeasible の差。
+
+== 例 2: TensorFlow Lite モバイル画像分類
+
+第 2 例 Android、TFLite GPU デリゲートでカメラ/レンダリ画像分類。
+
+=== シナリオ
+
+リアルタイム画像分類 Android アプリ——AR、ビジュアル検索、コンピュータビジョン機能ゲーム。Vulkan レンダリ、効率 ML 推論統合。
+
+=== アーキテクチャ概要
+
+Android AHardwareBuffer——デスクトップ Win32/fd 外部メモリ問題への Android 答え。Vulkan、OpenGL ES、カメラ、codec、TFLite GPU デリゲートが使える system-level 抽象。
+
+フロー simpler: Vulkan が AHardwareBuffer バック image レンダリ→TFLite GPU デリゲート同一 AHardwareBuffer 推論→次フレーム ready。手動 handle export、プラットフォーム分岐なし——Android が複雑さ処理。
+
+=== ステップ 1: AHardwareBuffer セットアップ
+
+AHardwareBuffer 作成、Vulkan import。GPU レンダリとデータバッファ（TFLite 読み取り）usage フラグ。Vulkan が buffer プロパティ照会——format、必要メモリ——Vulkan image wrap。
+
+[source,cpp]
+----
+class AndroidSharedImage {
+public:
+    AHardwareBuffer* hardwareBuffer;
+    vk::raii::Image image = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
+    vk::raii::ImageView imageView = nullptr;
+
+    void create(const vk::raii::Device& device, uint32_t width, uint32_t height) {
+        AHardwareBuffer_Desc bufferDesc = {};
+        bufferDesc.width = width;
+        bufferDesc.height = height;
+        bufferDesc.layers = 1;
+        bufferDesc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        bufferDesc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                          AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                          AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
+
+        AHardwareBuffer_allocate(&bufferDesc, &hardwareBuffer);
+
+        vk::AndroidHardwareBufferFormatPropertiesANDROID formatInfo{};
+
+        vk::AndroidHardwareBufferPropertiesANDROID properties{
+            .pNext = &formatInfo
+        };
+
+        properties = device.getAndroidHardwareBufferPropertiesANDROID(hardwareBuffer);
+
+        vk::ExternalMemoryImageCreateInfo externalInfo{
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eAndroidHardwareBufferANDROID
+        };
+
+        vk::ImageCreateInfo imageInfo{
+            .pNext = &externalInfo,
+            .imageType = vk::ImageType::e2D,
+            .format = formatInfo.format,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                     vk::ImageUsageFlagBits::eSampled
+        };
+
+        image = vk::raii::Image(device, imageInfo);
+
+        vk::ImportAndroidHardwareBufferInfoANDROID importInfo{
+            .buffer = hardwareBuffer
+        };
+
+        vk::MemoryAllocateInfo allocInfo{
+            .pNext = &importInfo,
+            .allocationSize = properties.allocationSize,
+            .memoryTypeIndex = findMemoryType(properties.memoryTypeBits,
+                                             vk::MemoryPropertyFlagBits::eDeviceLocal)
+        };
+
+        memory = vk::raii::DeviceMemory(device, allocInfo);
+        image.bindMemory(*memory, 0);
+
+        vk::ImageViewCreateInfo viewInfo{
+            .image = *image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = formatInfo.format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+        };
+
+        imageView = vk::raii::ImageView(device, viewInfo);
+    }
+};
+----
+
+=== ステップ 2: TensorFlow Lite 統合
+
+GPU デリゲート付き TFLite:
+
+[source,cpp]
+----
+class TFLiteClassifier {
+private:
+    std::unique_ptr<tflite::FlatBufferModel> model;
+    std::unique_ptr<tflite::Interpreter> interpreter;
+    TfLiteDelegate* gpuDelegate;
+
+public:
+    TFLiteClassifier(const std::string& modelPath) {
+        model = tflite::FlatBufferModel::BuildFromFile(modelPath.c_str());
+
+        tflite::ops::builtin::BuiltinOpResolver resolver;
+        tflite::InterpreterBuilder builder(*model, resolver);
+        builder(&interpreter);
+
+        TfLiteGpuDelegateOptionsV2 options = TfLiteGpuDelegateOptionsV2Default();
+        options.inference_priority1 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_LATENCY;
+        options.inference_priority2 = TFLITE_GPU_INFERENCE_PRIORITY_MIN_MEMORY_USAGE;
+
+        gpuDelegate = TfLiteGpuDelegateV2Create(&options);
+        interpreter->ModifyGraphWithDelegate(gpuDelegate);
+
+        interpreter->AllocateTensors();
+    }
+
+    std::vector<float> classify(AHardwareBuffer* inputBuffer) {
+        int input = interpreter->inputs()[0];
+        TfLiteTensor* inputTensor = interpreter->tensor(input);
+
+        void* inputData = inputTensor->data.raw;
+
+        void* bufferData;
+        AHardwareBuffer_lock(inputBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                            -1, nullptr, &bufferData);
+
+        memcpy(inputData, bufferData, inputTensor->bytes);
+
+        AHardwareBuffer_unlock(inputBuffer, nullptr);
+
+        interpreter->Invoke();
+
+        int output = interpreter->outputs()[0];
+        TfLiteTensor* outputTensor = interpreter->tensor(output);
+        float* outputData = outputTensor->data.f;
+
+        return std::vector<float>(outputData,
+                                 outputData + outputTensor->bytes / sizeof(float));
+    }
+
+    ~TFLiteClassifier() {
+        TfLiteGpuDelegateV2Delete(gpuDelegate);
+    }
+};
+----
+
+=== ステップ 3: Android メインループ
+
+[source,cpp]
+----
+void renderAndClassify() {
+    AndroidSharedImage sharedImage;
+    sharedImage.create(device, 224, 224);
+
+    TFLiteClassifier classifier("mobilenet_v2.tflite");
+
+    while (running) {
+        vk::raii::CommandBuffer cmd = beginFrame();
+        renderToTexture(*cmd, *sharedImage.imageView);
+        endFrame(*cmd);
+
+        graphicsQueue.waitIdle();
+
+        auto results = classifier.classify(sharedImage.hardwareBuffer);
+
+        int topClass = std::max_element(results.begin(), results.end()) - results.begin();
+        float confidence = results[topClass];
+
+        updateGameLogic(topClass, confidence);
+
+        present();
+    }
+}
+----
+
+=== 要点
+
+- Android AHardwareBuffer メモリ共有
+- Vulkan への AHardwareBuffer import
+- GPU デリゲート TFLite
+- 共有メモリ推論
+- Android native activity ライフサイクル統合
+
+デスクトップと類似パターン、Android 固有 API。
+
+== 例 3: リアルタイム推論パイプライン
+
+60 FPS フレーム処理、pipelining と async でレイテンシ hide。
+
+=== 課題
+
+60 FPS 毎フレーム推論は 16.67ms/フレーム。推論 10ms なら同期不可——予算 miss。解: 複数フレーム pipeline、フレーム N 推論中に N+1 レンダリ。
+
+=== アーキテクチャ
+
+[source]
+----
+Frame 0: レンダリ → 転送 → 推論
+Frame 1:          レンダリ → 転送 → 推論
+Frame 2:                   レンダリ → 転送 → 推論
+----
+
+各段階が他フレーム他段階と並行。
+
+=== 実装
+
+[source,cpp]
+----
+class PipelinedInference {
+private:
+    static constexpr int FRAMES_IN_FLIGHT = 3;
+
+    struct FrameResources {
+        SharedRenderTarget renderTarget;
+        OpenCLSharedMemory clMemory;
+        ExternalSemaphore renderComplete;
+        ExternalSemaphore inferenceComplete;
+        vk::raii::Fence frameFence = nullptr;
+
+        std::vector<float> results;
+        std::atomic<bool> resultsReady{false};
+    };
+
+    std::array<FrameResources, FRAMES_IN_FLIGHT> frames;
+    int currentFrame = 0;
+    ObjectDetector detector;
+
+public:
+    PipelinedInference(const std::string& modelPath)
+        : detector(modelPath) {
+
+        for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+            frames[i].renderTarget.create(device, physicalDevice, 1920, 1080);
+            frames[i].clMemory.importFromVulkan(frames[i].renderTarget, 1920, 1080);
+            frames[i].renderComplete.create(device);
+            frames[i].inferenceComplete.create(device);
+
+            vk::FenceCreateInfo fenceInfo{
+                .flags = vk::FenceCreateFlagBits::eSignaled
+            };
+            frames[i].frameFence = vk::raii::Fence(device, fenceInfo);
+        }
+    }
+
+    void processFrame() {
+        auto& frame = frames[currentFrame];
+
+        vk::Result result = device.waitForFences(*frame.frameFence, VK_TRUE, UINT64_MAX);
+        device.resetFences(*frame.frameFence);
+
+        if (frame.resultsReady.load()) {
+            processInferenceResults(frame.results);
+            frame.resultsReady.store(false);
+        }
+
+        vk::raii::CommandBuffer cmd = beginFrame();
+        renderScene(*cmd, *frame.renderTarget.imageView);
+        endFrame(*cmd, *frame.renderComplete.vkSemaphore);
+
+        std::thread([this, &frame]() {
+            detector.runInference(frame.clMemory,
+                                frame.renderComplete,
+                                frame.inferenceComplete,
+                                1920, 1080);
+
+            frame.results = detector.getResults();
+            frame.resultsReady.store(true);
+        }).detach();
+
+        vk::Semaphore waitSemaphore = *frame.inferenceComplete.vkSemaphore;
+        vk::PipelineStageFlags waitStage = vk::PipelineStageFlagBits::eAllCommands;
+
+        vk::SubmitInfo submitInfo{
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &waitSemaphore,
+            .pWaitDstStageMask = &waitStage
+        };
+
+        graphicsQueue.submit(submitInfo, *frame.frameFence);
+
+        currentFrame = (currentFrame + 1) % FRAMES_IN_FLIGHT;
+
+        present();
+    }
+
+private:
+    void processInferenceResults(const std::vector<float>& results) {
+        // pipelining により 3 フレーム前の結果
+    }
+};
+----
+
+=== 要点
+
+- 複数フレーム pipeline で推論レイテンシ hide
+- フレーム別リソースで競合回避
+- 非同期結果処理
+- 高コスト推論でも 60 FPS 維持
+
+トレードオフ: 結果数フレーム遅延。分析、非 critical ゲームプレイでは許容 often。
+
+== 一般的落とし穴と解決策
+
+=== 落とし穴 1: 同期バグ
+
+*症状*: ちらつき、破損、クラッシュ。
+
+*原因*: 同期 missing/不正——書き込み前読み取り、読み取り中書き込み。
+
+*解決*: validation layer 積極使用。デバッグ中明示同期（fence、clFinish）。
+
+=== 落とし穴 2: 形式不一致
+
+*症状*: 同期正しくても garbage 結果。
+
+*原因*: Vulkan BGRA、ML RGB。または [0,1] 期待に [0,255]。
+
+*解決*: 明示形式変換と正規化。GPU compute シェーダ。
+
+=== 落とし穴 3: メモリリーク
+
+*症状*: メモリ増加、最終クラッシュ。
+
+*原因*: 外部 handle、セマフォ、OpenCL 未解放。
+
+*解決*: RAII。create/allocate 毎 destroy/free。Valgrind、AddressSanitizer。
+
+=== 落とし穴 4: プラットフォーム固有問題
+
+*症状*: 1 プラットフォーム OK、他 NG。
+
+*原因*: capability と quirks 差。
+
+*解決*: ランタイム capability 確認、フォールバック、早期実機テスト。
+
+== まとめ
+
+実践例は ML 推論と Vulkan 統合の real-world パターン。デスクトップ ONNX Runtime+OpenCL+外部メモリ。モバイル Android TFLite+AHardwareBuffer。pipeline 例は並列でリアルタイム性能。
+
+共通原則: copy 回避のメモリ共有、race 回避の correct 同期、レイテンシ hide の pipeline。これらで diverse ハードウェア上効率 ML 統合グラフィックスアプリ構築可能。
+
+xref:ML_Inference/Third_Party_Libraries/08_data_transfer_optimization.adoc[前へ: データ転送の最適化] | xref:ML_Inference/Third_Party_Libraries/10_choosing_library.adoc[次へ: 適切なライブラリの選択]

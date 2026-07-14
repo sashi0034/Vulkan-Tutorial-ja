@@ -1,0 +1,557 @@
+= 開発環境
+
+:pp: {plus}{plus}
+
+この章では、Vulkan アプリケーション開発のための環境を整え、便利なライブラリを
+インストールします。使うツールはコンパイラを除きすべて Windows、Linux、macOS と
+互換性がありますが、インストール手順は少し異なるため、ここでは別々に説明します。
+
+== コードの取得
+
+まず、https://github.com/KhronosGroup/Vulkan-Tutorial[GitHub リポジトリ] から
+チュートリアルのコードをクローンする必要があります。
+これには https://git-scm.com/[git] バージョン管理システムのインストールが必要です。
+
+git がインストールされていれば、次のようにリポジトリをローカルにクローンできます。
+
+[,bash]
+----
+git clone https://github.com/KhronosGroup/Vulkan-Tutorial
+----
+
+これにより、（カレントディレクトリ内の）`Vulkan-Tutorial` という新しいフォルダに
+リポジトリがクローンされます。各章のソースファイルは `attachments` フォルダにあります。
+
+== 依存関係インストールスクリプト
+
+セットアップを容易にするため、Windows と Linux 向けの依存関係インストールスクリプトを
+用意しています。
+
+=== Windows
+
+Windows 向けには、vcpkg を使って必要な依存関係をすべてインストールするスクリプトを
+提供しています。
+
+1. vcpkg がインストールされていることを確認してください。なければ https://github.com/microsoft/vcpkg の手順に従ってください
+2. `scripts/install_dependencies_windows.bat` スクリプトを実行する
+3. Vulkan SDK のインストール手順に従う
+
+このインストールスクリプトを有効にするために vcpkg を使っていますが、
+プロセス全体は以下に詳細に記載されており、インストールスクリプトや vcpkg なしでも
+達成できます。セットアップを容易にするための便宜にすぎません。
+
+=== Linux
+
+Linux 向けには、パッケージマネージャを検出して必要な依存関係をすべてインストールする
+スクリプトを提供しています。
+
+1. `scripts/install_dependencies_linux.sh` スクリプトを実行する
+2. Vulkan SDK のインストール手順に従う
+
+依存関係を手動でインストールしたい場合、または macOS を使っている場合は、
+以下のプラットフォーム固有の手順に従ってください。
+
+== 共通の考慮事項
+
+=== Vulkan SDK
+
+Vulkan アプリケーション開発に最も重要なのは SDK です。
+ヘッダ、標準バリデーションレイヤ、デバッグツール、Vulkan 関数用のローダが含まれます。
+ローダはランタイムにドライバ内の関数を探し出し、OpenGL の GLEW と同様です
+（ご存じであれば）。
+
+SDK は https://vulkan.lunarg.com/sdk/home[LunarG のウェブサイト] からダウンロードできます。
+
+インストールを進め、SDK のインストール場所に注意してください。
+最初に行うことは、グラフィックスカードとドライバが Vulkan を適切にサポートしているか
+確認することです。SDK をインストールしたディレクトリに移動し、`bin` ディレクトリを
+開いて `vkcube` デモを実行してください。
+
+このディレクトリには、開発に役立つ別のプログラムもあります。`slangc` コマンドライン
+プログラムは、人間が読める
+https://shader-slang.org/slang/user-guide/[Slang Shading Language]
+からバイトコードへのシェーダコンパイルに使います。
+これについては
+xref:03_Drawing_a_triangle/02_Graphics_pipeline_basics/01_Shader_modules.adoc[シェーダモジュール]
+の章で詳しく扱います。`bin` ディレクトリには Vulkan ローダとバリデーションレイヤの
+バイナリもあり、`lib` ディレクトリにはライブラリがあります。
+
+最後に、Vulkan ヘッダを含む `include` ディレクトリがあります。
+他のファイルを探索しても構いませんが、本チュートリアルでは必要ありません。
+
+VulkanSDK が CMake プロジェクト設定やその他のツールを簡素化するために使う
+環境変数を自動的に設定するには、Linux では `setup-env` スクリプトの使用を推奨します。
+このスクリプトをターミナルの自動起動や IDE セットアップに追加すると、
+すべてのセッションでこれらの環境変数が利用可能になります。
+
+エラーメッセージが出た場合は、ドライバが最新であること、Vulkan ランタイムが
+含まれていること、グラフィックスカードがサポートされていることを確認してください。
+主要ベンダーのドライバへのリンクは
+xref:00_Introduction.adoc[導入の章] を参照してください。
+
+=== CMake
+クロスプラットフォームプロジェクトの扱いにまつわるさまざまな問題にもかかわらず、
+CMake は業界全体の定番になっています。プロジェクト全体のビルド記述ファイルを
+作成でき、あらゆるプロジェクトの作成に必要なサポートツールのセットアップと設定を
+面倒を見てくれます。
+bazel のような同様の能力を持つ他のビルドシステムもありますが、CMake ほど広く使われ
+受け入れられているものはありません。
+CMake の使い方の完全な説明はこのチュートリアルの範囲外ですが、詳細は
+http://www.cmake.org[CMake] で見つかります。
+
+Vulkan SDK は find_package の使用をサポートしています。プロジェクトで使うには、
+*-config.cmake の検索パスを find_package 設定呼び出しの `HINTS` 部分に追加できます。例:
+
+[,cmake]
+----
+find_package(slang CONFIG HINTS "$ENV{VULKAN_SDK}/lib/cmake")
+----
+
+将来、FindVulkan.cmake は *-config.cmake 標準に移行するかもしれませんが、
+執筆時点では VulkanSamples から FindVulkan.cmake を取得することを推奨します。
+Kitware のものは非推奨であり、macOS ビルドにバグがあるためです。
+コードディレクトリの link:/attachments/CMake/FindVulkan.cmake[FindVulkan.cmake]
+にあります。
+
+FindVulkan.cmake の使用はプロジェクト固有のファイルであり、ビルド環境でうまく動くよう
+必要に応じて変更でき、さらにニーズに合わせて調整できます。
+Khronos が VulkanSamples で配布しているものは十分にテストされており、良い出発点です。
+
+使うには、次のように CMAKE_MODULE_PATH に追加します。
+
+[,cmake]
+----
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/CMake")
+----
+
+これにより、Find*.cmake 経由で配布される他のプロジェクトも同じフォルダに置けます。
+動作するプロジェクトの例として、付属の link:/attachments/CMakeLists.txt[CMakeLists.txt]
+を参照してください。
+
+Vulkan C{pp} ヘッダは C{pp} モジュールも提供しています。C{pp} モジュールの大きな利点は、
+長いコンパイル時間のオーバーヘッドなしに C{pp} のすべての利点を得られることです。
+使うには、.cppm ファイルをターゲットデバイス向けにコンパイルする必要があります。
+
+[NOTE]
+====
+Vulkan C{pp} ヘッダのモジュールサポートはまだ実験的であり、すべてのコンパイラで動作するとは限りません。実験したいのでなければ、**使わない**ことを推奨します。
+====
+
+attachments テンプレートで Vulkan C{pp}20 モジュールを有効にするには、次のように CMake を設定します。
+
+[,bash]
+----
+cmake -DENABLE_CPP20_MODULE=ON ..
+----
+
+有効にすると、CMakeLists.txt にモジュールを自動ビルドするために必要な指示がすべて
+含まれます。関連するスニペットは次のとおりです。
+
+[,cmake]
+----
+find_package (Vulkan REQUIRED)
+
+# set up Vulkan C++ module (enabled when ENABLE_CPP20_MODULE=ON)
+add_library(VulkanCppModule)
+add_library(Vulkan::cppm ALIAS VulkanCppModule)
+
+target_compile_definitions(VulkanCppModule PUBLIC
+        VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+        VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
+)
+
+target_include_directories(VulkanCppModule PRIVATE "${Vulkan_INCLUDE_DIR}")
+
+target_link_libraries(VulkanCppModule PUBLIC Vulkan::Vulkan)
+
+set_target_properties(VulkanCppModule PROPERTIES CXX_STANDARD 20)
+
+target_sources(VulkanCppModule
+        PUBLIC
+        FILE_SET cxx_modules TYPE CXX_MODULES
+        BASE_DIRS "${Vulkan_INCLUDE_DIR}"
+        FILES "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.cppm"
+)
+----
+
+VulkanCppModule ターゲットは一度定義するだけで済み、消費するプロジェクトの依存関係に
+追加すれば自動的にビルドされます。
+プロジェクトに Vulkan::Vulkan も追加する必要はありません。
+
+[,cmake]
+----
+target_link_libraries (${PROJECT_NAME} Vulkan::cppm)
+----
+
+モジュールを無効のまま（デフォルト）にする場合は、従来のヘッダベースのインクルード
+（例: `#include <vulkan/vulkan_raii.hpp>`）を使い続けられます。
+attachments のサンプルコードはどちらの方法でもコンパイルできるよう書かれており、
+`ENABLE_CPP20_MODULE=ON`（`USE_CPP20_MODULES` を定義）のときだけモジュールを
+インポートします。
+
+=== ウィンドウ管理
+
+前述のとおり、Vulkan 自体はプラットフォーム非依存の API であり、描画結果を表示する
+ウィンドウを作成するツールは含みません。Vulkan のクロスプラットフォームの利点を
+活かすため、Windows、Linux、macOS をサポートする
+http://www.glfw.org/[GLFW ライブラリ]
+を使ってウィンドウを作成します。この目的には
+https://www.libsdl.org/[SDL]
+のような他のライブラリもありますが、GLFW の利点は、ウィンドウ作成以外にも
+Vulkan におけるプラットフォーム固有の事柄の一部を抽象化してくれることです。
+
+残念な欠点は、GLFW が Android や iOS では動作しないことです。デスクトップ専用の
+ソリューションです。SDL はモバイルサポートを提供しますが、モバイルのウィンドウ処理は、
+Android の JNI を使うなど、オペレーティングシステムと直接連携するのが最善です。
+
+=== GLM
+
+DirectX 12 とは異なり、Vulkan には線形代数操作用のライブラリが含まれていないため、
+ダウンロードする必要があります。http://glm.g-truc.net/[GLM] は
+グラフィックス API での使用向けに設計された優れたライブラリで、OpenGL でも
+よく使われています。
+
+=== テクスチャライブラリ
+
+Vulkan 自体には、png、jpeg、ktx ファイルなどさまざまなテクスチャリソースを
+読み込むサポートがありません。ただし、これは大きなトピックであり、あらゆる形式に
+深く踏み込むのはこのチュートリアルの範囲外です。
+本チュートリアルでは、テクスチャ読み込みの依存関係として stb を使います。
+グラフィックスアプリケーション向けに設計されたテクスチャ形式の利点を十分に得るため、
+ktx を調べることを推奨します。
+
+=== モデリングライブラリ
+
+モデル形式は多数あり、あらゆるところで多くの詳細が露出します。
+一般に、Vulkan や他のグラフィカル API で最も重要なのは、頂点情報、テクスチャ座標、
+場合によってはディフューズカラーの詳細です。
+GLTF は、クロスプラットフォームライブラリでサポートしやすい機能を持つ、
+高度で機能豊富なモデル形式です。ただし本チュートリアルでは、その純粋な簡潔さから
+tinyobjloader を使います。
+tinyobjloader ライブラリは、小さく複雑でないプロジェクトにのみ推奨します。
+
+== Windows
+
+Windows での開発は Visual Studio が最も簡単です。CLion も Windows でよく動作し、
+Android Studio も同様ですが、Visual Studio は非常に人気がありサポートも厚いため、
+そこでの依存関係の取得について説明します。完全な C++20 サポートには、2019 より
+新しい任意のバージョンが必要です。以下の手順は VS 2022 向けに書かれています。
+
+=== パッケージ管理
+すべてのプラットフォームで、プラットフォーム管理ツールの使用を推奨します。
+Windows はネイティブにはパッケージ管理に依存しないため、これは馴染みのない概念です。
+しかし、Microsoft はクロスプラットフォームでも動作する素晴らしいパッケージ管理ツールを
+導入しました。VCPkg は必要なすべての CMake 設定のセットアップも含みます。
+Windows プロジェクトでの CMake の使い方の詳細については、優れたドキュメント
+https://learn.microsoft.com/en-us/vcpkg/get_started/get-started?pivots=shell-powershell[こちら]
+に従うことを推奨します。
+
+このセットアップにより、Windows 開発者は Visual Studio でネイティブに CMake を
+使え、統合はかなり良好です。
+あるいは、http://jetbrains.com[CLion] はすべてのプラットフォームで
+CMakeLists.txt プロジェクトをネイティブにサポートし、Android Studio と
+まったく同じように動作します。
+また無料の IDE です。
+
+=== GLFW
+
+前述のとおり vcpkg でパッケージをインストールすることを推奨します。そのためには、
+コマンドラインから次を実行します: `vcpkg install glfw3`
+
+vcpkg なしでインストールしたい場合は、
+https://www.glfw.org/download.html[公式ウェブサイト]
+で GLFW の最新リリースを見つけられます。
+
+本チュートリアルでは 64 ビットバイナリを使いますが、もちろん 32 ビットモードで
+ビルドすることもできます。その場合は、`Lib` ではなく `Lib32` ディレクトリの
+Vulkan SDK バイナリとリンクしてください。ダウンロード後、都合のよい場所にアーカイブを
+展開してください。ここではドキュメント下の Visual Studio ディレクトリに
+`Libraries` ディレクトリを作成することにしました。
+
+image::/images/glfw_directory.png[]
+
+=== GLM
+
+純粋なグラフィックス API として、Vulkan には線形代数操作用のライブラリが
+含まれていないため、ダウンロードする必要があります。
+LM も次のように vcpkg でインストールできます: vcpkg install glm
+
+あるいは、GLM はヘッダオンリーライブラリなので、グラフィックス API での使用向けに
+設計され OpenGL でもよく使われる https://glm.g-truc.net/[GLM]
+をダウンロードしてください。
+
+image::/images/library_directory.png[]
+
+=== tinyobjloader
+
+Tinyobjloader は次のように vcpkg でインストールできます: vcpkg install tinyobjloader
+
+== Linux
+
+これらの手順は Ubuntu、Fedora、Arch Linux ユーザー向けですが、
+パッケージマネージャ固有のコマンドを適切なものに変えれば、一緒に進められるかも
+しれません。
+C{pp}20 をサポートするコンパイラ（GCC 7+ または Clang 5+）が必要です。
+また `cmake` も必要です。これらの多くは build-essentials のような大きなパッケージ経由で
+インストールできます。
+
+CLion や他の IDE の使用を推奨しますが、Linux の多くのことと同様、GUI は完全に任意です。
+
+=== Vulkan tarball
+
+Linux で Vulkan アプリケーションを開発するのに最も必要なのは、Vulkan ローダ、
+バリデーションレイヤ、およびマシンが Vulkan 対応かどうかをテストするいくつかの
+コマンドラインユーティリティです。
+
+https://vulkan.lunarg.com/[LunarG] から VulkanSDK tarball をダウンロードします。
+展開した VulkanSDK を都合のよいパスに置き、次のように最新へのシンボリックリンクを
+作成します。
+
+[,shell]
+----
+pushd vulkansdk
+tar -xf vulkansdk-linux-x86_64-1.4.304.1.tar.xz
+ln -s 1.4.304.1 default
+----
+
+次に、Vulkan の環境変数がどこでも有効になるよう、~/.bashrc ファイルに次を追加します。
+
+[,shell]
+----
+source ~/vulkanSDK/default/setup-env.sh
+----
+
+インストールが成功していれば、Vulkan の部分は準備完了です。
+`vkcube` を実行し、ウィンドウに次のようなものが表示されることを確認してください。
+
+image::/images/cube_demo_nowindow.png[]
+
+エラーメッセージが出た場合は、ドライバが最新であること、Vulkan ランタイムが
+含まれていること、グラフィックスカードがサポートされていることを確認してください。
+主要ベンダーのドライバへのリンクは
+xref:00_Introduction.adoc[導入の章] を参照してください。
+
+=== Ninja
+Ninja は、すべてのプラットフォームで CMake がサポートする高速ビルドシステムです。
+`sudo apt install ninja-build` でのインストールを推奨します。
+
+=== X Window System と XFree86-VidModeExtension
+これらのライブラリがシステムにない可能性があります。ない場合は、次のコマンドで
+インストールできます。
+* `sudo apt install libxxf86vm-dev` または `dnf install libXxf86vm-devel`:
+XFree86-VidModeExtension へのインターフェースを提供します。
+* `sudo apt install libxi-dev` または `dnf install libXi-devel`: XINPUT 拡張への
+X Window System クライアントインターフェースを提供します。
+
+=== GLFW
+
+次のコマンドから GLFW をインストールします。
+
+[,bash]
+----
+sudo apt install libglfw3-dev
+----
+または
+[,bash]
+----
+sudo dnf install glfw-devel
+----
+または
+[,bash]
+----
+sudo pacman -S glfw-wayland # glfw-x11 for X11 users
+----
+
+=== GLM
+
+`libglm-dev` または `glm-devel` パッケージからインストールできるヘッダオンリー
+ライブラリです。
+
+[,bash]
+----
+sudo apt install libglm-dev
+----
+または
+[,bash]
+----
+sudo dnf install glm-devel
+----
+または
+[,bash]
+----
+sudo pacman -S glm
+----
+
+=== CLion のセットアップ（任意）
+
+http://jetbrains.com[CLion] はそこから入手できます。CLion を自動更新できるよう、
+JetBrains Toolbox からのインストールを推奨します。
+CLion のような IDE を使うには、ターミナルが実行するときにセットアップされる環境変数を
+設定する必要があります。
+[,shell]
+----
+source ~/vulkanSDK/default/setup-env.sh
+----
+そのためには、Settings を開き、「Build, Execution, Deployment」を選択し、
+次に CMake を選択します。そのウィンドウの下部に環境変数があります。
+そこに VULKAN_SDK=<fullPathToVulkanSDK> を追加すると、コンパイル時に Vulkan が
+見つかります。フルパスはトップレベルの VulkanSDK フォルダだけではないことに注意してください。
+正確なパスを見つけるには、ターミナルで次を実行してください。
+[,shell]
+----
+echo $VULKAN_SDK
+----
+
+便宜のため、少なくともランタイムについては、レイヤをシステム全体に置くことを推奨します。
+そのためには、ターミナルから次を実行します。
+[,bash]
+----
+sudo cp $VULKAN_SDK/lib/libVkLayer_*.so /usr/local/lib/
+sudo mkdir -p /usr/local/share/vulkan/explicit_layer.d
+sudo cp $VULKAN_SDK/share/vulkan/explicit_layer.d/VkLayer_*.json /usr/local/share/vulkan/explicit_layer.d
+----
+
+あるいは、システム環境変数に VK_LAYER_PATH を追加し、
+`$VULKAN_SDK/share/vulkan/explicit_layer.d` を指すこともできます。また、
+LD_LIBRARY_CONFIG に `$VULKAN_SDK/lib` パスを追加したいでしょう。
+これらはすべて、ターミナル使用時に setup-env.sh ファイルが行ってくれます。
+
+=== CMake プロジェクトのセットアップ
+
+依存関係をすべてインストールしたので、Vulkan 用の基本的な CMake プロジェクトを
+セットアップし、すべてが動作することを確認するための少しのコードを書けます。
+
+変数やルールの仕組みなど、CMake の基本的な経験があることを前提とします。
+なければ、https://cmake.org/cmake/help/book/mastering-cmake/cmake/Help/guide/tutorial/[このチュートリアル]
+ですぐに追いつけます。
+
+これで、このチュートリアルの link:/attachments/[attachments] ディレクトリを
+Vulkan プロジェクトのテンプレートとして使えます。コピーを作り、`HelloTriangle`
+のような名前に変更し、`main.cpp` 内のコードをすべて削除してください。
+
+xref:03_Drawing_a_triangle/00_Setup/00_Base_code.adoc[本当の冒険] への準備が整いました。
+
+== macOS
+
+これらの手順は、Xcode と https://brew.sh/[Homebrew パッケージマネージャ] を使っていることを前提とします。
+また、少なくとも macOS バージョン 10.11 が必要であり、デバイスが
+https://en.wikipedia.org/wiki/Metal_(API)#Supported_GPUs[Metal API]
+をサポートしている必要があることに留意してください。
+
+=== Vulkan SDK
+
+macOS 向けの SDK バージョンは内部で https://github.com/KhronosGroup/MoltenVK[MoltenVK]
+を使います。
+macOS には Vulkan のネイティブサポートがないため、MoltenVK が実際に行うのは、
+Vulkan API 呼び出しを Apple の Metal グラフィックスフレームワークに変換するレイヤと
+して機能することです。
+これにより、Apple の Metal フレームワークのデバッグとパフォーマンスの利点を
+活かせます。
+
+macOS 用インストーラをダウンロードしたら、ダブルクリックしてプロンプトに従ってください。
+「Installation Folder」ステップでのインストール場所をメモしておいてください。
+Xcode でプロジェクトを作成するときに参照する必要があります。
+
+image::/images/sdk_install_mac.png[]
+
+**注意**: 本チュートリアルでは、`vulkansdk` は VulkanSDK をインストールしたパスを指します。
+
+`vulkansdk/Applications` フォルダ内には、SDK を使っていくつかのデモを実行する
+実行可能ファイルがあるはずです。
+`vkcube` 実行可能ファイルを実行すると、次のように表示されます。
+
+image::/images/cube_demo_mac.png[]
+
+=== GLFW
+
+MacOS で GLFW をインストールするには、Homebrew パッケージマネージャで `glfw`
+パッケージを取得します。
+
+[,bash]
+----
+brew install glfw
+----
+
+=== GLM
+
+`glm` パッケージからインストールできるヘッダオンリーライブラリです。
+
+[,bash]
+----
+brew install glm
+----
+
+=== Xcode のセットアップ
+
+依存関係がすべてインストールされたので、Vulkan 用の基本的な Xcode プロジェクトを
+セットアップできます。
+ここでの指示のほとんどは本質的に多くの「配管」であり、すべての依存関係をプロジェクトに
+リンクできるようにします。
+また、以下の指示でフォルダ `vulkansdk` に言及するときは、Vulkan SDK を展開した
+フォルダを指していることに留意してください。
+
+どこでも CMake を使うことを推奨し、Apple も例外ではありません。Apple 向けの
+CMake の使い方の例は https://medium.com/practical-coding/migrating-to-cmake-in-c-and-getting-it-working-with-xcode-50b7bb80ae3d[こちら]
+にあります。
+また、Apple 環境での cmake プロジェクトの使用について、VulkanSamples プロジェクトに
+ドキュメントがあります。iOS とデスクトップ Apple の両方を対象としています。
+
+XCode ジェネレータで CMake を使ったら、生成された xcode プロジェクトを開きます。
+このチュートリアルのコードディレクトリを使う場合は、コマンドラインから次のようにできます。
+
+[,shell]
+----
+cd code
+cmake -G XCode
+----
+
+最後に設定が必要なのは、いくつかの環境変数です。
+Xcode のツールバーで `Product` > `Scheme` > `+Edit Scheme...+` に行き、
+`Arguments` タブで次の 2 つの環境変数を追加します。
+
+* VK_ICD_FILENAMES = `vulkansdk/macOS/share/vulkan/icd.d/MoltenVK_icd.json`
+* VK_LAYER_PATH = `vulkansdk/macOS/share/vulkan/explicit_layer.d`
+
+'shared' のチェックを外します。次のようになるはずです。
+
+image::/images/xcode_variables.png[]
+
+これで準備完了です！
+
+xref:03_Drawing_a_triangle/00_Setup/00_Base_code.adoc[本番] への準備が整いました。
+
+== Android
+
+Vulkan は Android 上の第一級 API であり、広くサポートされています。ただし、ウィンドウ管理から
+ビルドシステムまで、デスクトップとはいくつかの重要な点で異なります。そのため、基本章は
+デスクトッププラットフォームに焦点を当てつつ、チュートリアルには開発環境のセットアップと
+Android 上でのチュートリアルコードの起動を案内する
+xref:14_Android.adoc[専用の章] もあります。
+
+== CMake プロジェクトのセットアップ
+
+依存関係をすべてインストールしたので、Vulkan 用の基本的な CMake プロジェクトを
+セットアップし、すべてが動作することを確認するための少しのコードを書けます。
+
+変数やルールの仕組みなど、CMake の基本的な経験があることを前提とします。
+なければ、https://cmake.org/cmake/help/book/mastering-cmake/cmake/Help/guide/tutorial/[このチュートリアル]
+ですぐに追いつけます。
+
+`attachment\template` フォルダには、好みの IDE 用に `build` フォルダにプロジェクトファイルを
+作成できる CMake テンプレートが含まれています。チュートリアルを進める出発点として使ってください。
+
+----
+cd attachments\template
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=[path\to\vcpkg]\scripts\buildsystems\vcpkg.cmake
+----
+
+あるいは、`attachments` フォルダで同じことを行うと、チュートリアルのすべての章を含む
+プロジェクトが作成されます。
+
+----
+cd attachments
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=[path\to\vcpkg]\scripts\buildsystems\vcpkg.cmake
+----
+
+おめでとうございます。xref:03_Drawing_a_triangle/00_Setup/00_Base_code.adoc[Vulkan を遊ぶ]
+準備が整いました！

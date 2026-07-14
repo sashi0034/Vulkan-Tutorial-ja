@@ -1,0 +1,106 @@
+:pp: {plus}{plus}
+= 同時フレームの管理: メインループの再構築
+
+== 目標: 混沌なしのオーバーラップ
+
+フレームインフライトシステムの目的は単純です。CPU が将来のフレームを準備している間、GPU を忙しく保つこと。コツは、データを壊したり無制限のレイテンシを入れたりせずにそれを行うことです。タイムラインセマフォなら、「フレーム N が完了した」を表す単一の単調な値で、これをきれいに表現できます。
+
+== 実践的な構造
+
+フレームごとのデータのリング（コマンドバッファ、ディスクリプタセット、一時バッファ）を使います。各フレームには、それらのリソースを再利用して安全なタイミングを示す関連タイムライン値があります。
+
+[,cpp]
+----
+struct FrameContext {
+    vk::raii::CommandPool   pool{nullptr};
+    vk::raii::CommandBuffer cmd{nullptr};
+    vk::raii::Fence         fence{nullptr}; // optional if you only use timeline waits on CPU
+    uint64_t                retireValue = 0; // timeline value when this frame finishes
+};
+
+std::array<FrameContext, MaxFramesInFlight> frames;
+
+vk::raii::Semaphore timeline = createTimelineSemaphore(device, /*initial=*/0);
+uint64_t nextSubmitValue = 1; // monotonically increasing
+----
+
+== タイムラインゲート付きメインループ
+
+各フレームで、リング内の次の `FrameContext` を選びます。そのリソースに触れる前に、グローバルタイムラインが、それらのリソースが最後に使われた値を超えて進んでいることを確認します。
+
+[,cpp]
+----
+FrameContext& fc = frames[currentFrameIndex];
+
+// Wait until GPU has reached the value when this frame's resources were last retired
+if (fc.retireValue != 0) {
+    auto waitInfo = vk::SemaphoreWaitInfo{
+        .semaphoreCount = 1,
+        .pSemaphores    = &(*timeline),
+        .pValues        = &fc.retireValue
+    };
+    device.waitSemaphores(waitInfo, /*timeoutNs=*/UINT64_C(1'000'000'000)); // 1s timeout
+}
+
+// Record & submit this frame
+recordCommands(fc.cmd /*, ... */);
+
+// Define the value that represents "this frame complete"
+const uint64_t frameComplete = nextSubmitValue++;
+
+vk::SemaphoreSubmitInfo signalInfo{
+    .semaphore = *timeline,
+    .value     = frameComplete,
+    .stageMask = vk::PipelineStageFlagBits2::eAllCommands
+};
+
+vk::CommandBufferSubmitInfo cmdInfo{ .commandBuffer = *fc.cmd };
+
+vk::SubmitInfo2 submit{
+    .commandBufferInfoCount  = 1,
+    .pCommandBufferInfos     = &cmdInfo,
+    .signalSemaphoreInfoCount= 1,
+    .pSignalSemaphoreInfos   = &signalInfo
+};
+
+graphicsQueue.submit2(submit);
+
+// Tag this frame's resources with the value at which they're safe to reuse
+fc.retireValue = frameComplete;
+----
+
+== フェンスなしの CPU スロットル
+
+レイテンシを制限する（例: インフライトは 2〜3 フレームだけ）には、新しいフレームを始める前に、「最も古いインフライトフレームが終わった」に対応する値を待ちます。フレームごとのフェンスは不要です。
+
+[,cpp]
+----
+const uint64_t minAllowedValue = frameCompleteValueFor(currentFrameIndex - (MaxFramesInFlight - 1));
+if (minAllowedValue) {
+    auto waitInfo = vk::SemaphoreWaitInfo{
+        .semaphoreCount = 1,
+        .pSemaphores    = &(*timeline),
+        .pValues        = &minAllowedValue
+    };
+    device.waitSemaphores(waitInfo, UINT64_MAX);
+}
+----
+
+このアプローチは、単一のデバッグ可能なカウンタの周りにフロー制御を集約します。次の節では、同じカウンタを使い、リソースの破棄と再利用について精密で低オーバーヘッドな判断を行います。
+
+== Simple Engine での実装方法
+
+`Simple Engine` でこれを実装するには、`Renderer::Render` メソッドをリファクタリングします。現在は `inFlightFences[currentFrame]` に依存して CPU をストールさせています。これを単一の `Renderer::frameTimeline` セマフォに置き換えます。
+
+新しい論理は次のようになります。
+
+1.  **リタイア値の計算**: `waitForFences` の代わりに、現在のフレームスロットの `retireValue` を計算します。これは単に、このスロットが前回サブミットされたときに割り当てられたタイムライン値です（例: `frameTimelineValue[currentFrame]`）。
+2.  **タイムライン待ち**: その `retireValue` を待つために `device.waitSemaphores` を呼びます。これにより、このフレームスロットに関連するリソース（コマンドバッファ、ディスクリプタセット）の使用を GPU が終えたことが保証されます。
+3.  **シグナル付きサブミット**: `queue.submit2` を呼ぶとき、新しい増分値で `frameTimeline` をシグナルする `vk::SemaphoreSubmitInfo` を含めます。
+4.  **フレームスロットの更新**: この新しいシグナル値を `frameTimelineValue[currentFrame]` に保存し、リングでこのスロットが次に回ってきたときに待てるようにします。
+
+このリファクタにより `inFlightFences` 配列を完全に削除でき、リソース管理が簡素化され、他の非同期システムを同じ「マスタークロック」へ統合しやすくなります。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Frame_in_Flight/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Frame_in_Flight/03_resource_lifetimes.adoc[リソースの寿命]

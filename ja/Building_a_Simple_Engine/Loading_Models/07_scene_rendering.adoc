@@ -1,0 +1,705 @@
+:pp: {plus}{plus}
+
+= モデルのロード: シーンのレンダリング
+
+== シーンのレンダリング
+
+=== シーンレンダリングの概要
+
+シーン レンダリングは、3D シーンの記述を画面上に表示できる 2D イメージに変換するプロセスです。私たちのエンジンでは、これにはシーン グラフの走査、変換の適用、マテリアル プロパティの設定、GPU への描画コマンドの発行が含まれます。
+
+シーンのレンダリング プロセスは、これまでに構築したすべてのコンポーネントが集まる場所であるため、レンダリングパイプラインの重要な部分です。
+
+* モデル システムは、シーン グラフ構造とメッシュ データを提供します。
+* マテリアル システムはオブジェクトの外観を定義します
+* カメラシステムが視点を決定する
+* 照明システムがシーンを照らします
+
+この章では、これらのコンポーネントがどのように連携して完全なシーンをレンダリングするかについて説明します。
+
+=== シーングラフのトラバーサル
+
+シーン グラフは、シーン内のオブジェクトを編成する階層ツリー構造です。ツリー内の各ノードは変換 (位置、回転、スケール) を持つことができ、レンダリングするメッシュが含まれる場合があります。ノードには、親の変換を継承する子ノードを持つこともできます。
+
+シーン グラフをレンダリングするには、深さ優先の方法でシーン グラフをトラバースし、各ノードのグローバル変換行列を計算し、見つかったメッシュをレンダリングする必要があります。
+
+[source,cpp]
+----
+void renderScene(const vk::raii::CommandBuffer& commandBuffer, Model& model, const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix) {
+    // Start traversal from the root nodes with an identity matrix
+    glm::mat4 rootMatrix = glm::mat4(1.0f);
+    renderNode(commandBuffer, model.nodes, rootMatrix);
+}
+----
+
+`renderNode` 機能は、シーン レンダリング システムの中心です。シーン グラフを再帰的に走査し、各ノードのグローバル変換行列を計算し、そこに含まれるメッシュをレンダリングします。
+
+=== ノードの走査と変換の計算
+
+レンダリング プロセスは、シーン グラフの系統的な走査から始まり、各ノードの変換は、そのローカル変換とその親の累積された変換行列を組み合わせることによって計算されます。
+
+[source,cpp]
+----
+void renderNode(const vk::raii::CommandBuffer& commandBuffer, const std::vector<Node*>& nodes, const glm::mat4& parentMatrix) {
+    for (const auto node : nodes) {
+        // Calculate the cumulative transformation from root to current node
+        // This combines the parent's world transformation with this node's local transformation
+        glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+----
+
+変換計算は、階層シーン グラフ レンダリングの中核を表します。各ノードの `getLocalMatrix()` は、その親に対する相対的な変換を返します。その後、行列の乗算を使用して、蓄積された親の変換と結合します。この数学的演算により、変換が階層の下に効果的に「連鎖」され、親ノードを移動すると、そのすべての子がワールド空間内で自動的に移動されます。
+
+ここでは乗算の順序が重要です。`parentMatrix * nodeLocalMatrix` は、ノードのローカル変換が最初に (ノードのローカル座標空間内で) 発生し、続いて親の変換がワールド空間に配置されるようにします。この順序付けにより、子が親に対して相対的に配置される階層関係が維持されます。
+
+=== メッシュの検証とレンダリングの準備
+
+レンダリングする前に、ノードに有効なメッシュ データが含まれており、GPU バッファに適切にアップロードされていることを検証する必要があります。これにより、不完全または無効なシーン グラフ ノードを処理する堅牢なレンダリングが保証されます。
+
+[source,cpp]
+----
+        // Validate that this node has complete, renderable mesh data
+        // All conditions must be met for safe GPU rendering
+        if (!node->mesh.vertices.empty() && !node->mesh.indices.empty() &&
+            node->vertexBufferIndex >= 0 && node->indexBufferIndex >= 0) {
+----
+
+この検証手順により、不完全なシーン グラフ ノードによって発生する可能性のあるレンダリング エラーが防止されます。シーン グラフ内のすべてのノードに必ずしもレンダリング可能なジオメトリが含まれているわけではありません。一部のノードは純粋に編成のため、または子オブジェクトの変換アンカーとして存在します。空ではない頂点配列とインデックス配列、および有効なバッファ インデックスをチェックすることで、GPU リソースで適切に準備されたノードのみをレンダリングしようとすることが保証されます。
+
+バッファ インデックス チェック (>= 0) は、メッシュ データが GPU バッファに正常にアップロードされ、バッファ管理システムで有効なインデックス (0 以上) が割り当てられていることを確認します。 0 は有効なバッファ インデックスであることに注意してください。負の値 (通常は -1) は、初期化されていない、または失敗したバッファ割り当てを示します。
+
+=== 材料特性の構成
+
+このマテリアル セットアップ手順では、高レベルのマテリアルの説明が、レンダリングされたジオメトリの外観と照明プロパティを制御する GPU 対応のプッシュ定数に変換されます。
+
+[source,cpp]
+----
+            // Initialize push constants structure for material data transfer
+            PushConstantBlock pushConstants{};
+
+            // Configure material properties if a valid material is assigned
+            if (node->mesh.materialIndex >= 0 && node->mesh.materialIndex < static_cast<int>(model.materials.size())) {
+                const auto& material = model.materials[node->mesh.materialIndex];
+
+                // Set PBR material factors that control surface appearance
+                pushConstants.baseColorFactor = material.baseColorFactor;      // Surface color tint
+                pushConstants.metallicFactor = material.metallicFactor;        // Metallic vs. dielectric
+                pushConstants.roughnessFactor = material.roughnessFactor;      // Surface roughness
+
+                // Configure texture binding indices (-1 indicates no texture)
+                pushConstants.baseColorTextureSet = material.baseColorTextureIndex >= 0 ? 1 : -1;
+                pushConstants.physicalDescriptorTextureSet = material.metallicRoughnessTextureIndex >= 0 ? 2 : -1;
+                pushConstants.normalTextureSet = material.normalTextureIndex >= 0 ? 3 : -1;
+                pushConstants.occlusionTextureSet = material.occlusionTextureIndex >= 0 ? 4 : -1;
+                pushConstants.emissiveTextureSet = material.emissiveTextureIndex >= 0 ? 5 : -1;
+            } else {
+                // Apply sensible default material properties for unassigned materials
+                pushConstants.baseColorFactor = glm::vec4(1.0f);               // White base color
+                pushConstants.metallicFactor = 1.0f;                           // Fully metallic (safe default)
+                pushConstants.roughnessFactor = 1.0f;                          // Fully rough (safe default)
+                pushConstants.baseColorTextureSet = -1;                        // No texture for default material
+                pushConstants.physicalDescriptorTextureSet = -1;               // No metallic/roughness texture
+                pushConstants.normalTextureSet = -1;                           // No normal map
+                pushConstants.occlusionTextureSet = -1;                        // No ambient occlusion
+                pushConstants.emissiveTextureSet = -1;                         // No emissive texture
+            }
+----
+
+マテリアル構成システムは、アーティストが作成したマテリアルと GPU シェーダ パラメータの間のギャップを橋渡しします。プッシュ定数は、GPU のメモリ階層をバイパスし、シェーダ コアに直接アクセスできるため、オブジェクトごとのマテリアル データを更新するための最速のパスを提供します。これにより、描画呼び出し間で頻繁に変化するマテリアル プロパティに最適になります。
+
+テクスチャ インデックス マッピング システム (未使用の場合は -1、アクティブなバインディングの場合は正の整数) により、シェーダーは可用性に基づいて条件付きでテクスチャをサンプリングできます。このアプローチにより、異なるシェーダ バリアントや複雑な分岐ロジックを必要とせずに、一部のマテリアルには法線マップがあり、他のマテリアルには法線マップがないという柔軟性が得られます。
+
+デフォルトのマテリアル プロパティは、マテリアルが欠落している場合や不適切に構成されている場合にレンダリング アーティファクトを防ぐために、控えめに選択されています。金属値と粗さの値が 1.0 の場合、意図したマテリアルの外観を表していない可能性がありますが、さまざまな照明条件にわたって視覚的に許容できる結果が得られる傾向があります。
+
+=== GPUリソ​​ースのバインドと描画コマンドの実行
+
+最後のレンダリング フェーズでは、GPU リソースをバインドし、シーン グラフ ノードを画面上のレンダリングされたピクセルに変換する実際の描画コマンドを発行します。
+
+[source,cpp]
+----
+            // Upload material properties to GPU via push constants
+            // This provides fast, per-draw-call material parameter updates
+            commandBuffer.pushConstants(*pipelineLayout, vk::ShaderStageFlagBits::eFragment,
+                                      0, sizeof(PushConstantBlock), &pushConstants);
+
+            // Bind geometry data buffers for GPU access
+            // Vertex buffer contains position, normal, texture coordinate data
+            commandBuffer.bindVertexBuffers(0, *vertexBuffers[node->vertexBufferIndex], {0});
+            // Index buffer defines triangle connectivity and enables vertex reuse
+            commandBuffer.bindIndexBuffer(*indexBuffers[node->indexBufferIndex], 0, vk::IndexType::eUint32);
+
+            // Execute the draw command to render this mesh
+            // GPU processes indices to generate triangles and runs vertex/fragment shaders
+            commandBuffer.drawIndexed(static_cast<uint32_t>(node->mesh.indices.size()), 1, 0, 0, 0);
+        }
+----
+
+リソース バインド シーケンスは、各リソース タイプを使用前にバインドする必要がある Vulkan の明示的バインディング モデルに従います。頂点バッファーは頂点ごとの属性データ (位置、法線、テクスチャ座標) を提供し、インデックス バッファーは頂点が接続して三角形を形成する方法を定義します。このインデックス付きレンダリング手法では、複数の三角形にわたって頂点を再利用できるため、メモリ使用量が削減されます。
+
+`drawIndexed` コマンドは、このメッシュのグラフィックス パイプライン全体の GPU 実行をトリガーします。 GPU は各インデックスを処理して頂点データを取得し、頂点シェーダーを実行してジオメトリを変換し、三角形をラスタライズしてフラグメントを生成し、フラグメント シェーダーを実行して最終的なピクセルの色を決定します。プッシュ定数を介して構成したすべてのマテリアル プロパティは、このプロセス中にフラグメント シェーダーで利用できるようになります。
+
+=== 階層的再帰
+
+最後に、蓄積された変換行列を使用して子ノードを再帰的に処理し、レンダリング プロセス全体を通じて階層構造を維持することで、シーン グラフの完全な走査を保証します。
+
+[source,cpp]
+----
+        // Recursively process child nodes with accumulated transformation
+        // This maintains the hierarchical transformation chain down the scene graph
+        if (!node->children.empty()) {
+            renderNode(commandBuffer, node->children, nodeMatrix);
+        }
+    }
+}
+----
+
+この走査アプローチにより、次のことが保証されます。
+
+1. 各ノードの変換はその親の変換と正しく結合されます。
+2. 子ノードは正しいグローバル変換でレンダリングされます。
+3. シーン グラフの階層はレンダリング中に保持されます。
+
+=== レンダリングプロセスを理解する
+
+レンダリング プロセスをさらに詳しく見てみましょう。
+
+==== 変換計算
+
+ノードをレンダリングする最初のステップは、そのグローバル変換行列を計算することです。
+
+[source,cpp]
+----
+// Calculate global matrix for this node
+glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+----
+
+これにより、ノードのローカル変換 (位置、回転、スケール) とその親のグローバル変換が結合されます。結果は、ノードのローカル空間からワールド空間に変換する行列になります。
+
+`getLocalMatrix` メソッド (`Node` クラスで定義) は、ノードの移動、回転、スケールのプロパティを組み合わせます。
+
+[source,cpp]
+----
+glm::mat4 getLocalMatrix() {
+    return glm::translate(glm::mat4(1.0f), translation) *
+           glm::toMat4(rotation) *
+           glm::scale(glm::mat4(1.0f), scale) *
+           matrix;
+}
+----
+
+==== マテリアルのセットアップ
+
+[NOTE]
+====
+PBR マテリアル理論とシェーダーの詳細については、xref:Building_a_Simple_Engine/Loading_Models/05_pbr_rendering.adoc[PBR レンダリング] で以前に説明したため、ここでは繰り返し説明しません。このセクションでは、ワイヤリング、つまりマテリアル プロパティがどのようにプッシュ定数にパックされ、この章のコンテキストで描画呼び出しによって消費されるかに焦点を当てます。
+====
+
+ノードにメッシュがある場合は、レンダリングする前にマテリアル プロパティを設定する必要があります。
+
+[source,cpp]
+----
+// Set up push constants for material properties
+PushConstantBlock pushConstants{};
+
+if (node->mesh.materialIndex >= 0 && node->mesh.materialIndex < static_cast<int>(model.materials.size())) {
+    const auto& material = model.materials[node->mesh.materialIndex];
+    pushConstants.baseColorFactor = material.baseColorFactor;
+    pushConstants.metallicFactor = material.metallicFactor;
+    pushConstants.roughnessFactor = material.roughnessFactor;
+    pushConstants.baseColorTextureSet = material.baseColorTextureIndex >= 0 ? 1 : -1;
+    pushConstants.physicalDescriptorTextureSet = material.metallicRoughnessTextureIndex >= 0 ? 2 : -1;
+    pushConstants.normalTextureSet = material.normalTextureIndex >= 0 ? 3 : -1;
+    pushConstants.occlusionTextureSet = material.occlusionTextureIndex >= 0 ? 4 : -1;
+    pushConstants.emissiveTextureSet = material.emissiveTextureIndex >= 0 ? 5 : -1;
+} else {
+    // Default material properties
+    pushConstants.baseColorFactor = glm::vec4(1.0f);
+    pushConstants.metallicFactor = 1.0f;
+    pushConstants.roughnessFactor = 1.0f;
+    pushConstants.baseColorTextureSet = -1;
+    pushConstants.physicalDescriptorTextureSet = -1;
+    pushConstants.normalTextureSet = -1;
+    pushConstants.occlusionTextureSet = -1;
+    pushConstants.emissiveTextureSet = -1;
+}
+
+// Update push constants
+commandBuffer.pushConstants(*pipelineLayout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(PushConstantBlock), &pushConstants);
+----
+
+このコード:
+
+1. メッシュに関連付けられたマテリアルを取得します
+2. 材料特性を使用して押し込み定数を設定します
+3. プッシュ定数を使用してこれらのプロパティをフラグメント シェーダーに渡します
+
+材料特性には次のものが含まれます。
+
+* ベースカラーファクター（アルベド）
+* 金属因子
+* 粗さ係数
+* さまざまなマテリアル マップのテクスチャ セット インデックス (ベース カラー、メタリック粗さ、法線、オクルージョン、エミッシブ)
+
+==== メッシュレンダリング
+
+変換とマテリアルを設定したら、メッシュをレンダリングできます。
+
+[source,cpp]
+----
+// Bind vertex and index buffers
+commandBuffer.bindVertexBuffers(0, *vertexBuffers[node->vertexBufferIndex], {0});
+commandBuffer.bindIndexBuffer(*indexBuffers[node->indexBufferIndex], 0, vk::IndexType::eUint32);
+
+// Draw the mesh
+commandBuffer.drawIndexed(static_cast<uint32_t>(node->mesh.indices.size()), 1, 0, 0, 0);
+----
+
+このコード:
+
+1. メッシュの頂点を含む頂点バッファをバインドします。
+2. メッシュのインデックスを含むインデックス バッファをバインドします。
+3. 描画コマンドを発行してメッシュをレンダリングします
+
+==== 再帰的走査
+
+現在のノードをレンダリングした後、その子を再帰的に走査します。
+
+[source,cpp]
+----
+// Recursively render children
+if (!node->children.empty()) {
+    renderNode(commandBuffer, node->children, nodeMatrix);
+}
+----
+
+これにより、シーン グラフ内のすべてのノードが確実に参照され、正しい変換でレンダリングされます。
+
+=== メインループでのシーンレンダリングの統合
+
+メイン レンダリング ループでシーン レンダリング システムを使用するには、必要な Vulkan 状態を設定し、`renderScene` 関数を呼び出す必要があります。これをわかりやすくするために、フレームを 5 つのステップとして考えてみましょう。
+
+1) 添付ファイル (動的レンダリング入力) を開始して説明します。
+2) レンダリングを開始し、パイプラインをバインドし、ビューポート/シザーを設定します。
+3) カメラ UBO の更新 (表示/投影)
+4) シーン グラフをトラバースし、メッシュごとの描画を発行します
+5) レンダリングを終了して現在
+
+[source,cpp]
+----
+void drawFrame() {
+    // ... (standard Vulkan frame setup)
+
+    // Begin command buffer recording
+    commandBuffer.begin({});
+
+    // Transition image layout for rendering
+    transition_image_layout(
+        imageIndex,
+        vk::ImageLayout::eUndefined,
+        vk::ImageLayout::eColorAttachmentOptimal,
+        {},
+        vk::AccessFlagBits2::eColorAttachmentWrite,
+        vk::PipelineStageFlagBits2::eTopOfPipe,
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput
+    );
+
+    // Set up rendering attachments
+    vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
+    vk::ClearValue clearDepth = vk::ClearDepthStencilValue(1.0f, 0);
+
+    vk::RenderingAttachmentInfo colorAttachmentInfo = {
+        .imageView = swapChainImageViews[imageIndex],
+        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .loadOp = vk::AttachmentLoadOp::eClear,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+        .clearValue = clearColor
+    };
+
+    vk::RenderingAttachmentInfo depthAttachmentInfo = {
+        .imageView = depthImageView,
+        .imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+        .loadOp = vk::AttachmentLoadOp::eClear,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+        .clearValue = clearDepth
+    };
+
+    vk::RenderingInfo renderingInfo = {
+        .renderArea = { .offset = { 0, 0 }, .extent = swapChainExtent },
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &colorAttachmentInfo,
+        .pDepthAttachment = &depthAttachmentInfo
+    };
+
+    // Begin dynamic rendering
+    commandBuffer.beginRendering(renderingInfo);
+
+    // Bind pipeline
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphicsPipeline);
+
+    // Set viewport and scissor
+    commandBuffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
+    commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
+
+    // Bind descriptor set with uniform buffer and textures
+    commandBuffer.bindDescriptorSets(
+        vk::PipelineBindPoint::eGraphics,
+        pipelineLayout,
+        0,
+        1,
+        &descriptorSets[currentFrame],
+        0,
+        nullptr
+    );
+
+    // Update view and projection in uniform buffer
+    UniformBufferObject ubo{};
+    ubo.view = camera.getViewMatrix();
+    ubo.proj = camera.getProjectionMatrix(swapChainExtent.width / (float)swapChainExtent.height);
+    ubo.proj[1][1] *= -1;  // Vulkan's Y coordinate is inverted
+
+    // Copy to uniform buffer (per frame-in-flight)
+    memcpy(uniformBuffers[currentFrame].mapped, &ubo, sizeof(ubo));
+
+    // Render the scene
+    renderScene(commandBuffer, model, ubo.view, ubo.proj);
+
+    // End dynamic rendering
+    commandBuffer.endRendering();
+
+    // Transition image layout for presentation
+    transition_image_layout(
+        imageIndex,
+        vk::ImageLayout::eColorAttachmentOptimal,
+        vk::ImageLayout::ePresentSrcKHR,
+        vk::AccessFlagBits2::eColorAttachmentWrite,
+        {},
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits2::eBottomOfPipe
+    );
+
+    // End command buffer recording
+    commandBuffer.end();
+
+    // ... (submit command buffer and present)
+}
+----
+
+このコード:
+
+1. Vulkan レンダリング状態を設定します (コマンド バッファ、画像トランジション、レンダリング アタッチメント)
+2. グラフィックス パイプラインとディスクリプタセットをバインドします
+3. ユニフォームバッファー内のビュー行列と投影行列を更新します。
+4. `renderScene` を呼び出してシーン全体をレンダリングします
+5. レンダリングを完了し、結果を表示します
+
+=== パフォーマンスに関する考慮事項
+
+複雑なシーンをレンダリングすると、パフォーマンスに負荷がかかる場合があります。シーンのレンダリングを最適化するためのテクニックをいくつか紹介します。
+
+==== 錐台カリング
+
+錐台カリングは、カメラのビュー錐台の外側にあるオブジェクトのレンダリングをスキップするプロセスです。これにより、描画呼び出しの数が減り、パフォーマンスが大幅に向上します。
+
+[source,cpp]
+----
+bool isNodeVisible(const Node* node, const glm::mat4& viewProjection) {
+    // Calculate the node's bounding sphere in world space
+    glm::vec3 center = glm::vec3(node->getGlobalMatrix() * glm::vec4(node->boundingSphere.center, 1.0f));
+    float radius = node->boundingSphere.radius * glm::length(glm::vec3(node->getGlobalMatrix()[0])); // Scale radius by the largest scale factor
+
+    // Check if the bounding sphere is visible in the view frustum
+    for (int i = 0; i < 6; i++) {
+        // Extract frustum planes from the view-projection matrix
+        glm::vec4 plane = getFrustumPlane(viewProjection, i);
+
+        // Calculate the signed distance from the sphere center to the plane
+        float distance = glm::dot(glm::vec4(center, 1.0f), plane);
+
+        // If the sphere is completely behind the plane, it's not visible
+        if (distance < -radius) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void renderNodeWithCulling(const vk::raii::CommandBuffer& commandBuffer, const std::vector<Node*>& nodes, const glm::mat4& parentMatrix, const glm::mat4& viewProjection) {
+    for (const auto node : nodes) {
+        // Calculate global matrix for this node
+        glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+
+        // Check if the node is visible
+        if (isNodeVisible(node, viewProjection)) {
+            // Render the node (same as before)
+            // ...
+
+            // Recursively render children
+            if (!node->children.empty()) {
+                renderNodeWithCulling(commandBuffer, node->children, nodeMatrix, viewProjection);
+            }
+        }
+    }
+}
+----
+
+==== 詳細レベル (LOD)
+
+詳細レベル (LOD) では、カメラから遠く離れたオブジェクトに対して、より単純なバージョンのモデルを使用します。
+
+[source,cpp]
+----
+void renderNodeWithLOD(const vk::raii::CommandBuffer& commandBuffer, const std::vector<Node*>& nodes, const glm::mat4& parentMatrix, const glm::vec3& cameraPosition) {
+    for (const auto node : nodes) {
+        // Calculate global matrix for this node
+        glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+
+        // Calculate distance to camera
+        glm::vec3 nodePosition = glm::vec3(nodeMatrix[3]);
+        float distanceToCamera = glm::distance(nodePosition, cameraPosition);
+
+        // Select LOD level based on distance
+        int lodLevel = 0;
+        if (distanceToCamera > 50.0f) {
+            lodLevel = 2; // Low detail
+        } else if (distanceToCamera > 20.0f) {
+            lodLevel = 1; // Medium detail
+        }
+
+        // Render the node with the selected LOD level
+        // ...
+
+        // Recursively render children
+        if (!node->children.empty()) {
+            renderNodeWithLOD(commandBuffer, node->children, nodeMatrix, cameraPosition);
+        }
+    }
+}
+----
+
+==== オクルージョンカリング
+
+オクルージョン カリングには、他のオブジェクトの背後に隠れているオブジェクトのレンダリングをスキップすることが含まれます。
+
+[source,cpp]
+----
+void renderNodeWithOcclusion(const vk::raii::CommandBuffer& commandBuffer, const std::vector<Node*>& nodes, const glm::mat4& parentMatrix) {
+    // Sort nodes by distance to camera (front to back)
+    std::vector<std::pair<Node*, float>> sortedNodes;
+    for (const auto node : nodes) {
+        glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+        glm::vec3 nodePosition = glm::vec3(nodeMatrix[3]);
+        float distanceToCamera = glm::length(nodePosition - cameraPosition);
+        sortedNodes.push_back({node, distanceToCamera});
+    }
+    std::sort(sortedNodes.begin(), sortedNodes.end(), [](const auto& a, const auto& b) {
+        return a.second < b.second;
+    });
+
+    // Render nodes from front to back
+    for (const auto& [node, distance] : sortedNodes) {
+        // Calculate global matrix for this node
+        glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+
+        // Begin occlusion query
+        vk::QueryPool occlusionQueryPool = createOcclusionQueryPool();
+        commandBuffer.beginQuery(occlusionQueryPool, 0, {});
+
+        // Render the node's bounding box with depth write but no color write
+        renderBoundingBox(commandBuffer, node, nodeMatrix);
+
+        // End occlusion query
+        commandBuffer.endQuery(occlusionQueryPool, 0);
+
+        // Check if the node is visible
+        uint64_t occlusionResult = getOcclusionQueryResult(occlusionQueryPool);
+        if (occlusionResult > 0) {
+            // Node is visible, render it
+            // ...
+
+            // Recursively render children
+            if (!node->children.empty()) {
+                renderNodeWithOcclusion(commandBuffer, node->children, nodeMatrix);
+            }
+        }
+    }
+}
+----
+
+==== インスタンス化されたレンダリング
+
+同一のオブジェクトが多数あるシーンの場合、インスタンス化されたレンダリングによりパフォーマンスが大幅に向上します。
+
+[source,cpp]
+----
+void renderInstanced(const vk::raii::CommandBuffer& commandBuffer, const std::vector<Node*>& nodes, const std::vector<glm::mat4>& instanceMatrices) {
+    for (const auto node : nodes) {
+        // If this node has a mesh, render it with instancing
+        if (!node->mesh.vertices.empty() && !node->mesh.indices.empty() &&
+            node->vertexBufferIndex >= 0 && node->indexBufferIndex >= 0) {
+
+            // Set up material properties (same as before)
+            // ...
+
+            // Bind vertex and index buffers
+            commandBuffer.bindVertexBuffers(0, *vertexBuffers[node->vertexBufferIndex], {0});
+            commandBuffer.bindIndexBuffer(*indexBuffers[node->indexBufferIndex], 0, vk::IndexType::eUint32);
+
+            // Create and bind instance buffer
+            vk::raii::Buffer instanceBuffer = createInstanceBuffer(instanceMatrices);
+            commandBuffer.bindVertexBuffers(1, *instanceBuffer, {0});
+
+            // Draw the mesh with instancing
+            commandBuffer.drawIndexedInstanced(
+                static_cast<uint32_t>(node->mesh.indices.size()),
+                static_cast<uint32_t>(instanceMatrices.size()),
+                0, 0, 0
+            );
+        }
+
+        // Recursively render children
+        if (!node->children.empty()) {
+            renderInstanced(commandBuffer, node->children, instanceMatrices);
+        }
+    }
+}
+----
+
+=== 高度なシーンレンダリング技術
+
+基本的なシーンのレンダリング以外にも、レンダラーの視覚的な品質とパフォーマンスを向上させる高度なテクニックがいくつかあります。
+
+==== 階層的カリング
+
+階層的カリングには、シーン グラフ構造を使用してカリング操作を高速化することが含まれます。
+
+[source,cpp]
+----
+bool isNodeAndChildrenVisible(const Node* node, const glm::mat4& viewProjection, const glm::mat4& parentMatrix) {
+    // Calculate global matrix for this node
+    glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+
+    // Check if the node's bounding volume is visible
+    if (!isNodeVisible(node, viewProjection, nodeMatrix)) {
+        // If the node is not visible, none of its children are visible either
+        return false;
+    }
+
+    // Node is visible, check if it has a mesh to render
+    bool hasVisibleContent = !node->mesh.vertices.empty() && !node->mesh.indices.empty();
+
+    // Recursively check children
+    for (const auto child : node->children) {
+        hasVisibleContent |= isNodeAndChildrenVisible(child, viewProjection, nodeMatrix);
+    }
+
+    return hasVisibleContent;
+}
+
+void renderNodeHierarchical(const vk::raii::CommandBuffer& commandBuffer, const std::vector<Node*>& nodes, const glm::mat4& parentMatrix, const glm::mat4& viewProjection) {
+    for (const auto node : nodes) {
+        // Calculate global matrix for this node
+        glm::mat4 nodeMatrix = parentMatrix * node->getLocalMatrix();
+
+        // Check if the node and its children are visible
+        if (isNodeAndChildrenVisible(node, viewProjection, glm::mat4(1.0f))) {
+            // Render the node if it has a mesh
+            if (!node->mesh.vertices.empty() && !node->mesh.indices.empty() &&
+                node->vertexBufferIndex >= 0 && node->indexBufferIndex >= 0) {
+                // Render the node (same as before)
+                // ...
+            }
+
+            // Recursively render children
+            if (!node->children.empty()) {
+                renderNodeHierarchical(commandBuffer, node->children, nodeMatrix, viewProjection);
+            }
+        }
+    }
+}
+----
+
+[NOTE]
+====
+ここで紹介する階層的カリング アルゴリズムは正しく機能しますが、比較的単純です。現在の形式では、より単純なカリング手法に比べてパフォーマンスが大幅に向上する可能性は低いです。実稼働環境で実際のパフォーマンスを向上させるには、次のようなより効率的で複雑な処理が必要になります。
+
+* 効率的な空間データ構造でバウンディング ボリューム階層 (BVH) を使用する
+* コンピューティング シェーダーを使用した GPU ベースのカリングの実装
+* 時間的コヒーレンスを採用してフレーム全体の可視性結果をキャッシュする
+* オクルージョン クエリを使用して、他のジオメトリの背後に隠れているサブツリー全体をスキップする
+====
+
+==== 遅延レンダリング
+
+遅延レンダリングによりジオメトリとライティング パスが分離されるため、ライトが多いシーンのパフォーマンスが向上します。
+
+[source,cpp]
+----
+void renderSceneDeferred(const vk::raii::CommandBuffer& commandBuffer, Model& model) {
+    // Geometry pass: render scene to G-buffer
+    beginGeometryPass(commandBuffer);
+    renderNode(commandBuffer, model.nodes, glm::mat4(1.0f));
+    endGeometryPass(commandBuffer);
+
+    // Lighting pass: apply lighting to G-buffer
+    beginLightingPass(commandBuffer);
+    for (const auto& light : lights) {
+        renderLight(commandBuffer, light);
+    }
+    endLightingPass(commandBuffer);
+}
+----
+
+==== クラスター化されたレンダリング
+
+クラスタ化されたレンダリングでは、視錐台が 3D セルに分割され、多くのライトが効率的に処理されます。
+
+[source,cpp]
+----
+void setupLightClusters() {
+    // Divide the view frustum into a 3D grid of clusters
+    const int clusterCountX = 16;
+    const int clusterCountY = 9;
+    const int clusterCountZ = 24;
+
+    // Assign lights to clusters based on their position and radius
+    for (const auto& light : lights) {
+        for (int x = 0; x < clusterCountX; x++) {
+            for (int y = 0; y < clusterCountY; y++) {
+                for (int z = 0; z < clusterCountZ; z++) {
+                    if (lightAffectsCluster(light, x, y, z)) {
+                        lightClusters[x][y][z].push_back(light.index);
+                    }
+                }
+            }
+        }
+    }
+
+    // Upload light cluster data to GPU
+    updateLightClusterBuffer();
+}
+
+void renderSceneClustered(const vk::raii::CommandBuffer& commandBuffer, Model& model) {
+    // Bind light cluster buffer
+    commandBuffer.bindDescriptorSets(
+        vk::PipelineBindPoint::eGraphics,
+        pipelineLayout,
+        1,
+        1,
+        &lightClusterDescriptorSet,
+        0,
+        nullptr
+    );
+
+    // Render scene normally
+    renderNode(commandBuffer, model.nodes, glm::mat4(1.0f));
+}
+----
+
+=== 結論
+
+この章では、シーン グラフを使用してシーンをレンダリングするプロセスについて説明しました。シーン グラフを走査し、変換を計算し、マテリアルを適用し、メッシュをレンダリングする方法を説明しました。パフォーマンスを向上させるためのさまざまな最適化手法についても説明しました。
+
+私たちが構築したシーン レンダリング システムは柔軟で拡張可能で、複数のオブジェクト、マテリアル、照明条件を含む複雑なシーンのレンダリングが可能です。次の章では、この基盤に基づいてアニメーションを実装し、シーンに命を吹き込みます。
+
+xref:Building_a_Simple_Engine/Loading_Models/06_multiple_objects.adoc[前: 複数のオブジェクトのレンダリング] | xref:Building_a_Simple_Engine/Loading_Models/08_animations.adoc[次へ: アニメーションの更新]

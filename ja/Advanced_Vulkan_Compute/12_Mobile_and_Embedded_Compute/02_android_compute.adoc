@@ -1,0 +1,463 @@
+:pp: {plus}{plus}
+= Android 上のコンピュート
+
+== Android 開発環境のセットアップ
+
+Android 向け Vulkan コンピュートコードを一行も書く前に、動くネイティブ開発環境が必要です。本セクションでは、IDE インストールからビルドシステム内のシェーダコンパイルまで、すべての構成要素を歩きます。
+
+=== Android Studio
+
+link:https://developer.android.com/studio[Android Studio] (https://developer.android.com/studio) は Android 開発の公式 IDE であり、NDK ネイティブデバッガの第一級サポートを持つ唯一のものです。ホスト OS 向けの最新安定版をダウンロードしてインストールしてください。無料の Community エディションで十分です。
+
+初回起動後、**Settings → Appearance & Behavior → System Settings → Android SDK → SDK Tools** を開き、次をインストールします。
+
+*   **NDK (Side by side)** — Native Development Kit。最新安定版を選んでください。NDK は ARM64 Android 向けに C{pp} をコンパイルするために必要な `aarch64-linux-android` Clang ツールチェーンを同梱します。
+*   **CMake** — Android Studio は Gradle ビルドと統合する独自の CMake インスタンスを出荷します。CMake 3.22 以降をインストールしてください。
+
+適合 Vulkan 1.0 実装の最小 Android API レベルは **API 24（Android 7.0）** です。Vulkan 1.1 と本チュートリアルが想定するほとんどの機能には **API 28+** が必要です。Vulkan 1.3 機能（本シリーズ全体で使う `VK_KHR_synchronization2` バリア API を含む）には **API 33+** をターゲットにしてください。
+
+=== Vulkan コンピュートアプリケーションのプロジェクト構造
+
+Android Studio の「Native C{pp}」プロジェクトテンプレートが適切な骨格を与えます。ネイティブソースと CMake ビルドスクリプトは `app/src/main/cpp/` の下にあります。
+
+[source]
+----
+app/
+├── src/
+│   └── main/
+│       ├── AndroidManifest.xml
+│       ├── assets/           ← コンパイル済み .spv シェーダファイルはここ
+│       ├── cpp/
+│       │   ├── CMakeLists.txt
+│       │   └── compute_app.cpp
+│       └── jniLibs/
+│           └── arm64-v8a/    ← clvk 共有ライブラリはここ（下記参照）
+----
+
+`CMakeLists.txt` は NDK 経由でシステム Vulkan ヘッダを見つけ、システム Vulkan ローダにリンクします。
+
+[source,cmake]
+----
+cmake_minimum_required(VERSION 3.22)
+project(my_compute_app)
+
+# Android は Vulkan ヘッダとローダスタブを提供。NDK の一部。
+find_library(vulkan-lib vulkan)
+
+add_library(my_compute SHARED compute_app.cpp)
+
+target_link_libraries(my_compute
+    ${vulkan-lib}
+    android          # AAssetManager 用
+    log)             # __android_log_print 用
+
+# 本チュートリアルで使う構造化バインディングと std::stop_token のため C++20 を使用。
+target_compile_features(my_compute PRIVATE cxx_std_20)
+----
+
+`app/build.gradle`（Kotlin DSL）の対応ブロックが Gradle をその CMakeLists へ向けます。
+
+[source,kotlin]
+----
+android {
+    defaultConfig {
+        externalNativeBuild {
+            cmake {
+                cppFlags("-std=c++20")
+                arguments("-DANDROID_STL=c++_shared")
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+}
+----
+
+=== Gradle ビルドの一部としてのシェーダコンパイル
+
+`assets/` に入る `.spv` ファイルは、バイナリ塊としてチェックインするのではなく、ビルド時に自動生成すべきです。`preBuild` フェーズの前にシェーダコンパイラを呼び出すカスタム Gradle タスクを追加してください。
+
+次の例は、本チュートリアルシリーズの主シェーディング言語である **Slang**（`slangc`）を使います。link:https://github.com/shader-slang/slang/releases[github.com/shader-slang/slang/releases] からリリースバイナリをダウンロードし、`PATH` 上のどこかに置いてください（または Gradle タスクでパスをハードコード）。
+
+[source,kotlin]
+----
+// build.gradle.kts  (app モジュール)
+tasks.register<Exec>("compileShaders") {
+    val srcDir  = file("src/main/cpp/shaders")
+    val outDir  = file("src/main/assets")
+    outDir.mkdirs()
+
+    // shaders ディレクトリ内のすべての .slang ファイルをコンパイル。
+    srcDir.listFiles { f -> f.extension == "slang" }?.forEach { shader ->
+        commandLine(
+            "slangc",
+            shader.absolutePath,
+            "-profile", "spirv_1_5",
+            "-o", File(outDir, shader.nameWithoutExtension + ".spv").absolutePath
+        )
+    }
+    description = "Compile Slang shaders to SPIR-V assets"
+}
+
+tasks.named("preBuild") { dependsOn("compileShaders") }
+----
+
+代わりに **GLSL** を使うチームでは、`slangc` を `glslangValidator -V` に置き換えてください。呼び出しは同様で、重要なのはコンパイル済み `.spv` が `src/main/assets/` に着地し、実行時に `AAssetManager` が開けることです（次セクションのシェーダロードコードを参照）。
+
+=== デバイスへのデプロイと ADB の使用
+
+Android Debug Bridge（`adb`）は Android SDK（`platform-tools/adb`）に同梱されています。そのディレクトリを `PATH` に追加してください。Vulkan コンピュート開発中のよく使うコマンド:
+
+[source,bash]
+----
+# デバイスが見えることを確認し、Android/API バージョンを表示。
+adb devices -l
+
+# デバイスが報告する Vulkan バージョンを確認（jq が必要）。
+adb shell cmd gpu vkjson | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['devices'][0]['properties']['apiVersion'])"
+
+# アプリタグと Vulkan バリデーションレイヤにフィルタした logcat 出力を監視。
+adb logcat -s MyComputeApp VALIDATION
+
+# ファイル（例: テストデータセット）をアプリのサンドボックスへ直接プッシュ。
+adb push test_input.bin /data/local/tmp/test_input.bin
+
+# 結果ファイルをホストへプルバック。
+adb pull /data/local/tmp/result.bin ./result.bin
+----
+
+=== Android Studio での LLDB によるネイティブコードのデバッグ
+
+Android Studio は **Debug** モードで実行すると、ネイティブコードに LLDB デバッガを自動アタッチします。`Run/Debug Configuration` の **Debugger** で、**Dual**（Java + Native）または純粋 NDK アプリなら **Native** を選んでください。その時点から、C{pp} ファイルでのブレークポイント設定、`VkResult` 変数の検査、ディスパッチコードのステップ実行は、デスクトップ LLDB セッションと同一に働きます。
+
+GPU レベルのデバッグ——ディスクリプタセットの検査、VRAM 使用の追跡、コマンドバッファ記録のキャプチャ——には、Android Studio とは別の **Android GPU Inspector（AGI）** を使います。ダウンロードリンクは下記のプロファイリングセクションを参照してください。
+
+== デスクトップディスパッチからモバイルディスパッチへ
+
+朗報は、Vulkan コンピュートパイプラインが Android 上でもデスクトップ上でも *同じオブジェクト* であることです。これまでの章で書いた `VkPipeline`、`VkDescriptorSet`、`vkCmdDispatch`、バリアコードは変更なしでコンパイル・実行されます。変わるのはディスパッチの *周り* すべてです。デバイスの作り方、SPIR-V の入手方法、能力の問い合わせ方、ユニファイドメモリアーキテクチャでの結果の読み戻し方です。
+
+まだ Android 向け Vulkan アプリケーションを構築していない場合は、まずメインチュートリアルの xref:14_Android.adoc[Android] 章を通してください。`VK_KHR_android_surface` 拡張、`ANativeWindow`、Gradle/NDK ビルドフローをカバーします。ここでは、すでに動く Android Vulkan アプリがあり、そこにコンピュートを追加したいことを前提とします。
+
+== ドライバのロード: Android 上の Vulkan ローダ
+
+ほとんどの Android 8.0+ デバイスではシステムが Vulkan ローダを出荷しますが、最大互換性のため（および開発中に最新バリデーションレイヤを拾うため）、NDK から **Vulkan Loader** を同梱し、`volk` のような関数ポインタローダで `libvulkan.so` を動的ロードするのが一般的です。これは本チュートリアルの他の場所で使うパターンそのものです。
+
+[source,cpp]
+----
+// Android システムドライバが提供する Vulkan エントリポイントをロード。
+if (volkInitialize() != VK_SUCCESS) {
+    // このデバイスに Vulkan 対応ドライバなし — CPU パスへフォールバック。
+    return false;
+}
+----
+
+本番出荷アプリは、適合 Vulkan ドライバのないデバイス向けに常に優雅なフォールバックを持つべきです。
+
+== SPIR-V をデバイスへ載せる
+
+デスクトップでは通常、ビルド時に Slang や GLSL シェーダを SPIR-V へコンパイルし、ディスクから `.spv` ファイルをロードします。Android でも同じ `.spv` が変更なしで動きます——違いは *どこに住むか* と *どう読むか* だけです。標準的なやり方は、Gradle ビルド中にシェーダをコンパイルし（Gradle タスクから `slangc` または `glslangValidator` を呼び出し）、結果の `.spv` を APK **アセット** としてパッケージすることです。実行時は `std::ifstream` ではなく `AAssetManager` 経由で読みます。
+
+[source,cpp]
+----
+// 'mgr' はすでに持っている ANativeActivity / android_app から来る。
+std::vector<uint32_t> loadSpirvAsset(AAssetManager* mgr, const char* name) {
+    AAsset* asset = AAssetManager_open(mgr, name, AASSET_MODE_BUFFER);
+    if (!asset) throw std::runtime_error("missing shader asset");
+    size_t size = AAsset_getLength(asset);
+    std::vector<uint32_t> code(size / sizeof(uint32_t));
+    AAsset_read(asset, code.data(), size);
+    AAsset_close(asset);
+    return code;
+}
+----
+
+その `std::vector<uint32_t>` はデスクトップとまったく同じように `VkShaderModuleCreateInfo` へ直接入ります。SPIR-V 自体にモバイル固有のものはありません。問い合わせた制限が異なるワークグループサイズを強制しない限り、別の「モバイル」シェーダを*維持しないで*ください。
+
+== スマートフォンが実際にできることの問い合わせ
+
+モバイルドライバは公開する制限と機能が非常に多様です。ディスパッチ前に、コンピュートに重要な制限を問い合わせ、*ワークグループ構成をそれらにクランプ*してください。
+
+[source,cpp]
+----
+VkPhysicalDeviceProperties props{};
+vkGetPhysicalDeviceProperties(physicalDevice, &props);
+
+const uint32_t maxInvocations = props.limits.maxComputeWorkGroupInvocations;
+const uint32_t maxSharedBytes = props.limits.maxComputeSharedMemorySize;
+const uint32_t* maxCount       = props.limits.maxComputeWorkGroupCount;
+const uint32_t* maxSize        = props.limits.maxComputeWorkGroupSize;
+----
+
+2 つの制限がデスクトップ開発者よりはるかに頻繁にモバイル開発者を噛みます。
+
+*   **`maxComputeSharedMemorySize`** はモバイルではしばしば*はるかに*小さいです（16 KB が一般的、デスクトップでは 32–64 KB）。デスクトップ LDS 予算向けにチューニングしたタイリングやリダクションカーネルは、スマートフォンでパイプライン作成に単純に失敗することがあります。
+*   **`maxComputeWorkGroupInvocations`** は一部の部品で 128 まで低いことがあります。ノート PC では問題なく動く `local_size_x = 256` シェーダが、ここでドライバに拒否されます。
+
+サブグループ作業では、サブグループサイズとサポートされる演算を明示的に問い合わせてください——多くのモバイル GPU はベンダーに応じて `subgroupSize` を 4、8、16、32、*または* 64 と報告します。
+
+[source,cpp]
+----
+VkPhysicalDeviceSubgroupProperties subgroup{
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES
+};
+VkPhysicalDeviceProperties2 props2{
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+    .pNext = &subgroup
+};
+vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
+// subgroup.subgroupSize と subgroup.supportedOperations が安全なものを教える。
+----
+
+モバイルではサブグループサイズを決してハードコードしないでください。保証されたフルサブグループが必要なら `VK_EXT_subgroup_size_control` を使うか、問い合わせて分岐してください。
+
+== 実際に使う機能の有効化
+
+堅牢なモバイルアプリと競合他社のスマートフォンでクラッシュするアプリの最大の単一の違いは、*防御的な機能有効化* です。デスクトップアプリがしばしば FP16 と Buffer Device Address の存在を想定できるのに対し、モバイルでは各機能をチェックし、デバイスが報告するものだけを有効にしなければなりません。機能構造体をチェーンし、問い合わせ、同じチェーンを `VkDeviceCreateInfo` へ渡してください。
+
+[source,cpp]
+----
+VkPhysicalDeviceShaderFloat16Int8Features f16{
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES
+};
+VkPhysicalDevice16BitStorageFeatures storage16{
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+    .pNext = &f16
+};
+VkPhysicalDeviceFeatures2 features2{
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    .pNext = &storage16
+};
+vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+// 実際にサポートされているものからシェーダ変種を決める。
+const bool useFp16 = f16.shaderFloat16 && storage16.storageBuffer16BitAccess;
+
+// 依存する機能がオンになるよう、同じ（今は埋められた）チェーンを
+// デバイス作成へ渡す:
+VkDeviceCreateInfo deviceInfo{
+    .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+    .pNext = &features2,
+    // ...キュー作成情報、有効拡張...
+};
+----
+
+`useFp16` が false なら、失敗するのではなく FP32 パイプラインへフォールバックしてください。この単一パターン——問い合わせ、決定、有効化、フォールバック——が、断片化した Android デバイス群にわたってコンピュートアプリを移植可能にします。
+
+== タイルベース GPU がルールを変える
+
+モバイル GPU について最も重要な単一のアーキテクチャ事実は、ほぼすべてが **Tile-Based Deferred Rendering（TBDR）** またはタイルベース即時モード設計であることです。GPU は非常に高速な少量の **オンチップタイルメモリ** を持ち、ユニファイドシステム RAM へのメインメモリ帯域は比較的乏しく、*電力を食い*ます。
+
+グラフィックスでは、有名な「フレーム途中の `vkCmdLoadOp`/`storeOp` 往復を避ける」指針を駆動します。**コンピュート** では、帰結は同様に重要です。
+
+*   デバイスメモリ内の `VkBuffer` から読む、またはへ書くすべてのバイトが、時間だけでなく実の **エネルギー** をコストします。モバイルでは、DRAM トラフィックが電力予算の支配項であることがよくあります。
+*   これにより第 3・4 章のサブグループと共有メモリ技法がデスクトップより*さらに*価値を持ちます。データをオンチップに保つことは速度最適化だけでなく、バッテリー寿命を直接延ばし熱スロットリングを避けます。
+
+大きな中間バッファを DRAM 経由でバウンスする素朴なカーネルは、スマートフォンで「動く」かもしれませんが、バッテリーを消耗し数秒でスロットルします。次のセクションでこれに戻ります。
+
+== ユニファイドメモリでの結果の読み戻し
+
+ほぼすべてのモバイルと組み込み GPU は、CPU と単一の物理メモリプールを共有します（**Unified Memory Architecture**、または UMA）。これはコンピュートリードバックへの贈り物です。通常、`DEVICE_LOCAL` かつ `HOST_VISIBLE` なメモリ型があり、ディスクリートデスクトップ GPU で必須のステージングバッファコピーをしばしばスキップできます。
+
+[source,cpp]
+----
+// デバイスローカルかつホスト可視のヒープを好む（UMA モバイル部品で典型的）。
+VkMemoryPropertyFlags want =
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+----
+
+正しい同期は依然必要です。ディスパッチ後、シェーダの書き込みをホストに*利用可能*にするバリアを挿入し、バッファをマップして読む前にフェンスで待ってください——同期教材で確立した規律そのものです。UMA はコピーを取り除きますが、可視性操作の必要性は取り除きません。完全なリードバックパスは次のとおりです。
+
+[source,cpp]
+----
+// 1. ディスパッチを記録し、HOST ドメインへのバッファバリア。
+VkBufferMemoryBarrier2 toHost{
+    .sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+    .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+    .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+    .dstStageMask  = VK_PIPELINE_STAGE_2_HOST_BIT,
+    .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+    .buffer        = resultBuffer,
+    .size          = VK_WHOLE_SIZE,
+};
+VkDependencyInfo dep{
+    .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+    .bufferMemoryBarrierCount = 1,
+    .pBufferMemoryBarriers    = &toHost,
+};
+vkCmdPipelineBarrier2(cmd, &dep);
+vkEndCommandBuffer(cmd);
+
+// 2. 投入しフェンスで待つ（UI スレッドで vkQueueWaitIdle は使わない）。
+vkQueueSubmit2(computeQueue, 1, &submitInfo, fence);
+vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+// 3. UMA バッファを直接マップ — ステージングコピー不要。
+void* mapped = nullptr;
+vkMapMemory(device, resultMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+// メモリ型が HOST_COHERENT でない場合、先に無効化:
+//   vkInvalidateMappedMemoryRanges(...) を読む前に。
+std::memcpy(hostResults.data(), mapped, byteCount);
+vkUnmapMemory(device, resultMemory);
+----
+
+モバイル固有の微妙な点は一貫性です。割り当てたヒープがホスト可視だが *HOST_COHERENT でない*場合（一部部品で一般的）、`memcpy` の前に `vkInvalidateMappedMemoryRanges` を呼ばなければならず、そうしないと古い CPU キャッシュデータを読むかもしれません。
+
+== ディスパッチをメインスレッドから外す
+
+Android はメイン（UI）スレッドで UI と入力を届け、数ミリ秒以上ブロックすると「Application Not Responding」（ANR）ダイアログが出ます。長時間コンピュートはワーカスレッドから投入し、`VkFence` またはタイムラインセマフォで同期し直さなければならず、UI スレッドで `vkQueueWaitIdle` によってレンダースレッドをストールさせてはいけません。
+
+実践的なパターンは、キューからジョブを取り、投入し、フェンスで待ち、結果を UI／レンダースレッドへポストする専用コンピュートスレッドを所有することです。
+
+[source,cpp]
+----
+void computeWorker(std::stop_token stop) {
+    while (!stop.stop_requested()) {
+        Job job = jobQueue.popBlocking();      // 仕事を待つ
+        recordAndSubmit(job);                  // vkQueueSubmit2(..., job.fence)
+        vkWaitForFences(device, 1, &job.fence,  // ここでブロック、UI スレッド外
+                        VK_TRUE, UINT64_MAX);
+        vkResetFences(device, 1, &job.fence);
+        postResultToMainThread(job);           // 例: ロックフリーキュー経由
+    }
+}
+----
+
+また、ディスパッチが飛行中に Android が `onPause`/`onDestroy` を呼び `ANativeWindow` を解体することがあることにも注意してください。ライフサイクル遷移でコンピュート投入がきれいに完了またはキャンセルされるようガードし、コンピュートスレッドからスワップチェーンに決して触れないでください。
+
+== Android での clvk の使用
+
+第 5 章では、Vulkan 上にレイヤされた適合 OpenCL 3.0 ランタイムとして `clvk` を紹介しました。Android では、同じライブラリにより、既存の OpenCL C カーネル——および `clCreateContext`、`clEnqueueNDRangeKernel` などを呼ぶホストコード——を、カーネルもホストアプリケーションコードも一行触れずに、デバイスの Vulkan ドライバ上で動かせます。
+
+=== Android 向け clvk のビルド
+
+Android 向けに `clvk` をクロスコンパイルするには NDK が必要です。`clvk` とその依存をクローンし、CMake Android ツールチェーンファイルを渡します。
+
+[source,bash]
+----
+# ホストの Linux または macOS ビルドマシン上。
+git clone --recursive https://github.com/kpet/clvk.git
+cd clvk && mkdir build-android && cd build-android
+
+cmake .. \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-28 \
+    -DCLVK_COMPILER_AVAILABLE=OFF   # JIT コンパイラを無効化。事前コンパイル SPIR-V を使用
+
+ninja OpenCL
+----
+
+`CLVK_COMPILER_AVAILABLE=OFF` フラグは、実行時カーネルコンパイル用に `clspv` を同梱しないよう `clvk` に伝えます（大きいため）。代わりに、ビルド時に *ホスト* で `clspv` により OpenCL C カーネルを SPIR-V へコンパイルし、結果の `.spv` を APK アセットとしてパッケージし、実行時にロードします。これはネイティブ Vulkan シェーダと同じパターンで、デバイス上の JIT コンパイルオーバーヘッドを排除します。
+
+ビルドは `libOpenCL.so` を生成します。Gradle パッケージャが APK に含めるよう、Android プロジェクトの `jniLibs/arm64-v8a/` ディレクトリへコピーしてください。
+
+=== NDK コードからの clvk OpenCL ライブラリのロード
+
+ほとんどのデバイスで Android にシステム OpenCL ローダはありません。OpenCL 関数を呼ぶ前に、起動時に `clvk` の `libOpenCL.so` を明示的にロードしてください。
+
+[source,cpp]
+----
+#include <dlfcn.h>
+
+void* clvkLib = dlopen("libOpenCL.so", RTLD_NOW | RTLD_LOCAL);
+if (!clvkLib) {
+    // clvk 利用不可 — ネイティブ Vulkan パスへフォールバックするか CL コードをスキップ。
+    LOGE("clvk not found: %s", dlerror());
+    return false;
+}
+// clvk が実装する ICD ローダ経由で関数ポインタを解決。
+auto clCreateContext_fn = (clCreateContext_fn_t)dlsym(clvkLib, "clCreateContext");
+// ... 残りの関数を解決 ...
+----
+
+実プロジェクトでは、Android 向けに `OPENCL_ICD_LOADER_DISABLE_LAYER_SETTINGS=ON` でコンパイルした **OpenCL-ICD-Loader**（link:https://github.com/KhronosGroup/OpenCL-ICD-Loader[github.com/KhronosGroup/OpenCL-ICD-Loader]）を使う方がきれいです。OpenCL 呼び出しの前に JNI で環境変数 `OPENCL_ICD_FILENAMES` を設定し、`clvk` の `libOpenCL.so` を指してください。
+
+[source,cpp]
+----
+// JNI_OnLoad または早期初期化で一度呼ぶ。
+setenv("OPENCL_ICD_FILENAMES",
+       "/data/app/<your.package>/lib/arm64/libOpenCL.so",
+       1 /* overwrite */);
+----
+
+=== Android 上の完全な clvk ワークフロー
+
+完全なパイプラインは次のとおりです。ホストで `clspv` によりカーネルをコンパイル、APK アセットとしてパッケージ、`clvk` バックの OpenCL API 経由で実行時にディスパッチ。
+
+*ホストビルドステップ（Gradle `compileShaders` タスク中にデスクトップから実行）:*
+
+[source,bash]
+----
+# OpenCL C カーネルを SPIR-V へコンパイル。
+clspv scale.cl -o scale.spv --spv-version=1.5
+# .spv ファイルは src/main/assets/ に追加され APK にパックされる。
+----
+
+*デバイス実行時（NDK C{pp}）:*
+
+[source,cpp]
+----
+// 1. APK アセットから事前コンパイル SPIR-V を読む。
+AAsset* asset = AAssetManager_open(mgr, "scale.spv", AASSET_MODE_BUFFER);
+size_t   spvSize = AAsset_getLength(asset);
+std::vector<uint8_t> spv(spvSize);
+AAsset_read(asset, spv.data(), spvSize);
+AAsset_close(asset);
+
+// 2. 最初の利用可能プラットフォーム（= clvk / Vulkan）上に OpenCL コンテキストを作成。
+cl_platform_id platform;
+clGetPlatformIDs(1, &platform, nullptr);
+cl_device_id device;
+clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
+cl_context ctx = clCreateContext(nullptr, 1, &device, nullptr, nullptr, nullptr);
+
+// 3. SPIR-V からプログラムをビルド（実行時コンパイル不要）。
+cl_program program = clCreateProgramWithIL(ctx, spv.data(), spv.size(), nullptr);
+clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
+
+// 4. カーネルオブジェクトとバッファを作成、仕事をエンキュー、結果をリードバック。
+cl_kernel kernel = clCreateKernel(program, "scale", nullptr);
+cl_command_queue queue = clCreateCommandQueueWithProperties(ctx, device, nullptr, nullptr);
+
+cl_mem buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(float) * N, nullptr, nullptr);
+clSetKernelArg(kernel, 0, sizeof(cl_mem), &buf);
+size_t globalSize = N;
+clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &globalSize, nullptr, 0, nullptr, nullptr);
+clFinish(queue);                         // GPU 完了を待つ
+
+float result[N];
+clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, sizeof(result), result, 0, nullptr, nullptr);
+----
+
+内部では、これらの呼び出しのすべてが `clvk` により、ネイティブ Vulkan コードが使うのと同じドライバ上の——そして `vkCmdDispatch` への——Vulkan コマンドへ変換されます。機能的結果は同一です。
+
+=== Android で clvk 対ネイティブ Vulkan をいつ使うか
+
+どちらのアプローチも正当です。正しい選択は既存コードベースと制約に依存します。
+
+[cols="1,1,1"]
+|===
+|基準 |clvk / OpenCL |ネイティブ Vulkan
+
+|既存 OpenCL コードベース |*完璧な適合* — 書き換えゼロ |カーネル + ホストの移植が必要
+|サブグループとプッシュ定数制御 |限定的 |フル
+|バイナリサイズ |+1–2 MB（`libOpenCL.so`） |オーバーヘッドなし
+|機能カバレッジ |OpenCL 3.0 サブセット |フル Vulkan 機能セット
+|プロファイラサポート |限定的（GPU フレームキャプチャなし） |フル AGI / ベンダーツールサポート
+|===
+
+事前の OpenCL 投資なしで新しい Android コンピュートプロジェクトを始めるなら、ネイティブ Vulkan コンピュートがより多くの制御とより良いツーリングを与えます。既存の OpenCL ライブラリ——ビジョンアルゴリズム、ML ランタイム、物理ソルバ——を移植するなら、`clvk` が動くデバイスデプロイへの最速パスであることがよくあります。
+
+== まとめ
+
+Android 上のコンピュートは、すでに知っている Vulkan に 3 つの注意点付きです。*はるかに厳しい*デバイス制限を問い合わせ尊重すること、DRAM トラフィックを単なるレイテンシコストではなく電力コストとして扱うこと、メモリモデルを依然尊重しつつユニファイドメモリを活用してリードバックを簡素化することです。新規プロジェクトでは NDK Vulkan ヘッダに直接ビルドし Android Studio のネイティブデバッガを使い、既存 OpenCL コードベースの移植では `clvk` を共有ライブラリとして統合し `clspv` でカーネルを事前コンパイルしてください。次のセクションでは、これらの観察を具体的な最適化戦略へ変えます。
+
+xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/01_introduction.adoc[前へ: はじめに] | xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/03_mobile_optimization.adoc[次へ: モバイル GPU 向け最適化]

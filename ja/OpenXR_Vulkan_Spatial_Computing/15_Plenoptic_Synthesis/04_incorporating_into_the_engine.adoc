@@ -1,0 +1,75 @@
+:pp: {plus}{plus}
+= エンジンへの組み込み
+
+**プレノプティック合成** を `simple_game_engine` に統合するには、`renderer_rendering.cpp` で従来のラスタライズと高度なレイトレーシングを切り替えられる柔軟なレンダリングアーキテクチャが必要です。*現時点では、実装は読者への演習として残されています。*
+
+== ラスタ合成パスの実装
+
+`renderer_rendering.cpp` では、ラスタ合成をフルスクリーンフラグメントパスとして扱います。構築した四線形補間ロジックでライトフィールドバッファをサンプリングします。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+void Renderer::RenderSynthesisRaster(...) {
+    // ...
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *rasterSynthesisPipeline);
+
+    // Bind the LightField buffer (using BDA address from push constants)
+    cmd.pushConstants<LightFieldPushConstants>(*pipelineLayout,
+        vk::ShaderStageFlagBits::eFragment, 0, synthesisPushConstants);
+
+    // Draw full-screen triangle to trigger fragment synthesis
+    cmd.draw(3, 1, 0, 0);
+}
+----
+
+== レイトレースパスの実装
+
+エンジンが `VK_KHR_ray_tracing_pipeline` サポートを検出した場合、より正確なレイトレース合成パスを使えます。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+void Renderer::RenderSynthesisRayTraced(...) {
+    // ...
+    cmd.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rtSynthesisPipeline);
+
+    // Dispatch rays through our virtual microlens array
+    // One ray per pixel of the high-res spatial display
+    cmd.traceRaysKHR(sbtRayGen, sbtMiss, sbtHit, sbtCallable,
+        swapChainExtent.width, swapChainExtent.height, 1);
+}
+----
+
+== Slang モジュールによるロジック共有
+
+Slang を使い、コア補間ロジックがラスタパスとレイトレースパスの両方で同一であることを保証します。
+
+[source,slang]
+----
+// synthesis_utils.slang
+// Common logic for both paths
+float3 samplePlenopticFunction(uint64_t bufferPtr, float4 ray) {
+    // Shared quadrilinear interpolation math
+    // ...
+}
+
+// fragment_synthesis.slang
+[shader("pixel")]
+float4 fragmentMain(V2P input) : SV_Target {
+    return float4(samplePlenopticFunction(pushConstants.ptr, input.ray), 1.0);
+}
+
+// raygen_synthesis.slang
+[shader("raygeneration")]
+void raygenMain() {
+    float4 ray = calculateRayFromMicrolens(DispatchRaysIndex().xy);
+    outputImage[DispatchRaysIndex().xy] = samplePlenopticFunction(pushConstants.ptr, ray);
+}
+----
+
+== なぜこれらの変更が必要か？
+
+`Renderer` に二重パスを提供することで、エンジンは低消費電力モバイル AR グラス（ラスタパス）からハイエンドホログラフィックワークステーションディスプレイ（レイトレースパス）までスケールできます。エンジンにはすでにモジュール化された `Render` 構造があり Slang を利用しているため、これらのパス間で複雑な 4D 補間ロジックを共有することで、数学的一貫性と視覚的忠実度が保たれます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/15_Plenoptic_Synthesis/03_ray_traced_synthesis.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/01_introduction.adoc[Next]

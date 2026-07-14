@@ -1,0 +1,561 @@
+:pp: {plus}{plus}
+
+= ベクトル加算の例
+
+== 導入
+
+コンピュートパイプライン、操作、データ管理、同期について多くの理論を扱いました。ここでは、コンパイル・実行・最初から最後まで理解できる完全な動作例ですべてをまとめます。
+
+ベクトル加算は些細に見えるかもしれません——2 つの配列の対応要素を足すだけです。しかしこの単純さこそが、最初の例に最適な理由です。実際の ML 操作の複雑さに fundamentals が隠れないうちに、Vulkan コンピュートパイプライン全体を示します。このパターンを理解すれば、畳み込み、行列乗算、完全なニューラルネットワークへの拡張は素直です。
+
+本章では完全なベクトル加算実装を walkthrough します。Vulkan 初期化、バッファ割り当て、シェーダ作成、コマンドバッファ記録、実行、結果検証です。終わる頃には、任意の ML 操作に適応できる動作テンプレートが手元にあります。
+
+== 問題
+
+計算したいのは: ベクトル A と B のすべての要素について `C[i] = A[i] + B[i]` です。
+
+例:
+
+- A = [1.0, 2.0, 3.0, 4.0]
+- B = [5.0, 6.0, 7.0, 8.0]
+- C = [6.0, 8.0, 10.0, 12.0]
+
+これは embarrassingly parallel です——各出力要素は独立です。C[0] は C[1] に依存しないので、すべての要素を GPU 上で同時に計算できます。
+
+== コンピュートシェーダ
+
+計算の中心であるシェーダから始めましょう。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer InputA {
+    float data[];
+} inputA;
+
+layout(binding = 1) readonly buffer InputB {
+    float data[];
+} inputB;
+
+layout(binding = 2) writeonly buffer Output {
+    float data[];
+} output;
+
+layout(push_constant) uniform PushConstants {
+    uint elementCount;
+} pc;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+
+    if (index < pc.elementCount) {
+        output.data[index] = inputA.data[index] + inputB.data[index];
+    }
+}
+----
+
+分解して見ましょう。
+
+*ワークグループサイズ*: `local_size_x = 256` は各ワークグループに 256 スレッド。ほとんどの GPU に良いデフォルト——ハードウェアを十分に活用し、リソースを使い果たさない。
+
+*ディスクリプタ binding*: 3 つの storage バッファ——2 入力（readonly）と 1 出力（writeonly）。readonly/writeonly 修飾子はコンパイラ最適化に役立ちます。
+
+*プッシュ定数*: 要素数をプッシュ定数で渡します。少量データには uniform バッファより効率的です。
+
+*境界チェック*: `if (index < pc.elementCount)` は要素数が 256 の倍数でない場合、バッファ末尾を超えて書かないようにします。
+
+*グローバル呼び出し ID*: `gl_GlobalInvocationID.x` は各スレッドに一意のインデックスを与えます。スレッド 0 が要素 0、スレッド 1 が要素 1 を処理します。
+
+== C++ 実装
+
+次にホスト側コードを実装します。論理セクションに分けます。
+
+=== セットアップ: Vulkan 初期化
+
+基本的な Vulkan セットアップが必要です。標準的な Vulkan 初期化——まだ ML 固有ではありません。
+
+[source,cpp]
+----
+class VectorAddition {
+private:
+    vk::raii::Context context;
+    vk::raii::Instance instance;
+    vk::raii::PhysicalDevice physicalDevice;
+    vk::raii::Device device;
+    vk::raii::Queue computeQueue;
+    uint32_t queueFamilyIndex;
+
+    vk::raii::CommandPool commandPool;
+    vk::raii::CommandBuffer commandBuffer;
+
+    vk::raii::DescriptorPool descriptorPool;
+    vk::raii::DescriptorSetLayout descriptorSetLayout;
+    vk::raii::DescriptorSet descriptorSet;
+
+    vk::raii::PipelineLayout pipelineLayout;
+    vk::raii::Pipeline pipeline;
+
+    vk::raii::Buffer bufferA, bufferB, bufferC;
+    vk::raii::DeviceMemory memoryA, memoryB, memoryC;
+
+    const uint32_t ELEMENT_COUNT = 1024 * 1024;  // 1M elements
+
+public:
+    void initialize() {
+        createInstance();
+        selectPhysicalDevice();
+        createDevice();
+        createCommandPool();
+        createDescriptorSetLayout();
+        createPipeline();
+        createBuffers();
+        createDescriptorSet();
+        createCommandBuffer();
+    }
+
+    void run() {
+        fillInputBuffers();
+        executeCompute();
+        verifyResults();
+    }
+
+    // RAII handles cleanup automatically - no explicit cleanup needed!
+};
+----
+
+=== ディスクリプタセットレイアウトの作成
+
+ディスクリプタセットレイアウトはシェーダが期待するリソースを記述します。
+
+[source,cpp]
+----
+void createDescriptorSetLayout() {
+    std::array<vk::DescriptorSetLayoutBinding, 3> bindings{{
+        // Binding 0: Input A (readonly)
+        {
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute
+        },
+        // Binding 1: Input B (readonly)
+        {
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute
+        },
+        // Binding 2: Output C (writeonly)
+        {
+            .binding = 2,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute
+        }
+    }};
+
+    vk::DescriptorSetLayoutCreateInfo layoutInfo{
+        .bindingCount = static_cast<uint32_t>(bindings.size()),
+        .pBindings = bindings.data()
+    };
+
+    descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
+}
+----
+
+=== パイプラインの作成
+
+コンピュートパイプラインはシェーダとディスクリプタセットレイアウトを組み合わせます。
+
+[source,cpp]
+----
+void createPipeline() {
+    // Load shader (assume we have compiled SPIR-V from slang)
+    std::vector<uint32_t> shaderCode = loadShaderCode("vector_add.comp.spv");
+
+    vk::ShaderModuleCreateInfo shaderInfo{
+        .codeSize = shaderCode.size() * sizeof(uint32_t),
+        .pCode = shaderCode.data()
+    };
+
+    vk::raii::ShaderModule shaderModule(device, shaderInfo);
+
+    // Push constant range for element count
+    vk::PushConstantRange pushConstantRange{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = sizeof(uint32_t)
+    };
+
+    // Pipeline layout
+    vk::PipelineLayoutCreateInfo layoutInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &*descriptorSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushConstantRange
+    };
+
+    pipelineLayout = vk::raii::PipelineLayout(device, layoutInfo);
+
+    // Compute pipeline
+    vk::PipelineShaderStageCreateInfo stageInfo{
+        .stage = vk::ShaderStageFlagBits::eCompute,
+        .module = *shaderModule,
+        .pName = "main"
+    };
+
+    vk::ComputePipelineCreateInfo pipelineInfo{
+        .stage = stageInfo,
+        .layout = *pipelineLayout
+    };
+
+    pipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+    // Shader module is automatically cleaned up by RAII
+}
+----
+
+=== バッファの作成
+
+3 つのバッファが必要です。2 入力、1 出力。
+
+[source,cpp]
+----
+void createBuffers() {
+    vk::DeviceSize bufferSize = ELEMENT_COUNT * sizeof(float);
+
+    // Create buffer A
+    bufferA = createBuffer(bufferSize,
+                           vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+                           vk::MemoryPropertyFlagBits::eDeviceLocal,
+                           memoryA);
+
+    // Create buffer B
+    bufferB = createBuffer(bufferSize,
+                           vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+                           vk::MemoryPropertyFlagBits::eDeviceLocal,
+                           memoryB);
+
+    // Create buffer C
+    bufferC = createBuffer(bufferSize,
+                           vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+                           vk::MemoryPropertyFlagBits::eDeviceLocal,
+                           memoryC);
+}
+
+vk::raii::Buffer createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
+                               vk::MemoryPropertyFlags properties,
+                               vk::raii::DeviceMemory& memory) {
+    vk::BufferCreateInfo bufferInfo{
+        .size = size,
+        .usage = usage,
+        .sharingMode = vk::SharingMode::eExclusive
+    };
+
+    vk::raii::Buffer buffer(device, bufferInfo);
+
+    auto memReqs = buffer.getMemoryRequirements();
+
+    vk::MemoryAllocateInfo allocInfo{
+        .allocationSize = memReqs.size,
+        .memoryTypeIndex = findMemoryType(memReqs.memoryTypeBits, properties)
+    };
+
+    memory = vk::raii::DeviceMemory(device, allocInfo);
+    buffer.bindMemory(*memory, 0);
+
+    return buffer;
+}
+----
+
+=== 入力バッファの投入
+
+GPU にデータをアップロードする必要があります。ステージングバッファを使います。
+
+[source,cpp]
+----
+void fillInputBuffers() {
+    vk::DeviceSize bufferSize = ELEMENT_COUNT * sizeof(float);
+
+    // Create staging buffer
+    vk::raii::DeviceMemory stagingMemory = nullptr;
+    vk::raii::Buffer stagingBuffer = createBuffer(bufferSize,
+                                                   vk::BufferUsageFlagBits::eTransferSrc,
+                                                   vk::MemoryPropertyFlagBits::eHostVisible |
+                                                   vk::MemoryPropertyFlagBits::eHostCoherent,
+                                                   stagingMemory);
+
+    // Fill buffer A
+    float* data = static_cast<float*>(stagingMemory.mapMemory(0, bufferSize));
+    for (uint32_t i = 0; i < ELEMENT_COUNT; i++) {
+        data[i] = static_cast<float>(i);
+    }
+    stagingMemory.unmapMemory();
+    copyBuffer(stagingBuffer, bufferA, bufferSize);
+
+    // Fill buffer B
+    data = static_cast<float*>(stagingMemory.mapMemory(0, bufferSize));
+    for (uint32_t i = 0; i < ELEMENT_COUNT; i++) {
+        data[i] = static_cast<float>(i * 2);
+    }
+    stagingMemory.unmapMemory();
+    copyBuffer(stagingBuffer, bufferB, bufferSize);
+
+    // RAII handles cleanup automatically
+}
+
+void copyBuffer(vk::raii::Buffer& src, vk::raii::Buffer& dst, vk::DeviceSize size) {
+    vk::CommandBufferAllocateInfo allocInfo{
+        .commandPool = *commandPool,
+        .level = vk::CommandBufferLevel::ePrimary,
+        .commandBufferCount = 1
+    };
+
+    vk::raii::CommandBuffers cmdBuffers(device, allocInfo);
+    vk::raii::CommandBuffer& cmdBuffer = cmdBuffers[0];
+
+    vk::CommandBufferBeginInfo beginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
+    };
+
+    cmdBuffer.begin(beginInfo);
+
+    vk::BufferCopy copyRegion{.size = size};
+    cmdBuffer.copyBuffer(*src, *dst, copyRegion);
+
+    cmdBuffer.end();
+
+    vk::SubmitInfo submitInfo{
+        .commandBufferCount = 1,
+        .pCommandBuffers = &*cmdBuffer
+    };
+
+    computeQueue.submit(submitInfo);
+    computeQueue.waitIdle();
+
+    // Command buffer automatically freed when cmdBuffers goes out of scope
+}
+----
+
+=== コマンドバッファの記録
+
+実際のコンピュート作業を記録します。
+
+[source,cpp]
+----
+void createCommandBuffer() {
+    vk::CommandBufferAllocateInfo allocInfo{
+        .commandPool = *commandPool,
+        .level = vk::CommandBufferLevel::ePrimary,
+        .commandBufferCount = 1
+    };
+
+    vk::raii::CommandBuffers cmdBuffers(device, allocInfo);
+    commandBuffer = std::move(cmdBuffers[0]);
+
+    vk::CommandBufferBeginInfo beginInfo;
+
+    commandBuffer.begin(beginInfo);
+
+    // Bind pipeline
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
+
+    // Bind descriptor set
+    commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                     *pipelineLayout, 0, *descriptorSet, nullptr);
+
+    // Push constants (element count)
+    commandBuffer.pushConstants(*pipelineLayout,
+                                vk::ShaderStageFlagBits::eCompute,
+                                0, sizeof(uint32_t), &ELEMENT_COUNT);
+
+    // Dispatch compute work
+    // Work groups = ceil(ELEMENT_COUNT / 256)
+    uint32_t workGroupCount = (ELEMENT_COUNT + 255) / 256;
+    commandBuffer.dispatch(workGroupCount, 1, 1);
+
+    commandBuffer.end();
+}
+----
+
+=== コンピュートシェーダの実行
+
+コマンドバッファを投入し、完了を待ちます。
+
+[source,cpp]
+----
+void executeCompute() {
+    vk::SubmitInfo submitInfo{
+        .commandBufferCount = 1,
+        .pCommandBuffers = &*commandBuffer
+    };
+
+    vk::FenceCreateInfo fenceInfo;
+    vk::raii::Fence fence(device, fenceInfo);
+
+    computeQueue.submit(submitInfo, *fence);
+    auto result = device.waitForFences(*fence, VK_TRUE, UINT64_MAX);
+
+    // Fence automatically cleaned up by RAII
+}
+----
+
+=== 結果の検証
+
+最後に結果を読み戻し、正しさを検証します。
+
+[source,cpp]
+----
+void verifyResults() {
+    vk::DeviceSize bufferSize = ELEMENT_COUNT * sizeof(float);
+
+    // Create staging buffer for readback
+    vk::raii::DeviceMemory stagingMemory = nullptr;
+    vk::raii::Buffer stagingBuffer = createBuffer(bufferSize,
+                                                   vk::BufferUsageFlagBits::eTransferDst,
+                                                   vk::MemoryPropertyFlagBits::eHostVisible |
+                                                   vk::MemoryPropertyFlagBits::eHostCoherent,
+                                                   stagingMemory);
+
+    // Copy result from GPU to staging buffer
+    copyBuffer(bufferC, stagingBuffer, bufferSize);
+
+    // Map and verify
+    float* results = static_cast<float*>(stagingMemory.mapMemory(0, bufferSize));
+
+    bool allCorrect = true;
+    for (uint32_t i = 0; i < ELEMENT_COUNT; i++) {
+        float expected = static_cast<float>(i) + static_cast<float>(i * 2);
+        float actual = results[i];
+
+        if (std::abs(expected - actual) > 0.001f) {
+            std::cout << "Mismatch at index " << i
+                      << ": expected " << expected
+                      << ", got " << actual << std::endl;
+            allCorrect = false;
+            break;
+        }
+    }
+
+    if (allCorrect) {
+        std::cout << "Success! All " << ELEMENT_COUNT
+                  << " elements computed correctly." << std::endl;
+    }
+
+    stagingMemory.unmapMemory();
+    // RAII handles cleanup automatically
+}
+----
+
+== 例の実行
+
+main 関数ですべてをつなぎます。
+
+[source,cpp]
+----
+int main() {
+    try {
+        VectorAddition app;
+        app.initialize();
+        app.run();
+        // No cleanup needed - RAII handles everything!
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+}
+----
+
+== フローの理解
+
+このプログラムを実行すると何が起きるかを追跡しましょう。
+
+*初期化フェーズ*:
+
+1. Vulkan インスタンスとデバイスを作成
+2. コマンドバッファ割り当て用コマンドプールを作成
+3. シェーダリソースを記述するディスクリプタセットレイアウトを作成
+4. シェーダをロード・コンパイルし、コンピュートパイプラインを作成
+5. GPU 上に 3 バッファ（A、B、C）を割り当て
+6. バッファをシェーダ binding にバインドするディスクリプタセットを作成
+7. コンピュートディスパッチ付きコマンドバッファを記録
+
+*実行フェーズ*:
+
+1. ステージングバッファ経由で入力データ（A と B）を GPU にアップロード
+2. コマンドバッファをコンピュートキューに投入
+3. GPU がシェーダを実行: 4096 ワークグループ × 256 スレッド = 1,048,576 スレッド
+4. 各スレッドが 1 要素を計算: C[i] = A[i] + B[i]
+5. GPU 完了を待機
+6. ステージングバッファ経由で結果を CPU にコピー
+7. 結果が期待値と一致することを検証
+
+*クリーンアップフェーズ*:
+
+1. すべての Vulkan オブジェクトを破棄
+2. すべてのメモリを解放
+
+== 要点
+
+この例はいくつかの重要なパターンを示します。
+
+*ステージングバッファ*: GPU メモリ（DEVICE_LOCAL）は高速ですが CPU から直接アクセスできません。CPU と GPU 間の転送にステージングバッファ（HOST_VISIBLE）を使います。
+
+*ワークグループ計算*: 100 万要素とワークグループあたり 256 スレッドでは 4096 ワークグループが必要です。式 `(elementCount + workGroupSize - 1) / workGroupSize` は非倍数を正しく扱います。
+
+*境界チェック*: シェーダは `if (index < elementCount)` をチェックし、総スレッド数が要素数を超える場合を扱います。
+
+*同期*: 簡潔さのため `vkQueueWaitIdle()` を使います。本番では fence や semaphore でより効率的に同期します。
+
+*メモリ管理*: 各バッファ用に個別メモリを割り当てます。本番ではより大きなブロックから sub-allocate するメモリアロケータを使います。
+
+== ML 操作への拡張
+
+このパターンは任意の ML 操作にスケールします。
+
+*要素ごと演算*（ReLU、sigmoid）: 同じ構造で、シェーダの計算だけ変更。
+
+*行列演算*: ディスパッチに次元を追加（workGroupsX、workGroupsY）、シェーダで行列インデックスを調整。
+
+*畳み込み*: より複雑なシェーダロジックですが、同じ全体構造——入出力/重みをバインド、ワークグループをディスパッチ、同期、結果を読む。
+
+fundamentals は一定です。バッファ作成、シェーダへのバインド、コンピュート作業のディスパッチ、同期、結果読み取り。本章で学んだすべてが完全なニューラルネットワーク推論の実装に適用されます。
+
+== よくある落とし穴
+
+*境界チェックの忘れ*: シェーダでは常に `if (index < elementCount)` をチェック。これがないと、データ範囲を超えたスレッドが無効メモリに書き込みます。
+
+*誤ったワークグループ数*: `elementCount / 256` ではなく `(elementCount + 255) / 256` を使う。elementCount が 256 の倍数でないと失敗します。
+
+*同期の欠落*: 結果を読む前にコンピュート完了を待たないと、不完全またはゴミデータを読みます。
+
+*誤ったメモリプロパティ*: ステージングバッファに DEVICE_LOCAL（CPU からマップ不可）、コンピュートバッファに HOST_VISIBLE（GPU アクセスが遅い）。
+
+*ディスクリプタセットの不一致*: バッファを誤ったディスクリプタ binding にバインドすると、シェーダが誤ったデータを読み書きします。
+
+== 性能上の考慮
+
+この例は性能より明瞭さを優先しています。本番では:
+
+*永続バッファ*: 毎回割り当て/解放せず、複数推論にわたってバッファを再利用。
+
+*非同期転送*: 別転送キューでデータアップロードとコンピュートを重ねる。
+
+*メモリプーリング*: バッファごとの個別割り当てではなく、大きなメモリブロックから sub-allocate。
+
+*パイプラインキャッシュ*: コンパイル済みパイプラインをディスクにキャッシュし、再コンパイルを避ける。
+
+*バッチ処理*: 複数入力をまとめて処理し、オーバーヘッドを償却。
+
+== まとめ
+
+このベクトル加算例は ML 操作向け Vulkan コンピュートパイプライン全体を示します。バッファ作成、シェーダロード、コマンド記録、GPU 実行、結果検証を行いました。パターンは単純ですが強力——任意の ML 操作実装の基盤です。
+
+重要な洞察: ML 推論は、適切なデータ管理と同期付きでコンピュートシェーダをディスパッチすることにすぎません。ベクトル加算もこのパターンです。行列乗算もこのパターンです。畳み込みもこのパターンです。完全なニューラルネットワークは、これらのパターンを多数チェーンしたものです。
+
+この動作例をテンプレートに、より複雑な ML 操作の実装に進めます。fundamentals は同じ——変わるのはシェーダロジックとバッファレイアウトだけです。
+
+xref:ML_Inference/Vulkan_Compute_for_ML/06_synchronization.adoc[前へ: 同期] | xref:ML_Inference/Building_the_Inference_Engine/05_model_formats_as_input.adoc[次へ: モデルとデータ]

@@ -1,0 +1,58 @@
+:pp: {plus}{plus}
+
+= clspv パイプライン: OpenCL C から SPIR-V へ
+
+== clspv とは？
+
+**clspv** は、OpenCL C ソースコードを、Vulkan コンピュートシェーダとして動くよう特別に設計された SPIR-V バイナリへ変換するオープンソースコンパイラです（Google/Khronos エコシステムの一部）。
+
+OpenCL 固有バージョンの SPIR-V をターゲットとする標準 OpenCL コンパイラとは異なり、`clspv` は Vulkan のより制限の厳しいメモリ・実行モデルと互換になるよう、複雑な一連の変換を行います。
+
+== コンパイルの流れ
+
+`clspv` を使うとき、カーネルはいくつかの段階を経ます。
+
+1.  **パース**: OpenCL C コードが **Clang**（LLVM 向けの C 言語ファミリーフロントエンド）でパースされます。
+2.  **LLVM 変換**: 結果の **LLVM IR**（Low-Level Virtual Machine Intermediate Representation、プラットフォーム独立のアセンブリ言語）が変換され、Vulkan に存在しない OpenCL 固有機能（物理ポインタや特定の組み込み変数など）が取り除かれます。
+3.  **SPIR-V 生成**: 変換された IR が Vulkan フレーバーの SPIR-V へ変換されます。
+4.  **ディスクリプタマッピング**: `clspv` がカーネル用の **ディスクリプタセットレイアウト** を自動生成します。たとえば、OpenCL の `__global float*` バッファは `set=0, binding=0` の Vulkan Storage Buffer にマッピングされるかもしれません。
+
+== ワークフローでの clspv の使い方
+
+`clspv` の最も一般的な使い方は、ビルドプロセス中のコマンドラインツールとしてです。
+
+[source,bash]
+----
+clspv my_kernel.cl -o my_kernel.spv
+----
+
+その後、`my_kernel.spv` を他のコンピュートシェーダと同様に Vulkan アプリケーションへロードできます。ただし、`clspv` が引数をディスクリプタバインディングへどうマッピングしたかを知る必要があります。デフォルトでは、カーネル関数の引数の順序に基づく決定的なマッピングに従います。
+
+[source,c]
+----
+// OpenCL C Kernel
+__kernel void MyKernel(__global float* input, __global float* output) {
+    // ...
+}
+----
+
+Vulkan では、典型的には次のようにマッピングされます。
+
+*   `input`: `set=0, binding=0`（Storage Buffer）
+*   `output`: `set=0, binding=1`（Storage Buffer）
+
+== 主要な課題: ポインタとメモリ
+
+`clspv` が解く最大のハードルの一つが **ポインタサポート** です。OpenCL C は任意のポインタ演算を許しますが、標準 Vulkan はそうしません。`clspv` は `VK_KHR_variable_pointers` 拡張（Vulkan 1.1 でコア）を使ってこの振る舞いをエミュレートしますが、複雑なポインタのポインタ演算を避ける方がはるかに効率的です。
+
+Vulkan 1.4 の **Buffer Device Address** の改善されたサポートにより、これはさらに容易になり、`clspv` は現代ハードウェア上でより移植可能かつ高性能なコードを生成できます。
+
+== clspv の利点
+
+*   **Ahead-of-Time（AOT）**: 実行時に重い OpenCL コンパイラは不要で、小さな SPIR-V バイナリだけで済みます。
+*   **Vulkan 統合**: OpenCL ロジックが既存の Vulkan パイプライン内の「もう一つのシェーダ」になります。
+*   **性能**: ネイティブ Vulkan ドライバを使うため、実行時の変換レイヤオーバーヘッドなしでハードウェアのフル性能が得られます。
+
+次のセクションでは、**カーネル移植性** の扱い方と、異なるベンダー間で正しく動くことの保証を見ます。
+
+xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/02_setup_and_installation.adoc[前へ: セットアップとインストール] | xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/04_kernel_portability.adoc[次へ: カーネル移植性]

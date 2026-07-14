@@ -1,0 +1,278 @@
+:pp: {plus}{plus}
+
+= 頂点バッファの作成
+
+== はじめに
+
+Vulkan におけるバッファは、グラフィックスカードが読み取れる任意のデータを格納するためのメモリ領域です。
+この章では頂点データの格納に使いますが、今後の章で探る他の多くの用途にも使えます。
+これまでに扱ってきた Vulkan オブジェクトとは異なり、バッファは自分自身のために自動的にメモリを割り当てません。
+これまでの章の作業で、Vulkan API はほぼすべてをプログラマの制御下に置いていることが分かりましたが、メモリ管理もその 1 つです。
+
+== バッファの作成
+
+新しい関数 `createVertexBuffer` を作成し、`initVulkan` から `createCommandBuffers` の直前に呼び出します。
+
+[,c++]
+----
+void initVulkan()
+{
+    createInstance();
+    setupDebugMessenger();
+    createSurface();
+    pickPhysicalDevice();
+    createLogicalDevice();
+    createSwapChain();
+    createImageViews();
+    createGraphicsPipeline();
+    createCommandPool();
+    createVertexBuffer();
+    createCommandBuffers();
+    createSyncObjects();
+}
+
+...
+
+void createVertexBuffer()
+{
+}
+----
+
+バッファの作成には `vk::BufferCreateInfo` 構造体を埋める必要があります。
+
+[,c++]
+----
+vk::BufferCreateInfo bufferInfo{.size        = sizeof(vertices[0]) * vertices.size(),
+                                .usage       = vk::BufferUsageFlagBits::eVertexBuffer,
+                                .sharingMode = vk::SharingMode::eExclusive};
+----
+
+`size` フィールドはバッファのサイズをバイト単位で指定します。頂点データのバイトサイズの計算は
+`sizeof` で簡単にできます。
+
+`usage` フィールドは、バッファ内のデータがどの目的で使われるかを示します。
+ビットごとの OR で複数の目的を指定できます。今回の用途は頂点バッファで、他の
+種類の usage は今後の章で見ていきます。
+
+スワップチェーンのイメージと同様に、バッファも特定のキューファミリーが所有するか、同時に複数で共有できます。
+バッファはグラフィックスキューからのみ使うので、排他アクセスのままで構いません。
+
+`flags` フィールドもあり、スパースバッファメモリの設定に使います。今は関係ないので、
+デフォルト値の `0` のままにします。
+
+これで `vk::raii::Buffer` コンストラクタでバッファを作成できます。
+バッファハンドルを保持するクラスメンバを定義し、`vertexBuffer` と名付けます。
+
+[,c++]
+----
+vk::raii::Buffer vertexBuffer = nullptr;
+
+...
+
+void createVertexBuffer() {
+		vk::BufferCreateInfo bufferInfo{.size        = sizeof(vertices[0]) * vertices.size(),
+		                                .usage       = vk::BufferUsageFlagBits::eVertexBuffer,
+		                                .sharingMode = vk::SharingMode::eExclusive};
+    vertexBuffer = vk::raii::Buffer(device, bufferInfo);
+}
+----
+
+バッファはプログラムの終了まで描画コマンドで使えるようにしておく必要があり、
+スワップチェーンには依存しません。
+
+== メモリ要件
+
+バッファは作成されましたが、まだメモリが割り当てられていません。
+バッファ用メモリ割り当てに向けた最初のステップは、適切に名付けられた `vk::raii::Buffer::getMemoryRequirements` 関数でメモリ要件を問い合わせることです。
+
+[,c++]
+----
+vk::MemoryRequirements memRequirements = vertexBuffer.getMemoryRequirements();
+----
+
+`vk::MemoryRequirements` 構造体には 3 つのフィールドがあります。
+
+* `size`: 必要なメモリのバイトサイズ。`bufferInfo.size` と異なる場合がある
+* `alignment`: 割り当てられたメモリ領域内でバッファが始まるバイトオフセット。`bufferInfo.usage` と `bufferInfo.flags` に依存する
+* `memoryTypeBits`: バッファに適したメモリタイプのビットフィールド
+
+グラフィックスカードは、割り当て元として異なる種類のメモリを提供できます。
+各メモリタイプは、許可される操作と性能特性が異なります。
+バッファの要件とアプリケーション自身の要件を組み合わせて、使うべき正しいメモリタイプを見つける必要があります。
+この目的のために新しい関数 `findMemoryType` を作成しましょう。
+
+[,c++]
+----
+uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties) {
+
+}
+----
+
+まず `vk::raii::PhysicalDevice::getMemoryProperties` で利用可能なメモリタイプの情報を問い合わせます。
+
+[,c++]
+----
+vk::PhysicalDeviceMemoryProperties memProperties = physicalDevice.getMemoryProperties();
+----
+
+`vk::PhysicalDeviceMemoryProperties` 構造体には `memoryTypes` と `memoryHeaps` の 2 つの配列があります。
+メモリヒープは、専用 VRAM や、VRAM が足りなくなったときの RAM 上のスワップ空間など、区別されたメモリリソースです。
+異なる種類のメモリはこれらのヒープ内に存在します。
+今のところメモリの種類だけに注目し、それがどのヒープから来るかは考えませんが、性能に影響しうることは想像できます。
+
+まずバッファ自体に適したメモリタイプを見つけましょう。
+
+[,c++]
+----
+for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
+{
+    if ((typeFilter & (1 << i)))
+    {
+        return i;
+    }
+}
+
+throw std::runtime_error("failed to find suitable memory type!");
+----
+
+`typeFilter` パラメータは、適したメモリタイプのビットフィールドを指定するために使います。
+つまり、それらを単純に反復し、対応するビットが `1` にセットされているかを確認すれば、適したメモリタイプのインデックスを見つけられます。
+
+ただし、頂点バッファに適したメモリタイプだけに興味があるわけではありません。
+そのメモリに頂点データを書き込めることも必要です。
+`memoryTypes` 配列は、各メモリタイプのヒープとプロパティを指定する
+`vk::MemoryType` 構造体で構成されています。
+プロパティは、CPU から書き込めるようマップできることなど、メモリの特別な機能を定義します。
+このプロパティは `vk::MemoryPropertyFlagBits::eHostVisible` で示されますが、`vk::MemoryPropertyFlagBits::eHostCoherent` プロパティも使う必要があります。
+メモリをマップするときに理由が分かります。
+
+このプロパティのサポートも確認するようループを変更できます。
+
+[,c++]
+----
+for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
+{
+    if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
+    {
+        return i;
+    }
+}
+----
+
+望ましいプロパティが複数ある場合があるので、ビットごとの AND の結果が非ゼロであるだけでなく、望ましいプロパティのビットフィールドと等しいかを確認すべきです。
+バッファに適し、必要なプロパティをすべて持つメモリタイプがあればそのインデックスを返し、なければ例外を投げます。
+
+== メモリの割り当て
+
+正しいメモリタイプを決定する方法ができたので、`vk::MemoryAllocateInfo` 構造体を埋めて実際にメモリを割り当てられます。
+
+[,c++]
+----
+vk::MemoryAllocateInfo memoryAllocateInfo{
+    .allocationSize  = memRequirements.size,
+    .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)};
+----
+
+メモリ割り当ては、サイズとタイプを指定するだけで済みます。どちらも頂点バッファのメモリ要件と望ましいプロパティから導出されます。
+メモリへのハンドルを格納するクラスメンバを作成し、`vk::raii::DeviceMemory` コンストラクタで割り当てます。
+
+[,c++]
+----
+vk::raii::Buffer       vertexBuffer       = nullptr;
+vk::raii::DeviceMemory vertexBufferMemory = nullptr;
+
+...
+
+vertexBufferMemory = vk::raii::DeviceMemory(device, memoryAllocateInfo);
+----
+
+メモリ割り当てが成功したら、`vk::raii::Buffer::bindBufferMemory` でこのメモリをバッファに関連付けられます。
+
+[,c++]
+----
+vertexBuffer.bindMemory( *vertexBufferMemory, 0 );
+----
+
+最初のパラメータはそのままですが、2 つ目のパラメータはメモリ領域内のオフセットです。
+このメモリはこの頂点バッファ専用に割り当てられているので、オフセットは単に `0` です。
+オフセットが非ゼロの場合は、`memRequirements.alignment` で割り切れる必要があります。
+
+== 頂点バッファへの書き込み
+
+いよいよ頂点データをバッファへコピーする番です。
+これは `vk::raii::DeviceMemory::mapMemory` で https://en.wikipedia.org/wiki/Memory-mapped_I/O[バッファメモリをマップ] し、CPU からアクセス可能なメモリにすることから始まります。
+
+[,c++]
+----
+void* data = vertexBufferMemory.mapMemory(0, bufferInfo.size);
+----
+
+この関数により、オフセットとサイズで定義された指定メモリリソースの領域にアクセスできます。
+ここでのオフセットとサイズはそれぞれ `0` と `bufferInfo.size` です。
+
+[,c++]
+----
+void* data = vertexBufferMemory.mapMemory(0, bufferInfo.size);
+memcpy(data, vertices.data(), bufferInfo.size);
+vertexBufferMemory.unmapMemory();
+----
+
+あとは単純に頂点データをマップしたメモリへ `memcpy` し、`vk::raii::DeviceMemory::unmapMemory` で再びマップ解除できます。
+残念ながら、例えばキャッシュのため、ドライバがデータをバッファメモリへすぐにはコピーしない場合があります。
+バッファへの書き込みがまだマップされたメモリから見えない可能性もあります。
+その問題への対処法は 2 つあります。
+
+* `vk::MemoryPropertyFlagBits::eHostCoherent` で示されるホストコヒーレントなメモリヒープを使う
+* マップされたメモリへの書き込み後に `vk::raii::Device::flushMappedMemoryRanges` を呼び、マップされたメモリから読む前に `vk::raii::Device::invalidateMappedMemoryRanges` を呼ぶ
+
+ここでは最初の方法を選びました。これにより、マップされたメモリが常に割り当てられたメモリの内容と一致することが保証されます。
+明示的なフラッシュより性能がわずかに劣る可能性がある点に注意してください。ただし、次の章でそれが問題にならない理由が分かります。
+
+メモリ範囲のフラッシュやコヒーレントなメモリヒープの使用は、ドライバがバッファへの書き込みを認識することを意味しますが、それらが GPU 上ですぐに見えることを意味するわけではありません。
+GPU へのデータ転送はバックグラウンドで起きる操作であり、仕様は単に、次の `vk::raii::Queue::submit` 呼び出しの時点では完了していることが保証されると https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-submission-host-writes[述べています]。
+
+== 頂点バッファのバインド
+
+あとは描画操作中に頂点バッファをバインドするだけです。
+そのために `recordCommandBuffer` 関数を拡張します。
+
+[,c++]
+----
+commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
+
+commandBuffer.bindVertexBuffers(0, *vertexBuffer, {0});
+
+commandBuffer.draw(static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+----
+
+`vk::raii::CommandBuffer::bindVertexBuffers` 関数は、前章で設定したようなバインディングに頂点バッファをバインドするために使います。
+最初のパラメータはバインディングへのオフセットです。
+2 つ目のパラメータはバインドするバッファの配列です。
+最後のパラメータは、頂点データの読み取りを開始するバイトオフセットの、同じサイズの配列です。
+また、`vk::CommandBuffer::draw` の呼び出しを、ハードコードされた数 `3` ではなくバッファ内の頂点数を渡すよう変更すべきです。
+
+プログラムを実行すると、おなじみの三角形が再び表示されるはずです。
+
+image::/images/triangle.png[]
+
+`vertices` 配列を変更して、上の頂点の色を白にしてみてください。
+
+[,c++]
+----
+const std::vector<Vertex> vertices = {
+    {{0.0f, -0.5f}, {1.0f, 1.0f, 1.0f}},
+    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
+};
+----
+
+プログラムを再実行すると、次のように見えるはずです。
+
+image::/images/triangle_white.png[]
+
+xref:./02_Staging_buffer.adoc[次の章]では、より良い性能になるものの作業が増える、頂点データを頂点バッファへコピーする別の方法を見ていきます。
+
+link:/attachments/19_vertex_buffer.cpp[C{pp} code] /
+link:/attachments/19_shader_vertexbuffer.slang[slang shader] /
+link:/attachments/19_shader_vertexbuffer.vert[GLSL Vertex shader] /
+link:/attachments/19_shader_vertexbuffer.frag[GLSL Fragment shader]

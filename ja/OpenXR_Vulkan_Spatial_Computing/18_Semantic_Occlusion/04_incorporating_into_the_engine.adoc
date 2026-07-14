@@ -1,0 +1,60 @@
+:pp: {plus}{plus}
+= セマンティックオクルージョンのエンジンへの組み込み
+
+**セマンティックオクルージョン** を統合すると、`simple_game_engine` は仮想アセットを物理の部屋と現実的にブレンドできます。`Renderer` にマスキングパスを追加し、`renderer_rendering.cpp` の最終合成ロジックを更新して実装します。*現時点では、実装は読者への演習として残されています。*
+
+== オクルージョンマスクパスの作成
+
+`renderer_rendering.cpp` では、ML セグメンテーション結果を使い **ステンシルバッファ** を埋めるステップを追加します。このパスは最新 ML マスクを受け取った後、仮想シーン幾何を描く前に実行されなければなりません。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+void Renderer::executeOcclusionMaskPass(vk::raii::CommandBuffer& cmd, uint32_t frameIndex) {
+    if (!xrMode || !occlusionEnabled) return;
+
+    // 1. Prepare to fill the stencil buffer
+    // We bind a simple pipeline that reads the ML mask texture
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *occlusionMaskPipeline);
+
+    // 2. Set the stencil reference to 0x1 (meaning "Real World")
+    cmd.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, 0x1);
+
+    // 3. Draw a full-screen quad. The shader will discard fragments
+    // where the ML mask doesn't indicate an occluding object (like a hand).
+    cmd.draw(3, 1, 0, 0); // Using a single large triangle for the full screen
+}
+----
+
+== Slang での合成
+
+`composite.slang` シェーダーでは、ステンシルバッファの出力を使い、仮想シーンをパススルーカメラフィードとどうブレンドするかを決めます。あるいは、ハードウェアがステンシルベース破棄をサポートしない場合は専用テクスチャを使えます。
+
+[source,slang]
+----
+// composite.slang
+[shader("pixel")]
+float4 fragmentMain(V2P input) : SV_Target {
+    // 1. Sample the virtual scene and the passthrough feed
+    float4 virtualColor = virtualScene.Sample(input.uv);
+    float4 passthroughColor = passthroughTexture.Sample(input.uv);
+
+    // 2. Sample our refined occlusion mask
+    float mask = occlusionMask.Sample(input.uv).r;
+
+    // 3. Perform the Final Blend
+    // If mask > 0.5, the real world is occluding. We use a smoothstep
+    // to provide a "soft" edge, reducing jitter.
+    float blendFactor = smoothstep(0.4, 0.6, mask);
+
+    return lerp(virtualColor, passthroughColor, blendFactor);
+}
+----
+
+== なぜこれらの変更が必要か？
+
+オクルージョンを単純な「オン／オフ」スイッチから `Renderer` 内の専用パスへ移すことで、仮想物体が現実世界とピクセル単位で相互作用できます。仮想キャラクターは現実の物体の「後ろ」に手を伸ばせます。エンジンはモダンな **Synchronization 2** アーキテクチャを使うため、GPU 全体を止めずに、このパス開始前に ML マスクが準備できていることを保証できます。
+
+このピクセル単位の認識こそが、「ビデオオーバーレイ」を「空間体験」へ変え、仮想と物理の境界がユーザーの目には区別できなくなります。
+
+xref:OpenXR_Vulkan_Spatial_Computing/18_Semantic_Occlusion/03_per_pixel_masking.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/19_Platform_Divergence/01_introduction.adoc[Next]

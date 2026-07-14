@@ -1,0 +1,306 @@
+:pp: {plus}{plus}
+= 補間とブレンド
+
+== 補間品質が重要な理由
+
+「シンプルなエンジンの構築」シリーズでは、アニメーションキーフレームに **線形補間** を実装しました。位置には **LERP**、回転には **SLERP** と呼ばれることもあります。線形補間は単純で高速です。二つのキーフレーム値と正規化時間係数 `t`（0 と 1 の間）があれば、結果はそれらの間の直線ブレンドです。
+
+多くの用途ではこれで十分です。しかし、各キーフレームで腕の速度が変わるように見えるキャラクターや、制作ツールでは明らかに滑らかなアニメーションカーブがあるのに動きが硬く機械的に感じるキャラクターを見たことがあれば、線形のみの補間の視覚的帰結を目撃したことになります。動きの速度は各キーフレーム区間内では一定ですが、境界で急に跳ねます。アニメーターは **イージング**—モーションがポーズに入り出す加速の仕方—に多くの時間を費やしますが、線形補間はその作業をすべて捨てます。
+
+glTF はアニメーションサンプラーで三つの補間モードをサポートします。`LINEAR`、`STEP`、`CUBICSPLINE` です。`LINEAR` と `STEP`（単に「遷移なしで前の値を保持」）はすでに扱っています。`CUBICSPLINE` はアニメーターのイージングを保持するモードで、プロ品質のキャラクターアニメーションを達成するために実装が必要です。
+
+== 三次スプライン補間の理解
+
+**Cubic Hermite Spline（三次エルミートスプライン）** は、制御点（キーフレーム）を通過しながら、各制御点の **接線ベクトル** も尊重する数学的曲線です。これらの接線は、キーフレームに近づき離れるときの曲線の傾き—速度—を定義します。
+
+glTF の cubic spline 形式では、各キーフレームは一つではなく三つの値を格納します。
+
+- **in-tangent**: 曲線がこのキーフレームに *到達する* ときの接線ベクトル
+- **value**: このキーフレームでの実際のポーズ値
+- **out-tangent**: 曲線がこのキーフレームから *出発する* ときの接線ベクトル
+
+これらの接線はアニメーションソフト（Blender、Maya など）でアーティストが設定し、モーションカーブの形状を制御します。アニメーターが「この腕はゆっくりイーズインして素早くスナップアウトしたい」と言うとき、その意図は接線値にエンコードされます。
+
+キーフレーム `p0`（out-tangent `m0`）と `p1`（in-tangent `m1`）の間の時間 `t` における値の cubic Hermite 補間式は次です。
+
+....
+h00 = 2t³ - 3t² + 1       (basis function for p0)
+h10 = t³ - 2t² + t        (basis function for m0)
+h01 = -2t³ + 3t²          (basis function for p1)
+h11 = t³ - t²             (basis function for m1)
+
+result = h00 * p0 + h10 * delta_time * m0 + h01 * p1 + h11 * delta_time * m1
+....
+
+ここでの `delta_time` はキーフレーム区間の長さ（`p0` と `p1` の時間差）です。接線を正しくスケールするために必要です。これがないと、曲線の形状がキーフレームのタイミングに制御不能な形で依存します。
+
+C{pp} では、`glm::vec3` 変換チャネル向けの実装は次のとおりです。
+
+[source,cpp]
+----
+glm::vec3 cubic_spline_interpolate_vec3(
+    float t,              // Normalized time in [0, 1]
+    float dt,             // Duration of the keyframe interval
+    glm::vec3 p0,         // Previous keyframe value
+    glm::vec3 out_tan0,   // Out-tangent of previous keyframe
+    glm::vec3 p1,         // Next keyframe value
+    glm::vec3 in_tan1)    // In-tangent of next keyframe
+{
+    // Compute the four Hermite basis polynomials
+    float t2 = t * t;
+    float t3 = t2 * t;
+
+    float h00 =  2.0f * t3 - 3.0f * t2 + 1.0f;
+    float h10 =           t3 - 2.0f * t2 + t;
+    float h01 = -2.0f * t3 + 3.0f * t2;
+    float h11 =           t3 -        t2;
+
+    // Combine: value is the weighted sum of the four components
+    return h00 * p0 + h10 * dt * out_tan0
+         + h01 * p1 + h11 * dt * in_tan1;
+}
+----
+
+回転では処理が少し異なります。クォータニオンはベクトルのように直接算術でブレンドできません—**Squad**（Spherical Quadrangle interpolation）を使うか、ゲームエンジンでより一般的には接線をベクトルとしてブレンドしてから結果のクォータニオンを正規化します。glTF 仕様は Hermite ブレンド後に結果を正規化することを推奨します。
+
+[source,cpp]
+----
+glm::quat cubic_spline_interpolate_quat(
+    float t,
+    float dt,
+    glm::quat p0, glm::quat out_tan0,
+    glm::quat p1, glm::quat in_tan1)
+{
+    float t2 = t * t;
+    float t3 = t2 * t;
+
+    float h00 =  2.0f * t3 - 3.0f * t2 + 1.0f;
+    float h10 =           t3 - 2.0f * t2 + t;
+    float h01 = -2.0f * t3 + 3.0f * t2;
+    float h11 =           t3 -        t2;
+
+    // Blend the quaternion components as if they were 4-component vectors
+    glm::vec4 blended =
+          h00 * glm::vec4(p0.x,       p0.y,       p0.z,       p0.w)
+        + h10 * dt * glm::vec4(out_tan0.x, out_tan0.y, out_tan0.z, out_tan0.w)
+        + h01 * glm::vec4(p1.x,       p1.y,       p1.z,       p1.w)
+        + h11 * dt * glm::vec4(in_tan1.x,  in_tan1.y,  in_tan1.z,  in_tan1.w);
+
+    // The glTF spec requires normalization after the cubic blend
+    return glm::normalize(glm::quat(blended.w, blended.x, blended.y, blended.z));
+}
+----
+
+== アニメーションシステムへの三次スプライン統合
+
+三次スプラインをサポートするには、`AnimationSampler` データ構造がキーフレームごとに一つではなく三つの値を格納する必要があります。サンプラーの補間タイプが `CUBICSPLINE` のとき、glTF バイナリバッファ内の各キーフレームは `[in_tangent, value, out_tangent]` の順で含まれます。
+
+[source,cpp]
+----
+enum InterpolationMode {
+    STEP,
+    LINEAR,
+    CUBICSPLINE
+};
+
+struct AnimationSampler {
+    InterpolationMode interpolation = LINEAR;
+    std::vector<float> inputs;              // Timestamps in seconds
+    std::vector<glm::vec4> outputs_raw;     // Packed: for CUBICSPLINE stores in_tan/value/out_tan triples
+
+    // For CUBICSPLINE, we split the raw data for easier interpolation
+    std::vector<glm::vec4> in_tangents;
+    std::vector<glm::vec4> values;
+    std::vector<glm::vec4> out_tangents;
+};
+
+struct AnimationChannel {
+    enum PathType { TRANSLATION, ROTATION, SCALE, WEIGHTS };
+    PathType path;
+    uint32_t node_index;
+    uint32_t sampler_index;
+};
+----
+
+更新したサンプラー読み込みコードはこのレイアウトを扱う必要があります。
+
+[source,cpp]
+----
+void load_animation_sampler(
+    const tinygltf::AnimationSampler& gltf_sampler,
+    const tinygltf::Model& model,
+    AnimationSampler& out_sampler)
+{
+    // Parse the interpolation type from the glTF string
+    if (gltf_sampler.interpolation == "LINEAR")           out_sampler.interpolation = LINEAR;
+    else if (gltf_sampler.interpolation == "STEP")        out_sampler.interpolation = STEP;
+    else if (gltf_sampler.interpolation == "CUBICSPLINE") out_sampler.interpolation = CUBICSPLINE;
+
+    // Load the input timestamps (these are always plain floats, no tangents)
+    load_accessor_float(model, gltf_sampler.input, out_sampler.inputs);
+
+    // For CUBICSPLINE, the output accessor contains 3 values per timestamp:
+    // [in_tangent, value, out_tangent]. The total count is 3 * keyframe_count.
+    // For LINEAR/STEP, the output count equals the keyframe count.
+    load_accessor_vec4(model, gltf_sampler.output, out_sampler.outputs_raw);
+
+    if (out_sampler.interpolation == CUBICSPLINE) {
+        // Split the interleaved data into separate arrays
+        size_t keyframe_count = out_sampler.inputs.size();
+        out_sampler.in_tangents.resize(keyframe_count);
+        out_sampler.values.resize(keyframe_count);
+        out_sampler.out_tangents.resize(keyframe_count);
+
+        for (size_t i = 0; i < keyframe_count; ++i) {
+            out_sampler.in_tangents[i]  = out_sampler.outputs_raw[i * 3 + 0];
+            out_sampler.values[i]       = out_sampler.outputs_raw[i * 3 + 1];
+            out_sampler.out_tangents[i] = out_sampler.outputs_raw[i * 3 + 2];
+        }
+    } else {
+        out_sampler.values = out_sampler.outputs_raw;
+    }
+}
+----
+
+== アニメーションブレンド: クリップ間のクロスフェード
+
+補間は単一アニメーションクリップ *内* のモーション品質を向上させます。しかし実際のキャラクターエンジンはクリップ *間* の遷移が必要です—歩行から走行へ、アイドルから攻撃へ、そして私たちの目的で最も重要な、スクリプトアニメーションから物理駆動ラグドールへ。
+
+**クロスフェード** が最も一般的な技法です。遷移がトリガーされると、すぐに新しいクリップへ切り替えません。代わりに両方のクリップを同時に再生し、短い遷移期間（通常 0.1〜0.3 秒）で出力ポーズをブレンドします。遷移開始時、古いクリップのウェイトは 1.0、新しいクリップは 0.0 です。終了時にはウェイトが逆転します。遷移中は両方が非ゼロで、ポーズがブレンドされます。
+
+このシステムの中核は、二つのポーズ（ジョイント変換の集合）とブレンド係数を受け取り、加重組み合わせを返す **Pose Blend** 関数です。
+
+[source,cpp]
+----
+// A Pose is a snapshot of all joint local transforms for a single frame
+struct Pose {
+    std::vector<glm::vec3> translations;
+    std::vector<glm::quat> rotations;
+    std::vector<glm::vec3> scales;
+};
+
+// Blend two poses together: result = (1-t) * pose_a + t * pose_b
+void blend_poses(const Pose& pose_a, const Pose& pose_b, float t, Pose& out)
+{
+    assert(pose_a.translations.size() == pose_b.translations.size());
+    size_t joint_count = pose_a.translations.size();
+
+    out.translations.resize(joint_count);
+    out.rotations.resize(joint_count);
+    out.scales.resize(joint_count);
+
+    for (size_t i = 0; i < joint_count; ++i) {
+        // Translation and scale use standard linear interpolation
+        out.translations[i] = glm::mix(pose_a.translations[i], pose_b.translations[i], t);
+        out.scales[i]       = glm::mix(pose_a.scales[i],       pose_b.scales[i],       t);
+
+        // Rotation uses spherical linear interpolation (SLERP) for shortest path
+        out.rotations[i] = glm::slerp(pose_a.rotations[i], pose_b.rotations[i], t);
+    }
+}
+----
+
+クロスフェードコントローラが遷移状態を管理します。
+
+[source,cpp]
+----
+struct CrossFadeState {
+    uint32_t  from_clip_index;
+    uint32_t  to_clip_index;
+    float     blend_factor;   // 0.0 = fully from_clip, 1.0 = fully to_clip
+    float     transition_duration;
+    bool      active = false;
+};
+
+void update_cross_fade(CrossFadeState& fade, float delta_time)
+{
+    if (!fade.active) return;
+
+    fade.blend_factor += delta_time / fade.transition_duration;
+    if (fade.blend_factor >= 1.0f) {
+        // Transition complete - snap to the destination clip
+        fade.blend_factor = 1.0f;
+        fade.active = false;
+        // The caller should now update the "current clip" to to_clip_index
+    }
+}
+----
+
+== ラグドールブレンド: アニメーションから物理へ
+
+クロスフェードシステムはアニメーションからラグドールへの引き渡しで特に重要になります。これは単なる二つのアニメーションクリップ間のクロスフェードではありません—アニメーションシステムがスケルトンを駆動する状態と物理システムが駆動する状態の間の遷移です。
+
+これを突然の切り替えで行うと、不快な視覚アーティファクトが生じます。キャラクターがアニメーションしたポーズから、物理エンジンが初期状態として計算したポーズへ瞬間的にスナップします。物理エンジンが正しいポーズから始めても、滑らかな遷移がないと遷移はおかしく見えます。
+
+代わりに **Physics Blend Weight（物理ブレンドウェイト）** を実装します。アニメーションシステムは引き続きポーズを計算します。物理システムもポーズ（ラグドール）を計算します。遷移期間中に 0.0 から 1.0 へランプする `ragdoll_weight` に基づいてブレンドします。
+
+[source,cpp]
+----
+struct CharacterAnimationState {
+    Pose    animation_pose;  // Pose from the current animation clip
+    Pose    physics_pose;    // Pose from the ragdoll physics simulation
+    float   ragdoll_weight;  // 0.0 = fully animated, 1.0 = fully ragdoll
+    bool    ragdoll_active;  // Is the physics simulation enabled?
+};
+
+void update_character_pose(
+    CharacterAnimationState& state,
+    float delta_time,
+    std::vector<Node>& nodes,
+    const Skin& skin)
+{
+    // Sample the animation clip to get animation_pose (as before)
+    sample_animation(state.animation_pose, delta_time);
+
+    if (state.ragdoll_active) {
+        // Read the physics simulation results into physics_pose
+        read_physics_pose(state.physics_pose, nodes, skin);
+
+        // Ramp the ragdoll weight up to 1.0 over the transition duration
+        state.ragdoll_weight = glm::min(state.ragdoll_weight + delta_time * 5.0f, 1.0f);
+
+        // Blend between animation and physics poses
+        Pose blended_pose;
+        blend_poses(state.animation_pose, state.physics_pose, state.ragdoll_weight, blended_pose);
+
+        // Apply the blended pose to the scene graph nodes
+        apply_pose_to_scene_graph(nodes, blended_pose, skin.joints);
+    } else {
+        // Fully animation-driven: apply directly without blending
+        apply_pose_to_scene_graph(nodes, state.animation_pose, skin.joints);
+    }
+}
+
+// Applies a Pose to the Scene Graph.
+// Parameter order: nodes first, pose second, then the joint index list.
+// (Canonical signature from animation.h.)
+void apply_pose_to_scene_graph(
+    std::vector<Node>&           nodes,
+    const Pose&                  pose,
+    const std::vector<uint32_t>& joint_indices)
+{
+    for (size_t i = 0; i < joint_indices.size(); ++i) {
+        Node& node = nodes[joint_indices[i]];
+
+        node.translation    = pose.translations[i];
+        node.local_rotation = pose.rotations[i];
+        node.scale          = pose.scales[i];
+
+        node.mark_dirty();
+    }
+}
+----
+
+`ragdoll_weight * 5.0f` の乗数は遷移が 0.2 秒（`1.0 / 5.0`）で完了することを意味します。この定数は好みに合わせて調整できます。速い遷移は突然の「落下」に見え、遅い遷移はキャラクターが重力にゆっくり引き渡されているように見えます。
+
+重要な実装詳細があります。`ragdoll_active` が true になったとき、物理ボディの初期状態を現在のアニメーションポーズに一致させる必要があります。物理シミュレーションが任意またはゼロポーズから始まると、物理システムが正しい開始位置に「スナップ」する最初の数フレーム、ブレンドはおかしく見えます。引き渡しの瞬間にアニメーションポーズから物理ボディを初期化すれば、ブレンドはほぼゼロの差分の状態から始まり、シームレスな遷移が保証されます。
+
+== まとめ
+
+三次スプライン補間により、アニメーションシステムはアニメーターが制作ツールで作る微妙なイージングと速度カーブを忠実に再現します。キャラクターはもはや機械的な等速キーフレームに駆動されているように感じません。
+
+クロスフェードブレンドにより、任意の二つのアニメーションクリップ間を滑らかに遷移でき、最も重要なのは、スクリプトアニメーションから完全な物理ラグドールシミュレーションへ自然で応答性のある見た目でブレンドできることです。
+
+補間品質とブレンド—この二つのシステムが、アニメーションが単に「動く」ことと、*生きているように感じる* ことの違いです。
+
+xref:Advanced_glTF/Skeletal_Compute_Skinning/04_shared_vertex_buffer.adoc[前へ: 一度スキンしてどこでも使う] | xref:Advanced_glTF/Skeletal_Compute_Skinning/06_conclusion.adoc[次へ: 章のまとめ]

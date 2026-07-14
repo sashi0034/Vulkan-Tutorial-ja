@@ -1,0 +1,197 @@
+:pp: {plus}{plus}
+
+= インスタンス
+
+== インスタンスの作成
+
+最初に行うべきことは、*インスタンス* を作成して Vulkan ライブラリを初期化することです。インスタンスはアプリケーションと Vulkan ライブラリの接続であり、作成時にはドライバにアプリケーションに関するいくつかの詳細を指定します。
+
+まず `createInstance` 関数を追加し、`initVulkan` 関数から呼び出します。
+
+[,c++]
+----
+void initVulkan() {
+    createInstance();
+}
+----
+
+さらに、インスタンスのハンドルと raii コンテキストを保持するデータメンバを追加します。
+
+[,c++]
+----
+private:
+vk::raii::Context  context;
+vk::raii::Instance instance = nullptr;
+----
+
+インスタンスを作成するには、まずアプリケーションに関する情報を構造体に埋めます。このデータは技術的にはオプションですが、ドライバが特定のアプリケーション向けに最適化するための有用な情報になる場合があります（例: 特殊な挙動を持つ有名なグラフィックスエンジンを使っているなど）。この構造体は `vk::ApplicationInfo` です。
+
+[,c++]
+----
+void createInstance()
+{
+    constexpr vk::ApplicationInfo appInfo{.pApplicationName   = "Hello Triangle",
+                                          .applicationVersion = VK_MAKE_VERSION( 1, 0, 0 ),
+                                          .pEngineName        = "No Engine",
+                                          .engineVersion      = VK_MAKE_VERSION( 1, 0, 0 ),
+                                          .apiVersion         = vk::ApiVersion14};
+}
+----
+
+vk::ApiVersion10 つまり Vulkan 1.0 も存在しますが、一部の機能は古く RAII とうまく動かないものや、xref:../../03_Drawing_a_triangle/02_Graphics_pipeline_basics/01_Shader_modules.adoc[後で述べる] Slang 言語向けでないものがあるため、ベースラインとして 1.4 を示しています。C API であれば stype と pnext を指定し、冗長に書く必要があります。C API を使う他の Vulkan プロジェクトでもそうなっているでしょう。現代的な c{pp} モジュールを使えばこれは自動で処理されます。
+
+Vulkan では多くの情報が関数パラメータではなく構造体経由で渡されます。インスタンス作成に十分な情報を与えるため、もう 1 つ構造体を埋める必要があります。この次の構造体は必須で、使うグローバル拡張とバリデーションレイヤを Vulkan ドライバに伝えます。ここでいうグローバルとは、特定のデバイスではなくプログラム全体に適用されるという意味で、次の数章で明らかになります。
+
+[,c++]
+----
+vk::InstanceCreateInfo createInfo{
+    .pApplicationInfo = &appInfo
+};
+----
+
+この構造体には flags というメンバがあり、本章の後半で扱います。
+メンバ pApplicationInfo は先ほど作成した appInfo を指します。
+次は要求するレイヤの配列、最後は望むグローバル拡張の配列です。概要の章で述べたように、Vulkan はプラットフォーム非依存の API なので、ウィンドウシステムとやり取りするには拡張が必要です。GLFW には、そのために必要な拡張を返す便利な組み込み関数があり、それを構造体に渡せます。
+
+[,c++]
+----
+// Get the required instance extensions from GLFW.
+uint32_t glfwExtensionCount = 0;
+auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
+
+// Check if the required GLFW extensions are supported by the Vulkan implementation.
+auto extensionProperties = context.enumerateInstanceExtensionProperties();
+for (uint32_t i = 0; i < glfwExtensionCount; ++i)
+{
+    if (std::ranges::none_of(extensionProperties,
+                             [glfwExtension = glfwExtensions[i]](auto const& extensionProperty)
+                             { return strcmp(extensionProperty.extensionName, glfwExtension) == 0; }))
+    {
+        throw std::runtime_error("Required GLFW extension not supported: " + std::string(glfwExtensions[i]));
+    }
+}
+
+vk::InstanceCreateInfo createInfo{
+    .pApplicationInfo = &appInfo,
+    .enabledExtensionCount = glfwExtensionCount,
+    .ppEnabledExtensionNames = glfwExtensions};
+----
+
+残りの欠けている部分は有効化するレイヤです。ここで、あらゆるプロジェクトで最も有用かつ重要なレイヤの 1 つであるバリデーションレイヤの有効化について触れます。次の章で詳しく扱うので、今は空のままにしておきます。
+
+Vulkan がインスタンスを作成するために必要な指定はすべて終わったので、いよいよ vk::raii::Instance を作成できます。
+
+[,c++]
+----
+instance = vk::raii::Instance(context, createInfo);
+----
+
+ご覧のとおり、Vulkan のオブジェクト作成関数のパラメータの一般的なパターンは次のとおりです。
+
+* 作成情報を持つ構造体へのポインタ
+* カスタムアロケータコールバックへのポインタ（デフォルトを使う場合はオプションなので、本チュートリアルでは常に無視）
+* コンストラクタが依存するデバイス、インスタンス、またはコンテキストへのポインタ
+* raii で構築されたオブジェクトへのポインタを返す
+
+すべてうまくいけば、インスタンスのハンドルが返されます。c{pp} の例外を使って成功を確認できます。c{pp} 例外が使えない場合は、`VULKAN_HPP_NO_EXCEPTIONS` を定義してオフにできます。その場合、呼び出しは VKResult と返されたオブジェクトを含む std::tuple を返します。
+Vulkan 呼び出しのエラーチェックの例です。
+
+[,c++]
+----
+    try
+    {
+        vk::raii::Context context;
+        vk::raii::Instance instance(context, vk::InstanceCreateInfo{});
+        vk::raii::PhysicalDevice physicalDevice = instance.enumeratePhysicalDevices().front();
+        vk::raii::Device device(physicalDevice, vk::DeviceCreateInfo{});
+
+        // Use Vulkan objects
+        vk::raii::Buffer buffer(device, vk::BufferCreateInfo{});
+    }
+    catch (const vk::SystemError& err)
+    {
+        std::cerr << "Vulkan error: " << err.what() << std::endl;
+        return 1;
+    }
+    catch (const std::exception& err)
+    {
+        std::cerr << "Error: " << err.what() << std::endl;
+        return 1;
+    }
+----
+
+またはタプルを使います。
+
+[,c++]
+----
+    vk::raii::Context context;
+    ...
+    auto instanceRV = context.createInstance(...);
+    if (!instanceRV.has_value())
+    {
+        std::cerr << "Error: Instance creation failed with " << vk::to_string(instanceVR.result) << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    vk::raii::Instance instance = std::move(instanceRV.value);
+    ...
+    auto physicalDevicesRV = instance.enumeratePhysicalDevices();
+    if (!physicalDevicesRV.hasValue())
+    {
+        std::cerr << "Error: Enumerating PhysicalDevices failed with " << vk::to_string(physicalDevicesRV) << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    vk::raii::PhysicalDevice physicalDevice = std::move(physicalDevicesRV.value.front());
+    ...
+----
+
+この例はチュートリアルの後半からのものです。すべての呼び出しでエラーを確認する方法の一例にすぎません。
+
+== vk::Result::eErrorIncompatibleDriver が発生した場合:
+最新の MoltenVK SDK を使う macOS では、`vk::raii::createInstance` または vk::raii::Instance コンストラクタから `vk::Result::eErrorIncompatibleDriver` が投げられることがあります。https://vulkan.lunarg.com/doc/sdk/1.3.216.0/mac/getting_started.html[Getting Start Notes] によると、1.3.216 Vulkan SDK 以降、`VK_KHR_PORTABILITY_subset` 拡張は必須です。
+
+このエラーを回避するには、まず `vk::InstanceCreateInfo` 構造体の flags に `vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR` ビットを追加し、次にインスタンスの有効化拡張リストに `vk::KHRPortabilityEnumerationExtensionName` を追加します。
+
+典型的には次のようなコードになります。
+
+[,c++]
+----
+constexpr vk::ApplicationInfo appInfo{.pApplicationName   = "Hello Triangle",
+                                      .applicationVersion = VK_MAKE_VERSION( 1, 0, 0 ),
+                                      .pEngineName        = "No Engine",
+                                      .engineVersion      = VK_MAKE_VERSION( 1, 0, 0 ),
+                                      .apiVersion         = vk::ApiVersion14};
+vk::InstanceCreateInfo createInfo{
+    .flags = vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR,
+    .pApplicationInfo = &appInfo,
+    .ppEnabledExtensionNames = { vk::KHRPortabilityEnumerationExtensionName }
+};
+instance = vk::raii::Instance(m_context, createInfo);
+----
+
+== 拡張サポートの確認
+
+`vkCreateInstance` のドキュメントを見ると、可能なエラーコードの 1 つに `VK_ERROR_EXTENSION_NOT_PRESENT` があります。必要な拡張を指定し、そのエラーコードが返ってきたら終了する、というやり方でも構いません。ウィンドウシステムインターフェースのような必須拡張ではそれでよいですが、オプション機能を確認したい場合はどうでしょうか。
+
+インスタンス作成前にサポートされている拡張の一覧を取得するには、`vk::raii::Context::enumerateInstanceExtensionProperties` 関数があります。利用可能な拡張のベクタを返し、特定のバリデーションレイヤで拡張をフィルタできます（今は無視します）。
+
+[,c++]
+----
+auto extensions = context.enumerateInstanceExtensionProperties();
+----
+
+各 `vk::ExtensionProperties` 構造体には拡張の名前とバージョンが含まれます。単純な for ループで一覧表示できます（`\t` はインデント用のタブです）。
+
+[,c++]
+----
+std::cout << "available extensions:\n";
+
+for (const auto& extension : extensions) {
+    std::cout << '\t' << extension.extensionName << '\n';
+}
+----
+
+Vulkan サポートの詳細を示したい場合は、このコードを `createInstance` 関数に追加できます。
+
+インスタンス作成後のより複雑な手順に進む前に、xref:./02_Validation_layers.adoc[バリデーションレイヤ] を確認してデバッグの選択肢を評価しましょう。
+
+link:/attachments/01_instance_creation.cpp[C{pp} code]

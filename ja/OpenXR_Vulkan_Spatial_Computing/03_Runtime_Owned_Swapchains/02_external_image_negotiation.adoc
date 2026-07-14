@@ -1,0 +1,82 @@
+:pp: {plus}{plus}
+= 外部イメージ交渉
+
+標準の Vulkan アプリケーションでは、`vkCreateSwapchainKHR` でサーフェスに紐づくスワップチェーンを作成します。OpenXR では、この仕組み全体を `XrSwapchain` に置き換えます。OS のウィンドウシステムがバッファを管理する代わりに、**XR Runtime** がスワップチェーン提供者として機能します。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+スワップチェーン所有権の逆転は、OpenXR が要求する根本的なアーキテクチャ変更です。エンジンが描画するイメージを取得するため、ランタイムと交渉しなければなりません。
+
+== 制御の逆転: スワップチェーン提供者
+
+この交渉を理解するには、マインドセットを切り替える必要があります。デスクトップアプリでは *あなた* がスワップチェーンを作り、OS がそれを *消費* します。OpenXR では **ランタイムがスワップチェーン提供者として機能** し、イメージを作成してあなたに「貸す」のです。
+
+*   **VRAM 割り当て**: ランタイムが VRAM を割り当てメモリレイアウトを管理し、エンジンとコンポジタプロセスの両方から見えるメモリ領域にイメージが割り当てられることを保証します。
+*   **メモリタイリングとアラインメント**: ランタイムは内部コンポジタ向けに最適なタイリングとアラインメントを選び、最大帯域でフレームを読めるようにします。
+*   **効率**: イメージを直接提供することで、ランタイムは **ゼロコピー** の受け渡しを行えます。描画が終わると、ランタイムはまったく同じメモリを最終コンポジタパスに使います。
+
+== スワップチェーンフォーマットの列挙
+
+最初のステップは、`xrEnumerateSwapchainFormats` でランタイムがサポートする `VkFormat` リストを問い合わせることです。
+
+[source,cpp]
+----
+uint32_t formatCount = 0;
+xrEnumerateSwapchainFormats(xrSession, 0, &formatCount, nullptr);
+std::vector<int64_t> formats(formatCount);
+xrEnumerateSwapchainFormats(xrSession, formatCount, &formatCount, formats.data());
+----
+
+OpenXR はこれらを `int64_t` 値として返すことに注意が必要で、`VkFormat`（RAII エンジンでは `vk::Format`）へキャストしなければなりません。通常は `VK_FORMAT_R16G16B16A16_SFLOAT` のような高ダイナミックレンジ（**HDR**）フォーマット、または `VK_FORMAT_R8G8B8A8_SRGB` のような標準 **SRGB** フォーマットが望ましいです。
+
+**発展: フォーマットと用途の制限への対応**:
+OpenXR は利用可能なスワップチェーンフォーマットを特定の列挙リストに制限しますが、Vulkan ではさらに先へ進めます。
+*   **カスタム内部フォーマット**: 高度に最適化された圧縮フォーマットなどのカスタム内部フォーマットへ描画し、最後の瞬間に OpenXR 対応スワップチェーンへ最終的な **Image Copy** または **Blit** を行えます。
+*   **ストレージイメージ用途**: 一部のランタイムはスワップチェーンイメージに `VK_IMAGE_USAGE_STORAGE_BIT` をサポートしない場合があります。その場合、Vulkan で別のストレージイメージを作成し、コンピュート作業を行ったうえで結果を XR スワップチェーンへコピーできます。
+
+== XrSwapchain の作成
+
+フォーマットを選んだら、指定初期化子を使って `XrSwapchainCreateInfo` 構造体を埋めます。
+
+[source,cpp]
+----
+XrSwapchainCreateInfo createInfo{
+    .type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+    .format = chosenVulkanFormat,
+    .sampleCount = 1,
+    .width = viewWidth,
+    .height = viewHeight,
+    .faceCount = 1,
+    .arraySize = 1, // 1 for standard mono/stereo, more for multiview
+    .mipCount = 1
+};
+
+XrSwapchain xrSwapchain;
+xrCreateSwapchain(xrSession, &createInfo, &xrSwapchain);
+----
+
+== 生イメージの取得
+
+`XrSwapchain` 作成後、エンジンの抽象にラップするため実際の `VkImage` ハンドルを取得する必要があります。`xrEnumerateSwapchainImages` を使い、`XrSwapchainImageVulkanKHR` 構造体の配列を取得します。
+
+[source,cpp]
+----
+uint32_t imageCount = 0;
+xrEnumerateSwapchainImages(xrSwapchain, 0, &imageCount, nullptr);
+std::vector<XrSwapchainImageVulkanKHR> xrImages(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+xrEnumerateSwapchainImages(xrSwapchain, imageCount, &imageCount, (XrSwapchainImageBaseHeader*)xrImages.data());
+----
+
+各 `XrSwapchainImageVulkanKHR` は `VkImage` ハンドルを含みます。これらのハンドルをエンジンの RAII システムに渡します。
+
+== 「ゼロコピー」が重要な理由: コンポジタパイプライン
+
+このようにイメージを交渉することで、**ゼロコピー** の受け渡しが保証されます。描画完了時、フレームを別バッファへコピーしません。代わりに、そのイメージの使用が終わったことをランタイムにシグナルするだけです。ランタイムはまったく同じメモリを最終コンポジタパス（歪み補正、色収差など）に使います。
+
+この効率が、高性能な 90Hz 体験と、ラグの多い不快な体験の差です。次のセクションでは、これらの生 Vulkan ハンドルをエンジンの `vk::raii` 抽象にどうラップするかを見ます。
+
+TIP: 詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#xrEnumerateSwapchainFormats[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/01_introduction.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/03_raii_resource_integration.adoc[次へ]

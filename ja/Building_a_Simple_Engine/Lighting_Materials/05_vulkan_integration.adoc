@@ -1,0 +1,221 @@
+= Vulkan 統合
+
+この節では、PBR 実装を Vulkan レンダリングパイプラインの残りの部分と統合します。レンダラークラスを更新し、glTF モデルとその PBR マテリアルで使える高度なライティング技法をサポートします。ここで開発する技法は、Loading_Models の章で glTF モデルを読み込んでレンダリングするときに適用されます。
+
+流れを具体的に保ち、前の理論の繰り返しを避けるため、次の短いロードマップを使います。
+
+1) PBR パイプラインオブジェクトとマテリアル用プッシュ定数ブロックでレンダラーを拡張する
+2) メインパイプラインと並べて PBR パイプライン（レイアウト、シェーダー、ブレンディング、フォーマット）を作成する
+3) 描画を記録する: PBR パイプラインをバインドし、ジオメトリをバインドし、メッシュごとにマテリアル定数をプッシュする
+4) RAII 経由でクリーンアップする（特別な解体は不要）
+
+[NOTE]
+====
+ここでは PBR 理論やプッシュ定数の基礎を再説明しません。xref:Building_a_Simple_Engine/Lighting_Materials/03_push_constants.adoc[プッシュ定数]、および xref:Building_a_Simple_Engine/Lighting_Materials/01_introduction.adoc[はじめに]（と xref:Building_a_Simple_Engine/Loading_Models/05_pbr_rendering.adoc[PBR レンダリング]）を参照してください。
+====
+
+PBR パスは、下図のようにグラフィックスパイプラインに組み込まれます。
+
+image::../../../images/rendering_pipeline_flowchart.png[Rendering Pipeline Flowchart, width=600, alt=Rendering pipeline flowchart showing where the PBR pass fits]
+
+== レンダラークラスの更新
+
+まず、PBR 実装に必要な新しいメンバを含めるようレンダラークラスを更新します。
+
+[source,cpp]
+----
+class Renderer {
+public:
+    // ... existing members ...
+
+    // PBR pipeline
+    vk::raii::PipelineLayout pbrPipelineLayout;
+    vk::raii::Pipeline pbrPipeline;
+
+    // Push constant block for PBR material properties
+    struct PushConstantBlock {
+        glm::vec4 baseColorFactor;
+        float metallicFactor;
+        float roughnessFactor;
+        int baseColorTextureSet;
+        int physicalDescriptorTextureSet;
+        int normalTextureSet;
+        int occlusionTextureSet;
+        int emissiveTextureSet;
+        float alphaMask;
+        float alphaMaskCutoff;
+    };
+
+    // ... existing methods ...
+
+    // New methods
+    bool createPBRPipeline();
+    void pushMaterialProperties(vk::CommandBuffer commandBuffer, const Model* model, uint32_t materialIndex);
+};
+----
+
+PBR パイプライン用のメンバと、PBR マテリアルプロパティ用の struct を追加しました。PBR パイプラインの作成と、マテリアルプロパティをシェーダーへプッシュするメソッドも追加しました。
+
+== 初期化の更新
+
+次に、PBR パイプラインを作成するよう初期化処理を更新する必要があります。
+
+[source,cpp]
+----
+bool Renderer::Initialize(const std::string& appName, bool enableValidationLayers) {
+    // ... existing initialization code ...
+
+    // Create graphics pipeline
+    if (!createGraphicsPipeline()) {
+        return false;
+    }
+
+    // Create PBR pipeline
+    if (!createPBRPipeline()) {
+        std::cerr << "Failed to create PBR pipeline" << std::endl;
+        return false;
+    }
+
+    // ... rest of initialization code ...
+
+    initialized = true;
+    return true;
+}
+----
+
+== クリーンアップの更新
+
+PBR パイプラインを破棄するようクリーンアップ処理も更新する必要があります。
+
+[source,cpp]
+----
+void Renderer::Cleanup() {
+    // ... existing cleanup code ...
+
+    // With vk::raii, pipeline and pipeline layout objects are automatically destroyed
+    // when they go out of scope, so we don't need explicit destruction calls
+
+    // ... rest of cleanup code ...
+}
+----
+
+== レンダリング処理の更新
+
+最後に、PBR パイプラインを使いマテリアルプロパティをプッシュするようレンダリング処理を更新する必要があります。
+
+[source,cpp]
+----
+void Renderer::recordCommandBuffer(vk::CommandBuffer commandBuffer, uint32_t imageIndex) {
+    // ... existing command buffer recording code ...
+
+    // Bind the PBR pipeline
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pbrPipeline);
+
+    // For each model in the scene
+    for (const auto& model : models) {
+        // Bind vertex and index buffers
+        vk::Buffer vertexBuffers[] = {model->vertexBuffer};
+        vk::DeviceSize offsets[] = {0};
+        commandBuffer.bindVertexBuffers(0, 1, vertexBuffers, offsets);
+        commandBuffer.bindIndexBuffer(model->indexBuffer, 0, vk::IndexType::eUint32);
+
+        // For each mesh in the model
+        for (const auto& mesh : model->meshes) {
+            // Push material properties
+            pushMaterialProperties(commandBuffer, model, mesh.materialIndex);
+
+            // Bind descriptor sets
+            commandBuffer.bindDescriptorSets(
+                vk::PipelineBindPoint::eGraphics,
+                *pbrPipelineLayout,
+                0,
+                1,
+                &descriptorSets[imageIndex],
+                0,
+                nullptr
+            );
+
+            // Draw
+            commandBuffer.drawIndexed(mesh.indexCount, 1, mesh.firstIndex, 0, 0);
+        }
+    }
+
+    // ... rest of command buffer recording code ...
+}
+----
+
+== PBR シェーダー参照
+
+この章は、重複とドリフトを避けるため、前節で定義した正確な PBR シェーダーを再利用します。完全な pbr.slang ソースと詳細な説明は xref:Building_a_Simple_Engine/Lighting_Materials/04_lighting_implementation.adoc[PBR シェーダーの実装] を参照してください。ここでは Vulkan 統合 — パイプラインレイアウト、ディスクリプタバインディング、プッシュ定数、描画の提出 — に厳密に焦点を当てます。
+
+
+== シェーダーのコンパイル
+
+シェーダーファイルを作成したら、slangc でコンパイルする必要があります。通常はビルド処理の一部として行われますが、手動でも実行できます。
+
+[source,bash]
+----
+slangc shaders/pbr.slang -target spirv -profile spirv_1_4 -o shaders/pbr.spv
+----
+
+== glTF モデルでの実装のテスト
+
+実装をテストするには、実装と互換性のある PBR マテリアルがすでに定義された glTF モデルを使えます。Loading_Models の章でこれらのモデルの読み込み方法を学びますが、今は読み込める手段があると仮定します。
+
+glTF モデルを使ったテストシーンのセットアップ例です。
+
+[source,cpp]
+----
+void Renderer::renderTestScene() {
+    // Set up camera
+    glm::vec3 cameraPos = glm::vec3(0.0f, 0.0f, 3.0f);
+    glm::vec3 cameraTarget = glm::vec3(0.0f, 0.0f, 0.0f);
+    glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+
+    // Set up lights
+    // Light 1: White light from above
+    glm::vec4 lightPos1 = glm::vec4(0.0f, 5.0f, 5.0f, 1.0f);
+    glm::vec4 lightColor1 = glm::vec4(300.0f, 300.0f, 300.0f, 1.0f);
+
+    // Light 2: Blue light from the left
+    glm::vec4 lightPos2 = glm::vec4(-5.0f, 0.0f, 0.0f, 1.0f);
+    glm::vec4 lightColor2 = glm::vec4(0.0f, 0.0f, 300.0f, 1.0f);
+
+    // Load glTF models
+    Model* damagedHelmet = modelLoader.loadModel("models/DamagedHelmet/DamagedHelmet.gltf");
+    Model* flightHelmet = modelLoader.loadModel("models/FlightHelmet/FlightHelmet.gltf");
+
+    // The models already have PBR materials defined in the glTF file
+    // We can render them directly with our PBR pipeline
+
+    // Render the models with different transformations
+    renderModel(damagedHelmet, glm::vec3(-1.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+    renderModel(flightHelmet, glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+    // We can also experiment with modifying the material properties
+    // For example, to make the damaged helmet more metallic:
+    if (damagedHelmet->materials.size() > 0) {
+        // Store the original value to restore later
+        float originalMetallic = damagedHelmet->materials[0].metallicFactor;
+
+        // Modify the material
+        damagedHelmet->materials[0].metallicFactor = 1.0f;
+
+        // Render with modified material
+        renderModel(damagedHelmet, glm::vec3(-2.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+        // Restore original value
+        damagedHelmet->materials[0].metallicFactor = originalMetallic;
+    }
+}
+----
+
+== まとめ
+
+この節では、PBR 実装を Vulkan レンダリングパイプラインの残りの部分と統合しました。glTF モデルとその PBR マテリアルで使える高度なライティング技法をサポートするようレンダラークラスを更新しました。学んだ概念に基づく PBR シェーダーを作成し、glTF モデルで実装をテストする方法を示しました。
+
+このアプローチは、物理的に正確なマテリアルをレンダリングするための堅固な基盤を提供し、Loading_Models の章で glTF モデルを読み込んでレンダリングするときに適用します。また、特定のレンダリング要件に合わせてマテリアルプロパティを変更・拡張する柔軟性も与えます。
+
+次の節では、Vulkan Ray Query を使って高品質な影を追加する方法を探ります。
+
+xref:Building_a_Simple_Engine/Lighting_Materials/04_lighting_implementation.adoc[前へ: ライティング実装] | xref:Building_a_Simple_Engine/Lighting_Materials/07_shadows.adoc[次へ: 影]

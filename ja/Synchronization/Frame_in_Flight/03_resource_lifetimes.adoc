@@ -1,0 +1,61 @@
+:pp: {plus}{plus}
+= リソースの寿命: deviceWaitIdle() なしの安全な再利用
+
+== タグ付けと回収
+
+Vulkan で最も大きな課題の一つは、リソースを再利用または破棄して安全なタイミングを知ることです。タイムラインセマフォでは、破棄と再利用をグローバルカウンタの関数として扱います。カウンタが最後に使われた値を超えたとき、リソースは回収の対象になります。
+
+一時リソース（コマンドバッファ、ステージングバッファ、ディスクリプタセット）用の小さなアロケータまたはフリーリストを維持します。各割り当てには `retireValue` がタグ付けされます。
+
+[,cpp]
+----
+struct TrackedResource {
+    ResourceHandle handle{}; // your wrapper around vk objects
+    uint64_t       retireValue = 0; // timeline value when last submitted use completes
+};
+
+void destroyWhenSafe(TrackedResource res) {
+    deferredDeletes.push_back(res);
+}
+
+void gc(vk::raii::Device const& device, vk::raii::Semaphore const& timeline) {
+    const uint64_t now = device.getSemaphoreCounterValue(*timeline);
+    auto it = std::remove_if(deferredDeletes.begin(), deferredDeletes.end(), [&](TrackedResource const& r){
+        if (now >= r.retireValue) { destroy(r.handle); return true; }
+        return false;
+    });
+    deferredDeletes.erase(it, deferredDeletes.end());
+}
+----
+
+== サブミッションとの統合
+
+リソースを参照する作業をサブミットするときはいつでも、そのサブミッションでタイムラインにシグナルするのと同じ値でタグ付けします。
+
+[,cpp]
+----
+const uint64_t submissionValue = nextSubmitValue++;
+submitCommands(cmd, /*signals*/ submissionValue);
+
+TrackedResource tex = createTexture(/*...*/);
+tex.retireValue = submissionValue; // safe to reuse/destroy once reached
+----
+
+このパターンは複雑なグラフにもスケールします。フレーム用に作成されたリソースセット全体や、アップロードマネージャのようなサブシステム内の個々の割り当てに `retireValue` を付けられます。
+
+== Simple Engine: ガベージコレクション
+
+`Simple Engine` では現在、`pendingASDeletions` キュー（`renderer_rendering.cpp` 内）の単純な「破棄からのフレーム数」カウンタで遅延リソース破棄を扱っています。このシステムは、アクセラレーション構造を削除する前に固定フレーム数（`MAX_FRAMES_IN_FLIGHT + 1`）待ちます。安全ではありますが不正確で、GPU が速く動いている場合にリソースが必要以上に長くメモリに残ることがあります。
+
+タイムラインベースの **ガベージコレクション（GC）** システムへ移ることで、はるかに効率的になれます。各 `pendingASDeletion`（およびステージングバッファなどの他の一時リソース）に、最後に使われた正確な `frameTimelineValue` をタグ付けします。`Renderer::ProcessDeferredDeletions` 関数は、現在の `frameTimeline` 値を問い合わせます。GPU がすでにタグ付けされた値に到達または通過していれば、リソースをすぐに削除できます。これにより、現在のフレームレートや CPU/GPU 負荷に関係なく、GPU が使い終わった時点でメモリが回収されることが保証されます。
+
+== 落とし穴とベストプラクティス
+
+- 値を漏らさない: `nextSubmitValue` を単調に保ちつつ意味を限定する（例: フレームとパスのインデックスを符号化する）とデバッグに役立ちます。
+- `gc()` で削除をバッチし、フレームごとのスパイクを避けます。
+- 同じ寿命判断にフェンスとタイムラインを混ぜず、矛盾した状態を防ぎます。
+- 外部キュー／デバイス（例: 相互運用）では、可能な限りその完了シグナルを自分のタイムライン領域へ変換します。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Frame_in_Flight/02_managing_concurrent_frames.adoc[同時フレームの管理] | 次へ: xref:Synchronization/Async_Compute_Overlap/01_introduction.adoc[非同期コンピュートと実行のオーバーラップ - はじめに]

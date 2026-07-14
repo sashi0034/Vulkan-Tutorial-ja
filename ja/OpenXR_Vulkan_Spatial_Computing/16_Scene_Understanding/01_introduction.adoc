@@ -1,0 +1,10 @@
+:pp: {plus}{plus}
+= シーン理解: データ取り込みとセマンティックラベル
+
+これまでの章では、仮想物体を現実世界へ描画することに焦点を当ててきました。しかし真の空間コンピューティングは双方向の道です。仮想のボールが実際のコーヒーテーブルではね返る、仮想キャラクターが実在のソファの後ろに隠れる——といった説得力のある相互作用を作るには、エンジンが物理環境を「見て」「理解する」必要があります。
+
+これが **シーン理解（Scene Understanding）** の領域です。この章では、OpenXR ランタイムが **LiDAR**（Light Detection and Ranging）や深度カメラなどのセンサを使い、ユーザーの部屋の動的 3D モデルをどう構築するかを探ります。このデータを **空間メッシュ（Spatial Meshes）** としてどう取り込むか、**セマンティックラベル** で「床」と「人間」をどう区別するか、そして **ゼロコピー引き継ぎ（Zero-Copy Hand-off）** 経由で Vulkan コンピュートパイプラインへ直接、超低レイテンシをどう達成するかを学びます。
+
+この章の終わりまでに、乱雑な物理世界を、エンジンが他の 3D アセットと同様に扱える構造化幾何へどう変えるかを理解できるでしょう。
+
+xref:OpenXR_Vulkan_Spatial_Computing/15_Plenoptic_Synthesis/04_incorporating_into_the_engine.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/02_environmental_ingestion.adoc[Next]

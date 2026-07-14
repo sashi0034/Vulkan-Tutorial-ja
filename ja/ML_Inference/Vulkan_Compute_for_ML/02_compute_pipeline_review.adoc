@@ -1,0 +1,387 @@
+:pp: {plus}{plus}
+
+= Vulkan コンピュートパイプラインの復習
+
+== 導入
+
+Vulkan コンピュートパイプラインはすでに扱ったことがあります。コンピュートシェーダの作成、ワークグループのディスパッチ、操作の同期の方法は知っています。しかし ML 推論には、一般的なコンピュートワークロードとは異なる固有のパターンと要件があります。本章は ML に焦点を当てて Vulkan コンピュートパイプラインを復習し、ニューラルネットワーク操作で最も重要な側面を際立たせます。
+
+これは集中的な復習と考えてください。Vulkan コンピュートをゼロから教えるのではなく、ML 推論を実行することが目標のときにコンピュートパイプラインをどう考えるかを示します。ここで学ぶパターンは、実装するすべての ML 操作に適用されます。
+
+== ML コンピュートワークロード
+
+Vulkan の詳細に入る前に、ML 推論が他のコンピュートワークロードと何が違うかを理解しましょう。
+
+=== ML 操作の特性
+
+ML 推論には、Vulkan コンピュートの使い方を形作る distinctive な特性があります。
+
+*大規模で規則的なデータ*: ニューラルネットワークはテンソル——数値の多次元配列——上で動作します。224×224×3 の画像 1 枚だけで 150,528 個の float です。中間活性化はさらに大きくなることもあります。このデータは非常に規則的で構造化されており、GPU 並列性に最適です。
+
+*embarrassingly parallel な操作*: 多くの ML 操作は要素ごとであるか、要素間の依存が最小です。ReLU 活性化はすべての要素に同じ関数を独立して適用します。行列乗算にはよく理解された並列化パターンがあります。この並列性こそ GPU が ML に効果的な理由です。
+
+*逐次依存*: 操作内の並列性にもかかわらず、ニューラルネットワークは依存する操作の列です。レイヤ 2 はレイヤ 1 が完了するまで始められません。操作内の並列性を最大化することと、操作間の依存を管理することの間に緊張関係が生じます。
+
+*メモリ集約的*: ML 推論は大量のデータを動かします。重みはメモリから読み込まれ、入力が読まれ、中間結果が書き込まれ、出力が生成されます。メモリ帯域幅がボトルネックになることが多く、コンピュートではありません。効率的なメモリアクセスパターンが極めて重要です。
+
+*予測可能なアクセスパターン*: 不規則なメモリアクセスを持つ一部のコンピュートワークロードと異なり、ML 操作は通常予測可能で構造化されたアクセスパターンを持ちます。畳み込みは規則的なウィンドウから読み、行列乗算は行と列に体系的にアクセスします。この予測可能性により効果的な最適化が可能です。
+
+=== Vulkan 実装への示唆
+
+これらの特性が Vulkan 実装の判断を導きます。
+
+操作内の並列性を最大化するため大きなワークグループを使います。coalesced アクセスを確保するためメモリレイアウトを慎重に管理します。パイプラインバリアで操作間の依存を強制しつつ、操作内の並列性を許します。フットプリントを最小化するためメモリを積極的に再利用します。
+
+これらのパターンを理解すると、特定の操作を実装する際に情報に基づいた判断ができます。
+
+== テンソル向けディスクリプタセットレイアウト
+
+ディスクリプタセットはシェーダが GPU メモリにアクセスする方法です。ML 推論では、テンソルと重みを効率的に表現するディスクリプタレイアウトが必要です。
+
+=== 基本パターン
+
+典型的な ML 操作は入力テンソルを読み、重みを読み、出力テンソルに書き込みます。ディスクリプタセットレイアウトはこれを反映します。
+
+[source,cpp]
+----
+vk::DescriptorSetLayoutBinding bindings[] = {
+    // Binding 0: Input tensor (read-only)
+    {
+        .binding = 0,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eCompute
+    },
+    // Binding 1: Weights (read-only)
+    {
+        .binding = 1,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eCompute
+    },
+    // Binding 2: Output tensor (write)
+    {
+        .binding = 2,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eCompute
+    }
+};
+----
+
+テンソルは大きい——しばしばメガバイト単位——ため、uniform バッファではなく storage バッファを使います。uniform バッファにはサイズ制限（通常 64KB）がありますが、storage バッファはギガバイトまで可能です。
+
+=== 複数の入力と出力
+
+一部の操作には複数の入力または出力があります。バッチ正規化は入力、重み、バイアス、running mean、running variance を読みます。残差接続は 2 つのテンソルを加算します。ディスクリプタレイアウトはこれらのパターンに対応する必要があります。
+
+[source,cpp]
+----
+// For operations with multiple inputs (e.g., residual add)
+vk::DescriptorSetLayoutBinding bindings[] = {
+    {.binding = 0, ...},  // Input tensor 1
+    {.binding = 1, ...},  // Input tensor 2
+    {.binding = 2, ...}   // Output tensor
+};
+----
+
+重要な洞察: ディスクリプタレイアウトは操作のデータフローに合わせるべきです。各入力テンソルに binding、各出力テンソルに binding、重みに binding。シンプルで明示的に保ちます。
+
+=== メタデータ向けプッシュ定数
+
+テンソルには形状——構造を定義する次元——があります。224×224×3 の画像は height=224、width=224、channels=3 です。シェーダはテンソルに正しくインデックスするためにこの情報が必要です。
+
+プッシュ定数はこのメタデータに最適です。
+
+[source,cpp]
+----
+struct TensorMetadata {
+    uint32_t height;
+    uint32_t width;
+    uint32_t channels;
+    uint32_t batch_size;
+};
+
+vk::PushConstantRange pushConstantRange = {
+    .stageFlags = vk::ShaderStageFlagBits::eCompute,
+    .offset = 0,
+    .size = sizeof(TensorMetadata)
+};
+----
+
+プッシュ定数は高速です——コマンドバッファに直接埋め込まれます。テンソル形状のような少量のデータには理想的です。
+
+== ワークグループサイズ
+
+ワークグループサイズは最も重要な性能判断の 1 つです。並列性、リソース使用量、メモリアクセスパターンに影響します。
+
+=== 基本
+
+ワークグループは一緒に実行され、共有メモリを通じてデータを共有できるシェーダ呼び出しの集合です。コンピュートシェーダをディスパッチするとき、起動するワークグループ数と各ワークグループ内の呼び出し数を指定します。
+
+ML 操作では、通常各呼び出しが 1 つ以上の出力要素を計算します。ワークグループサイズは一緒に実行される呼び出し数を決めます。
+
+=== ML 操作向けの典型的なサイズ
+
+要素ごと演算（ReLU、sigmoid など）では、一般的なパターンは次のとおりです。
+
+[source,slang]
+----
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+----
+
+これは 256 呼び出しのワークグループを作ります。256 なのはなぜか。良いバランスです。
+
+- GPU をビジーに保つのに十分大きい（最新 GPU は同時に数千の呼び出しを実行可能）
+- ハードウェア制限内に収まる（ほとんどの GPU はワークグループあたり少なくとも 1024 呼び出しをサポート）
+- 2 の累乗で、ハードウェアアーキテクチャによく整合する
+
+畳み込みのような 2D 操作では次のように使うことがあります。
+
+[source,slang]
+----
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+----
+
+これは 16×16 = 256 呼び出しのワークグループを作り、画像の 2D 構造に合う 2D パターンで配置されます。
+
+=== ディスパッチサイズ
+
+ワークをディスパッチするとき、起動するワークグループ数を指定します。N 要素のテンソルとサイズ 256 のワークグループでは次が必要です。
+
+[source,cpp]
+----
+uint32_t numWorkGroups = (N + 255) / 256;  // Round up
+commandBuffer.dispatch(numWorkGroups, 1, 1);
+----
+
+切り上げにより、すべての要素をカバーするのに十分な呼び出しが得られます。シェーダはテンソルサイズを超えて処理しないよう境界チェックが必要です。
+
+[source,slang]
+----
+uint globalID = gl_GlobalInvocationID.x;
+if (globalID >= tensorSize) return;  // Bounds check
+----
+
+=== ワークグループサイズの最適化
+
+最適なワークグループサイズは操作とハードウェアに依存します。一般的な指針:
+
+*要素ごと演算*: 128–256 呼び出しがうまく機能します。これらの操作は単純なので、GPU をビジーに保つために多くの呼び出しが欲しいです。
+
+*共有メモリを使う操作*: サイズは必要な共有メモリ量に依存します。各呼び出しが 4 バイトの共有メモリを必要とし、48KB 利用可能なら、ワークグループあたり最大 12,288 呼び出しが可能です。ただし実用的な上限は低く——1024 が一般的な最大値です。
+
+*2D 操作*: 16×16 または 32×32 がうまく機能します。画像の 2D 構造に合い、良い並列性（256 または 1024 呼び出し）を提供します。
+
+プロファイリングは不可欠です。異なるサイズを試し性能を測定してください。最適サイズは GPU アーキテクチャと操作の複雑さによって異なります。
+
+== メモリアクセスパターン
+
+メモリへのアクセス方法は性能に劇的に影響します。GPU は coalesced アクセス——隣接スレッドが隣接メモリ位置にアクセス——向けに設計されています。このパターンに反すると性能が 10 倍以上低下することがあります。
+
+=== Coalesced アクセス
+
+32 スレッド（NVIDIA GPU では warp、AMD では wavefront）が一緒に実行されていると想像してください。スレッド 0 がアドレス 0、スレッド 1 がアドレス 4、スレッド 2 がアドレス 8 を読むと、GPU はこれらを 1 回のメモリトランザクションに coalesce できます。これは高速です。
+
+スレッドがランダムなアドレスにアクセスすると、それぞれが別トランザクションになります。これは遅いです。
+
+ML 操作では、coalesced アクセスは通常次を意味します。
+
+*要素ごと演算*: 各スレッドが 1 要素を処理し、スレッドは連続要素を処理します。
+
+[source,slang]
+----
+uint idx = gl_GlobalInvocationID.x;
+float value = inputBuffer[idx];  // Coalesced: consecutive threads read consecutive addresses
+float result = relu(value);
+outputBuffer[idx] = result;      // Coalesced: consecutive threads write consecutive addresses
+----
+
+*行列演算*: アクセスパターンはレイアウトに依存します。行優先行列は行内で連続要素、列優先は列内で連続です。アクセスパターンはレイアウトに合わせるべきです。
+
+=== テンソルレイアウト
+
+テンソルは異なるレイアウトで格納できます。4D テンソル（batch、channels、height、width）では、一般的なレイアウトは次のとおりです。
+
+*NCHW（channels first）*: 要素は batch、channels、height、width の順。チャネル 0 のすべての値が先、次にチャネル 1 のすべて、という順序です。
+
+*NHWC（channels last）*: 要素は batch、height、width、channels の順。位置 (0,0) のすべてのチャネルが先、次に (0,1) のすべてのチャネル、という順序です。
+
+レイアウトはアクセスパターンに影響します。畳み込みでは NCHW がしばしば有利です。各空間位置ですべてのチャネルを読むからです。要素ごと演算ではレイアウトの影響は小さいです。
+
+レイアウトを 1 つ選び、推論パイプライン全体で一貫して使ってください。レイアウト間の変換は高コストです。
+
+=== 再利用のための共有メモリ
+
+一部の操作は同じデータを複数回読みます。畳み込みは重なるウィンドウを読み——同じ入力ピクセルが複数の出力ピクセルに寄与します。データを共有メモリに 1 回ロードして再利用するのは、グローバルメモリから繰り返し読むよりはるかに高速です。
+
+共有メモリは高速（オンチップ）ですが限られています（通常ワークグループあたり 48–96KB）。ワークグループ内で再利用されるデータに使います。
+
+[source,slang]
+----
+shared float sharedData[256];
+
+// Load data into shared memory
+uint localID = gl_LocalInvocationID.x;
+sharedData[localID] = inputBuffer[globalID];
+
+// Synchronize to ensure all threads have loaded
+barrier();
+
+// Now all threads can access sharedData quickly
+float value = sharedData[someIndex];
+----
+
+畳み込みを実装するときに具体例を見ます。
+
+== パイプライン作成
+
+ML 操作向けコンピュートパイプラインの作成は標準的な Vulkan パターンに従いますが、ML 固有の考慮があります。
+
+=== パイプラインキャッシュ
+
+ML 推論は多くの異なる操作を使い、それぞれ独自のパイプラインを持ちます。パイプライン作成は高コストです。パイプラインキャッシュでこのコストを償却します。
+
+[source,cpp]
+----
+vk::PipelineCacheCreateInfo cacheInfo{};
+vk::raii::PipelineCache pipelineCache(device, cacheInfo);
+
+// Create all pipelines with the cache
+vk::ComputePipelineCreateInfo pipelineInfo{
+    // ... pipeline configuration ...
+};
+vk::raii::Pipeline pipeline(device, *pipelineCache, pipelineInfo);
+// RAII handles cleanup automatically
+----
+
+キャッシュをディスクに保存し、次回起動時に読み込むこともでき、起動を高速化できます。
+
+=== 特殊化定数
+
+一部のシェーダパラメータはパイプライン作成時に既知ですが、パイプライン間で変わります。特殊化定数により、再コンパイルなしでシェーダをパラメータ化できます。
+
+[source,slang]
+----
+layout(constant_id = 0) const uint WORK_GROUP_SIZE = 256;
+layout(local_size_x_id = 0) in;  // Use specialization constant for work group size
+----
+
+[source,cpp]
+----
+vk::SpecializationMapEntry entry = {
+    .constantID = 0,
+    .offset = 0,
+    .size = sizeof(uint32_t)
+};
+
+uint32_t workGroupSize = 256;
+vk::SpecializationInfo specInfo = {
+    .mapEntryCount = 1,
+    .pMapEntries = &entry,
+    .dataSize = sizeof(uint32_t),
+    .pData = &workGroupSize
+};
+
+vk::ComputePipelineCreateInfo pipelineInfo{
+    // ...
+    .stage = {
+        // ...
+        .pSpecializationInfo = &specInfo
+    }
+};
+----
+
+同じシェーダから異なるワークグループサイズの複数パイプラインを、再コンパイルなしで作成できます。
+
+== コマンドバッファ記録
+
+ML 推論のコマンド記録はパターンに従います。パイプラインをバインド、ディスクリプタセットをバインド、プッシュ定数、ディスパッチ、バリア、繰り返し。
+
+=== 基本パターン
+
+[source,cpp]
+----
+// Begin command buffer
+vk::CommandBufferBeginInfo beginInfo{
+    .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
+};
+commandBuffer.begin(beginInfo);
+
+// Layer 1: Convolution
+commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *convPipeline);
+commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 *pipelineLayout, 0, *convDescriptorSet, nullptr);
+commandBuffer.pushConstants(*pipelineLayout, vk::ShaderStageFlagBits::eCompute,
+                           0, sizeof(metadata), &metadata);
+commandBuffer.dispatch(numWorkGroupsX, numWorkGroupsY, 1);
+
+// Barrier: ensure convolution completes before activation
+vk::MemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead
+};
+commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {}, barrier, nullptr, nullptr);
+
+// Layer 2: ReLU activation
+commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *reluPipeline);
+commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 *pipelineLayout, 0, *reluDescriptorSet, nullptr);
+commandBuffer.dispatch(numWorkGroupsX, 1, 1);
+
+// ... more layers ...
+
+commandBuffer.end();
+----
+
+このパターンは各レイヤで繰り返されます。バインド、ディスパッチ、バリア、次のレイヤ。
+
+=== オーバーヘッドの最小化
+
+コマンドバッファ記録にはオーバーヘッドがあります。推論では通常 1 回記録して何度も再生します。
+
+[source,cpp]
+----
+// Record once
+vk::raii::CommandBuffer inferenceCommandBuffer = recordInferencePipeline();
+
+// Execute many times
+for (int frame = 0; frame < numFrames; frame++) {
+    // Update input data
+    updateInputTensor(inputData[frame]);
+
+    // Submit the same command buffer
+    vk::SubmitInfo submitInfo{
+        .commandBufferCount = 1,
+        .pCommandBuffers = &*inferenceCommandBuffer
+    };
+    computeQueue.submit(submitInfo, *fence);
+    auto result = device.waitForFences(*fence, VK_TRUE, UINT64_MAX);
+
+    // Read output
+    readOutputTensor(outputData[frame]);
+}
+----
+
+これにより記録オーバーヘッドを多数の推論に償却できます。
+
+== まとめ
+
+本章は ML に焦点を当てて Vulkan コンピュートパイプラインを復習しました。要点:
+
+ML 操作は大規模で規則的なデータ、操作内の embarrassing な並列性、操作間の逐次依存、メモリ集約的なアクセスパターン、予測可能なアクセスで特徴づけられます。これらが Vulkan 実装を導きます。
+
+ML 向けディスクリプタセットは通常、入力テンソル、重み、出力テンソルの binding を持ち、大きなデータには storage バッファ、テンソル形状のようなメタデータにはプッシュ定数を使います。
+
+ワークグループサイズは性能に極めて重要です。要素ごと演算では 128–256、2D 操作では 16×16 または 32×32 が典型です。最適サイズを見つけるにはプロファイリングが不可欠です。
+
+メモリアクセスパターンが性能を決めます。coalesced アクセス（隣接スレッドが隣接メモリにアクセス）は critical です。テンソルレイアウト（NCHW 対 NHWC）はアクセスパターンに影響します。共有メモリは頻繁にアクセスされるデータの再利用を可能にします。
+
+パイプライン作成は標準 Vulkan パターンに従いますが、パイプラインキャッシュと特殊化定数が有益です。コマンドバッファ記録は各レイヤで繰り返される bind-dispatch-barrier パターンに従います。
+
+この基盤があれば、特定の ML 操作の実装に進めます。次章では要素ごと演算——最も単純な ML 操作で実装の良い出発点——を扱います。
+
+xref:ML_Inference/Vulkan_Compute_for_ML/01_introduction.adoc[前へ: はじめに] | xref:ML_Inference/Vulkan_Compute_for_ML/03_element_wise_operations.adoc[次へ: 要素ごと演算]

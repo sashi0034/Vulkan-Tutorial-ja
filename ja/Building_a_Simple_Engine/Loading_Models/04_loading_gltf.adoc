@@ -1,0 +1,812 @@
+:pp: {plus}{plus}
+
+= モデルの読み込み: glTF を理解する
+
+== glTFを理解する
+
+=== glTFとは何ですか?
+
+glTF (GL Transmission Format) は、Khronos Group (OpenGL や Vulkan と同じ組織) によって開発された標準 3D ファイル形式です。 3D コンテンツの汎用的で効率的な形式を目指しているため、「3D の JPEG」とも呼ばれます。
+
+glTF の主な目的は、3D コンテンツ作成ツール (Blender、Maya、3ds Max など) と、ゲームや視覚化ツールなどのリアルタイム レンダリング アプリケーションの間のギャップを埋めることです。 glTF が登場する前は、開発者は多くの場合、カスタム エクスポーターを作成するか、リアルタイム レンダリング用に最適化されていない中間形式を使用する必要がありました。
+
+glTF の主な利点は次のとおりです。
+
+* *効率*: 最小限の処理で読み込み速度とレンダリング パフォーマンスを最適化します。
+* *完全性*: ジオメトリ、マテリアル、テクスチャ、アニメーション、シーン階層が単一の形式で含まれています。
+* *PBR サポート*: 最新の物理ベースのレンダリング マテリアルの組み込みサポート
+* *標準化*: 業界全体で広く採用されており、カスタム エクスポーターの必要性が減少します。
+* *拡張性*: 互換性を維持しながら、ベンダー固有の機能の拡張をサポートします。
+
+=== glTF ファイル構造とデータ構成
+
+glTF ファイルには、構造化された方法で編成されたいくつかの主要コンポーネントが含まれています。
+
+* *シーンとノード*: シーン グラフ内のオブジェクトを編成する階層構造
+* *メッシュ*: 3D ジオメトリ データ (頂点、インデックス、法線や UV などの属性)
+* *マテリアル*: 物理ベース レンダリング (PBR) モデルを使用した表面プロパティ
+* *テクスチャと画像*: さまざまなテクスチャ タイプをサポートするマテリアルのビジュアル データ
+* *アニメーション*: ノードをアニメーション化するためのキーフレーム データ (位置、回転、スケール)
+* *スキン*: 骨格アニメーションのデータ (結合階層と頂点の重み)
+* *カメラ*: パースペクティブまたは正投影カメラの定義
+
+==== バッファ システム: 効率的なバイナリ データ ストレージ
+
+glTF の最も強力な機能の 1 つは、その 3 レベルのバッファ システムです。
+
+1. *バッファ*: 生のバイナリ データ ブロック (ディスク上のファイルなど)
+2. *BufferViews*: 特定のオフセットと長さを持つバッファーへのビュー
+3. *アクセサー*:bufferView 内のデータを解釈する方法の説明 (タイプ、コンポーネント タイプ、カウントなど)
+
+このシステムにより、異なるアトリビュート(位置、法線、UV)が同じ基礎となるバッファを共有できるようになり、メモリ使用量とファイル サイズが削減されます。例えば：
+
+* 単一のバッファーにすべての頂点データが含まれる場合があります
+* 1 つの BufferView は、そのバッファ内の位置データを指します
+* 別のbufferViewは通常のデータを指します
+* アクセサは、各bufferView を解釈する方法を記述します (例: vec3 float として)。
+
+=== tinygltf ライブラリを使用した効率的な解析
+
+glTF パーサーを最初から書くのではなく (これはかなりの作業になります)、 tinygltf ライブラリを使用します。
+
+* 統合が簡単な軽量のヘッダーのみの C++ ライブラリです
+* .gltf 形式と .glb 形式の両方を透過的に処理します
+* JSON とバイナリ データを解析する複雑なタスクを管理します。
+* すべての glTF コンポーネントにアクセスするためのクリーンな API を提供します
+* Base64 でエンコードされたデータを含むバッファ システムの詳細を処理します。
+
+tinygltf を使用すると、JSON やバイナリ データの解析という低レベルの詳細を扱うのではなく、解析されたデータをエンジンの構造に変換するという高レベルのタスクに集中できます。
+
+=== 堅牢な glTF ローダーの実装
+
+本番環境に対応した glTF ローダーを実装する場合は、いくつかの考慮事項が考慮されます。
+
+* *エラー処理*: 不正なファイルの堅牢な処理と正常な失敗
+* *形式検出*: .gltf 形式と .glb 形式の両方をサポート
+* *メモリ管理*: 大量のデータの効率的な割り当てと処理
+* *拡張機能のサポート*: オプションの glTF 拡張機能の処理
+
+初期ファイル読み込みを実装する方法を見てみましょう。
+
+[source,cpp]
+----
+void loadModel(const std::string& modelPath) {
+    // Create a tinygltf loader
+    tinygltf::Model gltfModel;
+    tinygltf::TinyGLTF loader;
+    std::string err, warn;
+
+    // Detect file extension to determine which loader to use
+    bool ret = false;
+    std::string extension = modelPath.substr(modelPath.find_last_of(".") + 1);
+    std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+
+    if (extension == "glb") {
+        ret = loader.LoadBinaryFromFile(&gltfModel, &err, &warn, modelPath);
+    } else if (extension == "gltf") {
+        ret = loader.LoadASCIIFromFile(&gltfModel, &err, &warn, modelPath);
+    } else {
+        err = "Unsupported file extension: " + extension + ". Expected .gltf or .glb";
+    }
+
+    // Handle errors and warnings
+    if (!warn.empty()) {
+        std::cout << "glTF warning: " << warn << std::endl;
+    }
+    if (!err.empty()) {
+        std::cout << "glTF error: " << err << std::endl;
+    }
+    if (!ret) {
+        throw std::runtime_error("Failed to load glTF model");
+    }
+
+    // Clear existing model data
+    model = Model();
+
+    // Process the loaded data (covered in the following sections)
+}
+----
+
+.gltf と .glb の両方の形式をサポートすることで、アーティストはワークフローに柔軟性を与えることができます。
+
+glTF には 2 つの形式があり、それぞれに独自の利点があります。
+
+* *.gltf*: 外部バイナリ ファイルとイメージ ファイルを含む JSON ベースの形式
+- 人間が判読可能でデバッグが容易
+- アセット管理が容易になります (テクスチャを別のファイルとして)
+- 開発ワークフローに最適
+* *.glb*: すべてを 1 つのファイルに結合したバイナリ形式
+- よりコンパクトで効率的な配布が可能
+- ロード中のファイル操作の数を削減します。
+- 導入と配布に優れています
+
+=== 物理ベース レンダリング (PBR) マテリアルについて
+
+[NOTE]
+====
+このセクションでは、glTF ローディングに関連する PBR 材料の簡単な概要を説明します。 PBR の概念と照明モデルのより包括的な説明については、「照明マテリアル」の章の「XR0」を参照してください。
+====
+
+マテリアルは、レンダリング時のサーフェスの外観を定義します。最新のゲームとエンジンは、物理ベース レンダリング (PBR) を使用しており、物理原理に基づいて光が現実世界のマテリアルとどのように相互作用するかをシミュレートします。
+
+==== 物質システムの進化
+
+3D グラフィックスのマテリアル システムは大幅に進化しました。
+
+1. *基本マテリアル (1990 年代)*: オプションの鏡面ハイライトを備えたシンプルな拡散カラー
+2. *マルチテクスチャ マテリアル (2000 年代)*: 複数のテクスチャ マップを組み合わせてさまざまな効果を実現
+3. *シェーダーベース マテリアル (2000 年代後半)*: 高度な効果のためのカスタム シェーダー プログラム
+4. *物理ベース レンダリング (2010 年代)*: 現実世界の表面の物理的特性に基づいたマテリアル
+
+PBR は、リアルタイム グラフィックスの現在の状態を表します。さまざまな照明条件でより現実的な結果が得られ、環境に関係なく一貫した外観が保証されます。
+
+==== PBR 材料の主要な特性
+
+glTF の PBR モデルは、次の主要なプロパティを使用する「金属粗さ」ワークフローに基づいています。
+
+* *ベースカラー*: 表面のアルベドまたは拡散色 (RGB またはテクスチャ)
+* *金属性*: 表面がどの程度金属っぽいか (0.0 = 非金属、1.0 = 金属)
+  - 金属は拡散反射を持たないが、鏡面反射が大きい
+  - 非金属（誘電体）には拡散反射があり、鏡面反射は最小限に抑えられます。
+* *粗さ*: 表面の滑らかさまたは粗さ (0.0 = 鏡面、1.0 = 粗い)
+  - 光の散乱を引き起こす微小表面の詳細を制御します
+  - 反射と鏡面ハイライトの鮮明さに影響します
+* *法線マップ*: 追加のジオメトリを使用せずにサーフェスの詳細を追加します
+  - サーフェス法線を摂動させて、追加の詳細の錯覚を作成します
+  - 実際のジオメトリを追加するよりも効率的
+* *オクルージョン マップ*: 表面の隙間内のセルフ シャドウイングを近似します。
+  - 周囲光が少ない領域を暗くします。
+  - 奥行きと細部の知覚を強化します
+* *発光*: サーフェスを発光させます (RGB またはテクスチャ)
+  - スクリーン、ライト、ネオンサインなどの光るオブジェクトに使用されます。
+  - シーンの照明の影響を受けない
+
+これらのプロパティは、定数値またはテクスチャ マップとして指定できます。
+表面全体にわたる空間的な変化。 PBR については、次の記事で詳しく説明します。
+次の数章。
+
+image::images/bookstand.png[Bookstand with complex PBR materials - demonstrating wood, glass, metal, and paper textures with varied material properties]
+
+==== テクスチャのフォーマットと圧縮
+
+私たちのエンジンでは、テクスチャに Basis Universal 圧縮を備えた KTX2 を使用します。このアプローチにはいくつかの利点があります。
+
+* *ファイル サイズの削減*: Basis Universal 圧縮により、視覚的な品質を維持しながらテクスチャ サイズが大幅に削減されます。
+* *GPU 対応フォーマット*: KTX2 テクスチャをプラットフォーム固有の GPU フォーマットに直接トランスコードできます。
+* *クロスプラットフォーム互換性*: 基本ユニバーサル テクスチャは、さまざまなプラットフォームやグラフィックス API 間で動作します。
+* *ミップマップのサポート*: KTX2 にはミップマップのサポートが含まれており、レンダリングの品質とパフォーマンスが向上します。
+
+===== glTF/glb の埋め込みテクスチャ
+
+glTF 形式は、テクスチャを含める 2 つの方法をサポートしています。
+
+1. *外部参照*: .gltf ファイルは外部画像ファイルを参照します。
+2. *埋め込みデータ*: 画像はバイナリ データとして .glb ファイルに直接埋め込まれます。
+
+私たちのエンジンには、KTX2 テクスチャが埋め込まれた .glb 形式を使用します。このアプローチは次のとおりです。
+
+* ロード中のファイル操作の数を削減します。
+* すべてのテクスチャがモデルで常に利用可能であることを保証します
+* 資産管理と分配を簡素化
+
+glTF 仕様は、画像オブジェクトの `bufferView` プロパティを通じて埋め込みテクスチャをサポートしています。 KTX2 テクスチャを使用する場合、フォーマットを示すために `mimeType` が `"image/ktx2"` に設定されます。
+
+テクスチャの読み込みプロセスには、glTF の抽象テクスチャ参照と Vulkan の低レベル GPU リソースの間のギャップを埋めるいくつかの複雑な手順が含まれます。
+
+=== テクスチャの読み込み: glTF テクスチャの反復とメタデータの抽出
+
+まず、glTF モデルのテクスチャ定義を繰り返し、各テクスチャ リソースを見つけて識別するために必要な基本情報を抽出します。
+
+[source,cpp]
+----
+// First, load all textures from the model
+std::vector<Texture> textures;
+for (size_t i = 0; i < gltfModel.textures.size(); i++) {
+    const auto& texture = gltfModel.textures[i];
+    const auto& image = gltfModel.images[texture.source];
+
+    Texture tex;
+    tex.name = image.name.empty() ? "texture_" + std::to_string(i) : image.name;
+----
+
+glTF テクスチャ システムは、テクスチャがイメージを参照し、イメージに実際のピクセル データまたはその参照が含まれる間接的なアプローチを使用します。この分離により、複数のテクスチャが同じイメージ データを共有できますが、サンプリング パラメータは異なります (フィルタリング モードやラッピング モードが異なるなど)。私たちの反復プロセスでは、マテリアルが最終的に参照するすべてのテクスチャ リソースの包括的なインベントリが構築されます。
+
+命名戦略により、重要なデバッグ機能と資産管理機能が提供されます。アーティストが 3D アプリケーションでテクスチャを作成するとき、意味のある名前は開発者が開発中にどのテクスチャがどの目的に役立つかを識別するのに役立ちます。代替命名スキームにより、アーティストがわかりやすい名前を指定していない場合でも、すべてのテクスチャに一意の識別子が付けられるようになります。
+
+=== テクスチャの読み込み: フォーマット検出とバッファ アクセス
+
+次に、テクスチャが glTF ファイルに埋め込まれているかどうかを判断し、その形式を特定して、適切な読み込み戦略の基礎を設定する必要があります。
+
+[source,cpp]
+----
+    // Check if the image is embedded as KTX2
+    if (image.mimeType == "image/ktx2" && image.bufferView >= 0) {
+        // Get the buffer view that contains the KTX2 data
+        const auto& bufferView = gltfModel.bufferViews[image.bufferView];
+        const auto& buffer = gltfModel.buffers[bufferView.buffer];
+
+        // Extract the KTX2 data from the buffer
+        const uint8_t* ktx2Data = buffer.data.data() + bufferView.byteOffset;
+        size_t ktx2Size = bufferView.byteLength;
+----
+
+MIME タイプの検出により、特に KTX2 形式を使用していることが保証され、PNG や JPEG などの従来の画像形式に比べていくつかの利点が得られます。 KTX2 は GPU テクスチャ専用に設計されており、基本ユニバーサル圧縮、複数のミップマップ レベル、GPU フォーマットの直接互換性などの高度な機能をサポートしています。 bufferView チェックでは、画像データが外部参照ではなく glTF ファイル内に埋め込まれていることを確認します。
+
+バッファ アクセス パターンは、glTF の洗練されたデータ編成システムを示しています。データを不必要にコピーするのではなく、ロードされた glTF バッファ内の KTX2 データへの直接ポインタを取得します。このアプローチにより、メモリ使用量が最小限に抑えられ、高価なコピー操作が回避されます。これは、簡単に数百メガバイトを消費する可能性のある大規模なテクスチャ データセットを扱う場合に特に重要です。
+
+=== テクスチャの読み込み: KTX2 の解析と検証
+
+次に、特殊な KTX ソフトウェア ライブラリを使用して KTX2 テクスチャ データをロードし、初期検証を実行してテクスチャ データが使用可能であることを確認する必要があります。
+
+[source,cpp]
+----
+        // Load the KTX2 texture using KTX-Software library
+        ktxTexture2* ktxTexture = nullptr;
+        KTX_error_code result = ktxTexture2_CreateFromMemory(
+            ktx2Data, ktx2Size,
+            KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT,
+            &ktxTexture
+        );
+
+        if (result != KTX_SUCCESS) {
+            std::cerr << "Failed to load KTX2 texture: " << ktxErrorString(result) << std::endl;
+            continue;
+        }
+----
+
+KTX ソフトウェア ライブラリは、複雑な KTX2 フォーマットの堅牢な解析を提供し、複数のミップマップ レベル、さまざまなピクセル フォーマット、ゼロから正しく実装するには非常に複雑なメタデータなどの詳細を処理します。 `KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT` フラグは、実際のピクセル データをメモリに即座にロードし、後続の処理ステップに備えるようにライブラリに指示します。
+
+アセットパイプライン処理またはファイル転送中にテクスチャ ファイルが破損する可能性があるため、この段階でのエラー処理は非常に重要です。テクスチャの読み込みに失敗したときに次のテクスチャを続行することで、1 つの問題のあるテクスチャによってモデル全体の読み込みが妨げられることがなくなります。この適切な機能低下アプローチは、コンテンツの問題によってアプリケーションがクラッシュしない堅牢な運用システムに不可欠です。
+
+=== テクスチャの読み込み: 基本ユニバーサルトランスコーディング
+
+次に、ランタイム パフォーマンスを最適化するために、Basis Universal 圧縮テクスチャを GPU ネイティブ形式に変換するトランスコーディング プロセスを処理します。
+
+[source,cpp]
+----
+        // If the texture uses Basis Universal compression, transcode it to a GPU-friendly format
+        if (ktxTexture->isCompressed && ktxTexture2_NeedsTranscoding(ktxTexture)) {
+            // Choose the appropriate format based on GPU capabilities
+            ktx_transcode_fmt_e transcodeFmt = KTX_TTF_BC7_RGBA;
+
+            // For devices that don't support BC7, use alternatives
+            // if (!deviceSupportsBC7) {
+            //     transcodeFmt = KTX_TTF_ASTC_4x4_RGBA;
+            // }
+            // if (!deviceSupportsASTC) {
+            //     transcodeFmt = KTX_TTF_ETC2_RGBA;
+            // }
+
+            // Transcode the texture
+            result = ktxTexture2_TranscodeBasis(ktxTexture, transcodeFmt, 0);
+            if (result != KTX_SUCCESS) {
+                std::cerr << "Failed to transcode KTX2 texture: " << ktxErrorString(result) << std::endl;
+                ktxTexture2_Destroy(ktxTexture);
+                continue;
+            }
+        }
+----
+
+Basis Universal は、テクスチャ圧縮に対する革新的なアプローチを表しており、異なる GPU が異なるテクスチャ圧縮形式をサポートするという、クロスプラットフォーム開発における根本的な問題を解決します。従来のアプローチでは、異なるプラットフォーム用に複数のテクスチャ バージョンを保存する必要があり、ストレージ要件が大幅に増加しました。 Basis Universal は、ロード時に任意の GPU ネイティブ形式にすばやくトランスコードできる中間形式でテクスチャを保存します。
+
+形式選択ロジック (コメント形式で表示) は、運用システムが GPU 機能の違いをどのように処理するかを示しています。デスクトップ GPU は通常、優れた品質を提供する BC7 圧縮をサポートしていますが、モバイル GPU は ASTC または ETC2 形式を使用することがよくあります。トランスコーディング プロセスは、ターゲット GPU の実際の機能に基づいて実行時に行われ、あらゆるプラットフォームで最適なパフォーマンスと品質を保証します。
+
+トランスコーディング操作自体は大量の計算を必要としますが、アセットの読み込み中に 1 回だけ実行されます。結果として得られる GPU ネイティブ形式は、非圧縮テクスチャと比較してレンダリング中のパフォーマンスが大幅に向上するため、事前のトランスコーディング コストに見合った価値があります。トランスコーディングの試行が失敗すると、部分的に処理されたリソースのクリーンアップがトリガーされ、エラー状態でのメモリ リークが防止されます。
+
+=== テクスチャの読み込み: Vulkan リソースの作成と GPU アップロード
+
+最後に、GPU レンダリングに必要な Vulkan リソースを作成し、処理されたテクスチャ データをビデオ メモリにアップロードします。
+
+[source,cpp]
+----
+        // Create Vulkan image, memory, and view
+        vk::Format format = static_cast<vk::Format>(ktxTexture2_GetVkFormat(ktxTexture));
+        vk::Extent3D extent{
+            static_cast<uint32_t>(ktxTexture->baseWidth),
+            static_cast<uint32_t>(ktxTexture->baseHeight),
+            static_cast<uint32_t>(ktxTexture->baseDepth)
+        };
+        uint32_t mipLevels = ktxTexture->numLevels;
+
+        // Create the Vulkan image
+        vk::ImageCreateInfo imageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent = extent,
+            .mipLevels = mipLevels,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+            .sharingMode = vk::SharingMode::eExclusive,
+            .initialLayout = vk::ImageLayout::eUndefined
+        };
+
+        // Create the image, allocate memory, and bind them
+        // ... (code omitted for brevity)
+
+        // Upload the texture data to the image
+        ktxTexture2_VkUploadEx(ktxTexture, &ktxVulkanTexture, &vkDevice, &vkQueue,
+                              &ktxVulkanDeviceMemory, &ktxVulkanImage,
+                              &ktxVulkanImageView, &ktxVulkanImageLayout,
+                              &ktxVulkanImageMemory);
+
+        // Store the Vulkan resources in our texture object
+        tex.image = ktxVulkanImage;
+        tex.imageView = ktxVulkanImageView;
+        tex.memory = ktxVulkanImageMemory;
+
+        // Clean up KTX resources
+        ktxTexture2_Destroy(ktxTexture);
+    } else {
+        // Handle other image formats or external references
+        // ... (code omitted for brevity)
+    }
+
+    // Create a sampler for the texture
+    VkSamplerCreateInfo samplerInfo = {};
+    // ... (code omitted for brevity)
+
+    textures.push_back(tex);
+}
+
+// Now load materials and associate them with textures
+for (const auto& material : gltfModel.materials) {
+    Material mat;
+
+    // Base color
+    if (material.pbrMetallicRoughness.baseColorFactor.size() == 4) {
+        mat.baseColorFactor.r = material.pbrMetallicRoughness.baseColorFactor[0];
+        mat.baseColorFactor.g = material.pbrMetallicRoughness.baseColorFactor[1];
+        mat.baseColorFactor.b = material.pbrMetallicRoughness.baseColorFactor[2];
+        mat.baseColorFactor.a = material.pbrMetallicRoughness.baseColorFactor[3];
+    }
+
+    // Metallic and roughness factors
+    mat.metallicFactor = material.pbrMetallicRoughness.metallicFactor;
+    mat.roughnessFactor = material.pbrMetallicRoughness.roughnessFactor;
+
+    // Associate textures with the material
+    if (material.pbrMetallicRoughness.baseColorTexture.index >= 0) {
+        const auto& texture = gltfModel.textures[material.pbrMetallicRoughness.baseColorTexture.index];
+        mat.baseColorTexture = &textures[texture.source];
+    }
+
+    if (material.pbrMetallicRoughness.metallicRoughnessTexture.index >= 0) {
+        const auto& texture = gltfModel.textures[material.pbrMetallicRoughness.metallicRoughnessTexture.index];
+        mat.metallicRoughnessTexture = &textures[texture.source];
+    }
+
+    if (material.normalTexture.index >= 0) {
+        const auto& texture = gltfModel.textures[material.normalTexture.index];
+        mat.normalTexture = &textures[texture.source];
+    }
+
+    if (material.occlusionTexture.index >= 0) {
+        const auto& texture = gltfModel.textures[material.occlusionTexture.index];
+        mat.occlusionTexture = &textures[texture.source];
+    }
+
+    if (material.emissiveTexture.index >= 0) {
+        const auto& texture = gltfModel.textures[material.emissiveTexture.index];
+        mat.emissiveTexture = &textures[texture.source];
+    }
+
+    model.materials.push_back(mat);
+}
+----
+
+さて、これらすべてがどのように組み合わされるかについて話しましょう。
+
+=== シーン グラフと階層変換について
+
+シーン グラフは、3D シーンの空間表現を編成する階層ツリー状のデータ構造です。これはコンピューター グラフィックスとゲーム エンジンの基本的な概念であり、複雑なシーンを編成するためのバックボーンとして機能します。
+
+==== シーングラフが重要な理由
+
+シーン グラフには、オブジェクトのフラットなコレクションに比べて、いくつかの重要な利点があります。
+
+* *階層型変換*: 子は親から変換を継承するため、複雑な関係を自然にモデル化できます。
+* *空間構成*: オブジェクトは論理的な関係に基づいて整理され、シーン管理が容易になります。
+* *アニメーションのサポート*: 階層構造は骨格アニメーションや複雑な動きのパターンにとって重要です
+* *効率的なトラバーサル*: 最適化されたレンダリング、カリング、ピッキング操作を可能にします。
+* *インスタンス化のサポート*: 同じオブジェクトが異なる変換で複数回表示される可能性があります
+
+次の実際的な例を考えてみましょう。
+
+1. *装備を備えたキャラクター*: キャラクターが移動すると、取り付けられているすべての装備 (武器、防具) も一緒に移動する必要があります。シーン グラフを使用してキャラクタ ノードを移動すると、すべての子ノードが自動的に変換を継承します。
+
+2. *可動部品を備えた車両*: 車両には、車両全体の移動中に独立して回転する車輪が搭載されている場合があります。シーン グラフを使用すると、この動きの階層を自然に表現できます。
+
+3. *多関節アニメーション*: スケルトンを持つキャラクターには、親ジョイントを基準にして動くジョイントが必要です。シーン グラフは、この親子関係を直接モデル化します。
+
+==== シーングラフの変換
+
+シーン グラフの最も強力な側面の 1 つは、変換の処理方法です。
+
+* 各ノードには、親を基準とした *ローカル変換* があります。
+* *グローバル変換*は、ノードのローカル変換とその親のグローバル変換を組み合わせて計算されます。
+* これにより、複雑な階層的な動きの直感的なモデリングが可能になります。
+
+変換パイプラインは通常次のように動作します。
+
+1. 各ノードはローカル変換 (移動、回転、スケール) を保存します。
+2. レンダリング時に、親変換を乗算してグローバル変換を計算します。
+3. このグローバル変換は、オブジェクトをワールド空間に配置するために使用されます。
+
+glTF データからシーン グラフを構築する方法は次のとおりです。
+
+[source,cpp]
+----
+// First pass: create all nodes
+for (size_t i = 0; i < gltfModel.nodes.size(); i++) {
+    const auto& node = gltfModel.nodes[i];
+    model.linearNodes[i] = new Node();
+    model.linearNodes[i]->index = static_cast<uint32_t>(i);
+    model.linearNodes[i]->name = node.name;
+
+    // Get transformation data
+    if (node.translation.size() == 3) {
+        model.linearNodes[i]->translation = glm::vec3(
+            node.translation[0], node.translation[1], node.translation[2]
+        );
+    }
+    // ... handle rotation and scale
+}
+
+// Second pass: establish parent-child relationships
+for (size_t i = 0; i < gltfModel.nodes.size(); i++) {
+    const auto& node = gltfModel.nodes[i];
+    for (int childIdx : node.children) {
+        model.linearNodes[childIdx]->parent = model.linearNodes[i];
+        model.linearNodes[i]->children.push_back(model.linearNodes[childIdx]);
+    }
+}
+----
+
+2 パスのアプローチを使用して、ノードをリンクする前にすべてのノードが存在することを確認します。
+
+=== 3D ジオメトリとメッシュ データについて
+
+3D モデルは、オブジェクトの形状を定義する頂点、エッジ、面の集合であるメッシュとして表されます。効率的なレンダリングには、このデータがどのように構造化されているかを理解することが重要です。
+
+==== 3D モデルの構成要素
+
+3D ジオメトリの基本コンポーネントは次のとおりです。
+
+* *頂点*: 形状を定義する 3D 空間内の点
+* *インデックス*: 頂点を接続して三角形を形成する方法を定義する頂点への参照
+* *属性*: 頂点に関連付けられた追加データ:
+  - *位置*: 3D 座標 (x、y、z)
+  - *法線*: サーフェスに垂直な方向ベクトル (照明計算用)
+  - *テクスチャ座標 (UV)*: テクスチャをサーフェスにマッピングするための 2D 座標
+  - *タンジェントとバイタンジェント*: 法線マッピングに使用されるベクトル
+  - *カラー*: 頂点ごとのカラー データ
+  - *スキニング ウェイトとインデックス*: スケルトン アニメーション用
+
+最新の 3D グラフィックスでは、次の理由から三角形メッシュが使用されます。
+
+* 三角形は常に平面です (3 つの点が平面を定義します)
+* 三角形は、あらゆる面を表すことができる最も単純な多角形です。
+* グラフィックス ハードウェアは三角形処理用に最適化されています
+
+==== glTF のメッシュ構成
+
+glTF は、ストレージとレンダリングの両方において効率的な方法でメッシュ データを編成します。
+
+* *メッシュ*: 論理オブジェクトを形成するプリミティブのコレクション
+* *プリミティブ*: それぞれが独自のマテリアルを持つメッシュの個々の部分
+* *属性*: 位置、法線、テクスチャ座標などの頂点データ
+* *インデックス*: 三角形を定義する頂点への参照
+
+この組織により、次のことが可能になります。
+
+* データ共有による効率的なメモリ使用
+* 単一メッシュ内の材質の変化
+* バッチ処理による最適化されたレンダリング
+
+メッシュ データを抽出する方法は次のとおりです。
+
+[source,cpp]
+----
+// Load meshes
+for (size_t i = 0; i < gltfModel.nodes.size(); i++) {
+    const auto& node = gltfModel.nodes[i];
+    if (node.mesh >= 0) {
+        const auto& mesh = gltfModel.meshes[node.mesh];
+
+        // Process each primitive
+        for (const auto& primitive : mesh.primitives) {
+            Mesh newMesh;
+
+            // Set material
+            if (primitive.material >= 0) {
+                newMesh.materialIndex = primitive.material;
+            }
+
+            // Extract vertex positions, normals, and texture coordinates
+            // ... (code omitted for brevity)
+
+            // Extract indices that define triangles
+            // ... (code omitted for brevity)
+
+            // Assign the mesh to the node
+            model.linearNodes[i]->mesh = newMesh;
+        }
+    }
+}
+----
+
+=== アニメーション システムを理解する
+
+アニメーションは、静的な 3D モデルを仮想世界で生き生きとした実体に変換するものです。魅力的でダイナミックな 3D アプリケーションを作成するには、堅牢なアニメーション システムが不可欠です。
+
+==== 3D グラフィックスにおけるアニメーション技術
+
+3D グラフィックスでは、いくつかのアニメーション手法が一般的に使用されます。
+
+* *キーフレーム アニメーション*: 特定の時間に特定のポーズを定義し、その間を補間します。
+* *スケルタル アニメーション*: ボーンの階層を使用してメッシュを変形します
+* *モーフ ターゲット アニメーション*: 事前定義されたメッシュ形状間の補間
+* *プロシージャル アニメーション*: アルゴリズムと物理学を通じてアニメーションを生成
+* *パーティクル システム*: 単純なルールで多数の小さな要素をアニメーション化する
+
+最近のゲームでは通常、これらのテクニックを組み合わせて使用​​し、スケルトン アニメーションがキャラクターの動きのバックボーンを形成します。
+
+==== アニメーションのコアコンセプト
+
+アニメーション システムを理解するには、いくつかの重要な概念が基礎となります。
+
+* *キーフレーム*: アニメーション値が明示的に定義される特定の時点
+* *補間*: キーフレーム間の値を計算してスムーズなモーションを作成します。
+* *チャンネル*: アニメーションの特定のプロパティ (位置や回転など) をターゲットにします。
+* *ブレンディング*: 異なるウェイトを持つ複数のアニメーションを結合します。
+* *リターゲット*: あるモデル用に作成されたアニメーションを別のモデルに適用する
+
+==== glTF アニメーション システム
+
+glTF は、さまざまなアニメーション技術を表現できる柔軟なアニメーション システムを使用します。
+
+* *アニメーション*: チャンネルとサンプラーのコレクション
+* *チャンネル*: サンプラーとノード プロパティ (移動、回転、スケール) の間のリンク
+* *サンプラー*: タイムスタンプ、値、補間方法を含むキーフレーム データ
+* *ターゲット*: アニメーション化されるプロパティ (モーフ ターゲットの移動、回転、スケール、またはウェイト)
+
+glTF は 3 つの補間方法をサポートしています。
+
+* *LINEAR*: 一定速度でのスムーズなトランジション
+* *STEP*: 補間なしの急変
+* *CUBICSPLINE*: 加速と減速の制御点を持つ滑らかな曲線
+
+このシステムにより、モデルの特定の部分を個別にターゲットにすることができる複雑なアニメーションが可能になり、歩行、顔の表情、複雑なインタラクションなどのアクションが可能になります。
+
+アニメーション データをロードする方法は次のとおりです。
+
+[source,cpp]
+----
+// Load animations
+for (const auto& anim : gltfModel.animations) {
+    Animation animation;
+    animation.name = anim.name;
+
+    // Load keyframe data
+    for (const auto& sampler : anim.samplers) {
+        AnimationSampler animSampler{};
+
+        // Set interpolation type (LINEAR, STEP, or CUBICSPLINE)
+        // ... (code omitted for brevity)
+
+        // Extract keyframe times and values
+        // ... (code omitted for brevity)
+
+        animation.samplers.push_back(animSampler);
+    }
+
+    // Connect samplers to node properties
+    for (const auto& channel : anim.channels) {
+        AnimationChannel animChannel{};
+
+        // Set target node and property (translation, rotation, or scale)
+        // ... (code omitted for brevity)
+
+        animation.channels.push_back(animChannel);
+    }
+
+    model.animations.push_back(animation);
+}
+----
+
+=== レンダリングパイプラインとの統合
+
+モデル データをロードしたので、それがレンダリングパイプラインの残りの部分とどのように統合されるかについて説明します。
+
+==== アセットのロードからレンダリングまで
+
+glTF ファイルから画面上のピクセルまでの過程には、いくつかの段階が含まれます。
+
+1. *アセットの読み込み*: glTF ローダーは、モデル、ノード、メッシュ、およびマテリアル構造を設定します。
+2. *シーン管理*: エンジンは、シーン内に読み込まれたモデルのコレクションを維持します。
+3. *更新ループ*: 各フレーム、アニメーションは経過時間に基づいて更新されます
+4. *カリン​​グ*: エンジンはどのオブジェクトが表示される可能性があるかを判断します。
+5. *レンダリング*: シーン グラフが走査され、表示されている各メッシュがそのマテリアルを使用してレンダリングされます。
+
+このパイプラインにより、アニメーション化されたモデルを含む複雑なシーンを効率的にレンダリングできます。
+
+==== レンダリングの最適化
+
+いくつかの最適化により、モデル レンダリングのパフォーマンスを向上させることができます。
+
+* *バッチ処理*: 描画コールを減らすために類似したオブジェクトをグループ化します。
+* *インスタンス化*: 同じメッシュの複数のインスタンスを異なる変換でレンダリングします。
+* *詳細レベル (LOD)*: より遠い距離では、より単純なバージョンのモデルを使用します。
+* *錐台カリング*: カメラのビュー外のオブジェクトのレンダリングをスキップします。
+* *オクルージョン カリング*: 他のオブジェクトの背後に隠れているオブジェクトのレンダリングをスキップします。
+
+==== メモリ管理の考慮事項
+
+モデル、特に大規模なモデルをロードする場合、メモリ管理が重要になります。
+
+* *頂点データ*: 効率的なレンダリングのために GPU バッファーに保存します。
+* *インデックス*: メモリを節約するために、可能な場合は 16 ビットのインデックスを使用します。
+* *テクスチャ*: KTX2 と Basis Universal 圧縮を使用してメモリ使用量を大幅に削減します
+* *インスタンス化*: 異なる変換を使用して複数のインスタンスに同じモデル データを再利用します。
+
+===== KTX2 と Basis Universal による効率的なテクスチャ メモリ管理
+
+多くの場合、テクスチャは 3D アプリケーションの GPU メモリの大部分を消費します。 Basis Universal 圧縮を備えた KTX2 には、メモリ最適化に関するいくつかの利点があります。
+
+* *超圧縮*: Basis Universal は、非圧縮形式と比較してテクスチャ サイズを 4 ～ 10 倍削減できます。
+* *GPU ネイティブ フォーマット*: テクスチャは、GPU が直接サンプリングできるフォーマットにトランスコードされ、ランタイム解凍を回避します。
+* *ミップマップ*: KTX2 はミップマップをサポートしており、視覚的な品質を向上させるだけでなく、遠くにあるオブジェクトのメモリ使用量を削減します。
+* *フォーマットの選択*: トランスコーダーは、ターゲット GPU の機能に基づいて最適なフォーマットを選択できます。
+  - デスクトップ GPU 用 BC7 (NVIDIA、AMD、Intel)
+  - モバイル GPU 用 ASTC (ARM、Qualcomm)
+  - 古いモバイル GPU 用の ETC2
+
+===== Vulkan レンダリングパイプラインとの統合
+
+KTX2 テクスチャを Vulkan と効率的に統合するには:
+
+1. *ディスクリプタセット*: テクスチャ イメージ ビューとサンプラーをシェーダー バインディング ポイントにバインドするディスクリプタセットを作成します。
+2. *パイプライン レイアウト*: これらのディスクリプタセットを含むパイプライン レイアウトを定義します。
+3. *シェーダー アクセス*: シェーダーで、適切なバインディング ポイントを使用してテクスチャにアクセスします。
+
+PBR テクスチャのディスクリプタセットをセットアップする簡単な例を次に示します。
+
+[source,cpp]
+----
+// Create descriptor set layout for PBR textures
+std::array<vk::DescriptorSetLayoutBinding, 5> bindings{
+    // Base color texture
+    vk::DescriptorSetLayoutBinding{
+        .binding = 0,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment
+    },
+    // Metallic-roughness texture
+    vk::DescriptorSetLayoutBinding{
+        .binding = 1,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment
+    },
+    // Normal map
+    vk::DescriptorSetLayoutBinding{
+        .binding = 2,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment
+    },
+    // Occlusion map
+    vk::DescriptorSetLayoutBinding{
+        .binding = 3,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment
+    },
+    // Emissive map
+    vk::DescriptorSetLayoutBinding{
+        .binding = 4,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment
+    }
+};
+
+vk::DescriptorSetLayoutCreateInfo layoutInfo{
+    .bindingCount = static_cast<uint32_t>(bindings.size()),
+    .pBindings = bindings.data()
+};
+
+vk::raii::DescriptorSetLayout descriptorSetLayout(device, layoutInfo);
+
+// For each material, create a descriptor set and update it with the material's textures
+for (const auto& material : model.materials) {
+    // Allocate descriptor set from the descriptor pool
+    vk::DescriptorSetAllocateInfo allocInfo{
+        .descriptorPool = descriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &*descriptorSetLayout
+    };
+
+    vk::raii::DescriptorSet descriptorSet = std::move(vk::raii::DescriptorSets(device, allocInfo).front());
+
+    // Update descriptor set with texture image views and samplers
+    std::vector<vk::WriteDescriptorSet> descriptorWrites;
+
+    if (material.baseColorTexture) {
+        vk::DescriptorImageInfo imageInfo{
+            .sampler = material.baseColorTexture->sampler,
+            .imageView = material.baseColorTexture->imageView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+        };
+
+        vk::WriteDescriptorSet write{
+            .dstSet = *descriptorSet,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &imageInfo
+        };
+
+        descriptorWrites.push_back(write);
+    }
+
+    // Similar writes for other textures
+    // ...
+
+    device.updateDescriptorSets(descriptorWrites, {});
+
+    // Store the descriptor set with the material for later use during rendering
+    material.descriptorSet = *descriptorSet;
+}
+----
+
+===== テクスチャ メモリ管理のベスト プラクティス
+
+テクスチャ メモリの使用量を最適化するには:
+
+1. *テクスチャ アトラス*: 複数の小さなテクスチャを 1 つの大きなテクスチャに結合して、状態の変化を減らします。
+2. *ミップマップ管理*: すべてのテクスチャのミップマップを生成して使用し、パフォーマンスと品質を向上させます。
+3. *テクスチャ ストリーミング*: 非常に大規模なシーンの場合は、テクスチャ ストリーミングを実装して、必要な場合にのみ高解像度のテクスチャをロードします。
+4. *メモリ バジェット*: メモリが制限されている場合にテクスチャの品質を低下させることができるテクスチャ バジェット システムを実装します。
+5. *形式の選択*: テクスチャの内容に基づいて適切な形式を選択します。
+
+   - アルファ付きのカラー テクスチャ用の BC7/ASTC
+   - BC1/ETC1 (アルファなしのカラー テクスチャ用)
+   - BC5/ETC2（ノーマルマップ用）
+   - シングルチャンネルテクスチャ用のBC4/EAC（粗さ、メタリックなど）
+
+=== 概要と次のステップ
+
+この章では、glTF ファイルから 3D モデルをロードし、それらをシーン グラフに編成するプロセスについて説明しました。以下について説明しました。
+
+* glTF形式の構造と利点
+* tinygltf ライブラリを使用して効率的に解析する方法
+* 最新のレンダリングで使用される物理ベースのマテリアル システム
+* シーン グラフが階層構造でオブジェクトを編成する方法
+* メッシュでの 3D ジオメトリの表現
+* モデルに命を吹き込むアニメーション システム
+* レンダリングパイプラインとの統合
+
+glTF ローダーは、以下を含む完全なシーン グラフを作成します。
+
+* 階層的に編成されたノード
+* ノードにアタッチされたメッシュ
+* 表面特性を定義する材料
+* 時間の経過とともにノードのプロパティを変更できるアニメーション
+
+この構造により、次のことが可能になります。
+
+* 複雑な 3D シーンをレンダリングする
+* キャラクターやオブジェクトをアニメーション化する
+* 階層全体に伝播する変換を適用する
+* パフォーマンスのためにレンダリングを最適化する
+
+次の章では、これらのモデルをレンダリングする方法を検討します。
+物理ベースのレンダリング技術により、ロードされたアセットに命を吹き込みます
+リアルな照明とマテリアルを使用します。
+
+xref:Building_a_Simple_Engine/Loading_Models/03_model_system.adoc[Previous: モデル読み込みシステムの実装] | xref:Building_a_Simple_Engine/Loading_Models/05_pbr_rendering.adoc[次へ: PBR レンダリングの実装]

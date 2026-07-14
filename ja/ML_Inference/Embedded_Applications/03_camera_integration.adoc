@@ -1,0 +1,318 @@
+= カメラ統合: ゼロコピーパイプライン
+:pp: {plus}{plus}
+:stem: latexmath
+
+デスクトップアプリケーションでは、カメラ統合は解決済み問題として扱われることが多い——OpenCV のようなライブラリを使い、単一関数呼び出しでフレームを取得し GPU にアップロードします。32GB RAM と 300W GPU のハイエンド PC では、雑な実装でも許容できます。しかし **組み込みシステム** の世界では、雑なコードは製品の死刑宣告です。
+
+標準 1080p RGB フレームは latexmath:[\approx 6\text{MB}] のメモリを占めます。「デスクトップ方式」——カーネルからユーザースペースへコピー、OpenCV から Vulkan ステージングバッファへ、最終的に GPU へ——を使うと、1 フレームあたり **18MB** のデータを移動します。60 FPS では「ピクセルを動かすだけ」で **1 GB/s** 超のメモリ帯域。Raspberry Pi や Jetson Nano では、この帯域税がメモリバスを飽和させ、ML 推論を這わせ、フレームレートを落とし、SoC を過熱させます。
+
+本章では組み込みビジョンの「聖杯」——**ゼロコピーパイプライン**——を学びます。**V4L2** と **dmabuf** を使い、CPU 側メモリコピー 1 回もなしでセンサーからピクセルを Vulkan コンピュートシェーダに直接供給する方法を探ります。
+
+== V4L2 基盤: センサーとの対話
+
+Linux は link:https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/v4l2.html[**Video for Linux 2（V4L2）**] API でカメラとインターフェースします。最大速度のため、素朴な `read()` 呼び出し（遅いカーネル→ユーザーコピーを実行）を避け、**メモリマッピング付きストリーミング I/O（MMAP）** を使います。
+
+=== IOCTL ライフサイクル: センサーの管理
+
+V4L2 との通信は `ioctl`（Input/Output Control）呼び出しで行われます。本番カメラパイプラインは手動で管理する必要がある厳格な状態遷移の連鎖に従います。
+
+[cols="1,3"]
+|===
+| IOCTL Command | Purpose
+
+| `VIDIOC_S_FMT` | ピクセルフォーマット（例: YUYV）と解像度を設定。
+| `VIDIOC_REQBUFS` | カーネル内にバッファプールを割り当て。
+| `VIDIOC_QUERYBUF` | 各バッファの物理メモリオフセットを取得。
+| `VIDIOC_EXPBUF` | **魔法のステップ**: バッファを `dmabuf` ファイルディスクリプタとしてエクスポート。
+| `VIDIOC_QBUF` | センサーが充填するバッファをカーネルに渡す。
+| `VIDIOC_STREAMON` | センサーの DMA エンジンを開始。
+| `VIDIOC_DQBUF` | 充填済みバッファをカーネルから取得。
+|===
+
+=== 深掘り: バッファネゴシエーション
+ストリーミング前にカーネルとバッファ数をネゴシエートする必要があります。高速 ML では通常 **トリプルバッファリング**（3 バッファ）または **クアッドバッファリング**（4 バッファ）を使います。
+
+* **バッファ 1**: カメラセンサーが充填中（ハードウェア所有）。
+* **バッファ 2**: Vulkan ML エンジンが処理中（GPU 所有）。
+* **バッファ 3**: 次に充填されるためキューで待機。
+
+このパイプライン化により、センサーが GPU を待つ必要も、GPU がセンサーを待つ必要もありません。
+
+[source,cpp]
+----
+// Request 4 buffers from the kernel
+v4l2_requestbuffers req = {
+    .count = 4,
+    .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    .memory = V4L2_MEMORY_MMAP
+};
+if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+    perror("Requesting buffers failed");
+}
+----
+
+=== デバイスの初期化
+ストリーミング前に正しい `/dev/videoX` ノードを見つけ設定する必要があります。組み込みデバイスには複数ノード（例: センサー用 `/dev/video0`、メタデータ用 `/dev/video1`）があることが多い。`v4l2-ctl` ツールでハードウェアを調査できます:
+
+[source,bash]
+----
+# List all video devices and their capabilities
+v4l2-ctl --list-devices
+# List supported formats for /dev/video0
+v4l2-ctl -d /dev/video0 --list-formats-ext
+----
+
+[source,cpp]
+----
+// 1. Open the camera device
+// We open in Read/Write mode because ioctls require both.
+int fd = open("/dev/video0", O_RDWR);
+
+// 2. Set Format (YUYV 1080p)
+// YUYV is the native format for most MIPI CSI cameras.
+v4l2_format fmt = {
+    .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    .fmt = { .pix = {
+        .width = 1920,
+        .height = 1080,
+        .pixelformat = V4L2_PIX_FMT_YUYV,
+        .field = V4L2_FIELD_NONE
+    }}
+};
+if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+    throw std::runtime_error("Failed to set V4L2 format");
+}
+----
+
+=== メモリマッピング（MMAP）vs. DMA-BUF
+V4L2 はメモリアクセスに 2 つの主要方式をサポート:
+1.  **V4L2_MEMORY_MMAP**: ドライバがカーネル内にメモリを割り当て。プロセスに「マップ」。CPU のみ処理に最適。
+2.  **V4L2_MEMORY_DMABUF**: メモリを（例: Vulkan で）割り当て、ファイルディスクリプタをカメラに渡す。
+
+本章では **MMAP を DMA-BUF にエクスポート** する経路を使います。カメラドライバ（自身のアライメント要件を知っている）がメモリを割り当て、それを Vulkan に「インポート」するだけ——最も広くサポートされる方式です。
+
+== ゼロコピーの秘密: `dmabuf`
+
+**dmabuf** は物理 RAM の一部へのカーネルレベルハンドルです。異なるハードウェアドライバ間の境界を越えられるポインタと考えてください。V4L2 バッファを dmabuf としてエクスポートすれば、GPU に「独自メモリを割り当てないで、この物理アドレスのメモリを見ろ」と指示できます。
+
+.The Zero-Copy dmabuf Pipeline
+image::images/ML_Inference/Embedded_Applications/zero_copy_pipeline.svg[Diagram showing physical memory sharing between V4L2 sensor and Vulkan GPU via dmabuf, 800]
+
+=== フェーズ 1: V4L2 からのエクスポート
+特定バッファの物理メモルを表すファイルディスクリプタをカメラドライバに要求します。
+
+[source,cpp]
+----
+v4l2_exportbuffer expbuf = {
+    .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    .index = i // The index of the buffer (usually 0 to 3)
+};
+if (ioctl(fd, VIDIOC_EXPBUF, &expbuf) < 0) {
+    perror("Exporting dmabuf failed");
+}
+// This integer is a standard File Descriptor.
+// You can send it to other processes or drivers!
+int sharedFd = expbuf.fd;
+----
+
+=== フェーズ 2: Vulkan へのインポート
+この外部メモリを使うと Vulkan に伝えます。link:https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_external_memory_fd.html[`VK_KHR_external_memory_fd`] 拡張が必要です。
+
+[source,cpp]
+----
+// 1. Define External Memory Properties
+// We tell Vulkan that this memory comes from a DMA-BUF handle.
+vk::ImportMemoryFdInfoKHR importInfo{
+    .handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+    .fd = sharedFd
+};
+
+vk::MemoryAllocateInfo allocInfo{
+    .pNext = &importInfo,
+    .allocationSize = bufferSize, // This must match the V4L2 buffer length
+    .memoryTypeIndex = findDmabufCompatibleMemoryType()
+};
+
+// 2. Allocate 'External' Memory
+// Note: Vulkan now 'shares' ownership of the memory with the kernel.
+// It does not perform a copy; it simply maps the physical address.
+vk::raii::DeviceMemory vulkanMemory = device.allocateMemory(allocInfo);
+
+// 3. Bind to a Linear Image
+// Camera sensors write data in 'Linear' order (pixel by pixel).
+// Most GPUs prefer 'Tiled' order, but we MUST use linear here.
+vk::ImageCreateInfo imageInfo{
+    .imageType = vk::ImageType::e2D,
+    .format = vk::Format::eG8B8G8R8G8B8G8R8_422_Unorm, // YUYV
+    .tiling = vk::ImageTiling::eLinear,
+    .usage = vk::ImageUsageFlagBits::eSampled,
+    .extent = {1920, 1080, 1}
+};
+vk::raii::Image cameraImage = device.createImage(imageInfo);
+cameraImage.bindMemory(*vulkanMemory, 0);
+----
+
+**成果**: latexmath:[100\%] の CPU 節約を達成。ピクセルは RAM に着地し、GPU は同じ RAM から読み取ります。CPU は画像の 1 バイトにも触れません。
+
+== YUV の理解: 組み込みの現実
+
+組み込みセンサーは RGB を出力することは稀です。通常 **YUV422（YUYV）** を出力します。テレビ史の遺物ですが、単純な圧縮を可能にするため今日も有用です。link:https://fourcc.org/yuv.php[YUV フォーマットのバリエーション] を調べ、メモリレイアウトを理解できます。人間の目は色（Chrominance）より明るさ（Luminance）にはるかに敏感です。
+
+=== マクロピクセルレイアウト
+**YUYV** ストリームでは、ピクセルはスペース節約のためペアでパックされます。4 バイトごとに **2 ピクセル**:
+`[Y0, U, Y1, V]`
+
+*   **ピクセル 0** は `(Y0, U, V)` で再構成。
+*   **ピクセル 1** は `(Y1, U, V)` で再構成。
+
+色（U と V）は隣接 2 ピクセルで共有されます。RGB888 比で帯域を 33% 削減。ただし Vulkan シェーダは `vec4` を単に読めず、レイアウトを理解する必要があります。
+
+=== YUYV→RGB の数学
+**BT.601** 色空間係数を使います。正規化 YUV latexmath:[[0, 1]] から RGB への変換は線形行列乗算:
+
+[latexmath]
+++++
+\begin{bmatrix} R \\ G \\ B \end{bmatrix} = \begin{bmatrix} 1.0 & 0.0 & 1.402 \\ 1.0 & -0.344 & -0.714 \\ 1.0 & 1.772 & 0.0 \end{bmatrix} \begin{bmatrix} Y \\ U - 0.5 \\ V - 0.5 \end{bmatrix}
+++++
+
+*（注: U と V から 0.5 を引くのは、クロマは符号付きで正規化範囲では 0.5 を中心とするため。）*
+
+=== 上級: NV12 マルチプレーンの課題
+YUYV は USB カメラで一般的ですが、高性能 MIPI CSI センサーは **NV12** を使うことが多い。
+
+NV12 では画像が 2 つの別メモリプレーンに分割:
+
+1.  **輝度（Y）プレーン**: フル解像度グレースケール画像。
+2.  **クロマ（UV）プレーン**: U と V がインターリーブされた半解像度（2x2 サブサンプル）プレーン。
+
+メモリバスにさらに効率的ですが、Vulkan に **2 つの別 DMA-BUF**（または 2 オフセット付き 1 DMA-BUF）をインポートする必要があります。
+
+[source,cpp]
+----
+// Importing a multi-planar NV12 image
+vk::ExternalFormatANDROID externalFormat{ .externalFormat = 0 }; // Vendor specific
+
+vk::ImageCreateInfo imageInfo{
+    .pNext = &externalFormat,
+    .imageType = vk::ImageType::e2D,
+    .format = vk::Format::eG8B8R8_2Plane420Unorm, // NV12
+    .extent = {1920, 1080, 1},
+    .usage = vk::ImageUsageFlagBits::eSampled
+};
+----
+
+== `VK_KHR_sampler_ycbcr_conversion` の使用
+
+シェーダ内で YUV 変換（下記）は移植性が高いですが、多くの組み込み GPU（ARM Mali など）は **固定機能 YUV ハードウェア** を持ちます。`VK_KHR_sampler_ycbcr_conversion` 拡張を使えば、GPU ハードウェアがテクスチャフェッチ中に変換を実行し、**ゼロ** シェーダ命令コスト。
+
+1.  **変換オブジェクト作成**: 色空間（BT.601）とクロマ配置を定義。
+2.  **サンプラー作成**: 変換オブジェクトをサンプラーにアタッチ。
+3.  **GLSL でサンプリング**: 通常通り `texture()` を使用——結果は自動的に RGB!
+
+[source,glsl]
+----
+// With Ycbcr conversion, this sampler returns RGB directly!
+layout(set = 0, binding = 0) uniform sampler2D cameraTexture;
+
+void main() {
+    vec3 rgb = texture(cameraTexture, uv).rgb;
+    // No manual math required!
+}
+----
+
+== 「オールインワン」前処理シェーダ
+
+Vulkan の真の力は、**フォーマット変換**、**双線形リサイズ**、**ImageNet 正規化** を単一コンピュートパスに統合できることです。別ステップとして行うより大幅に高速です。
+
+[source,glsl]
+----
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Our dmabuf-backed camera frame
+layout(set = 0, binding = 0) uniform sampler2D cameraTexture;
+
+// The output tensor for ONNX Runtime
+layout(set = 0, binding = 1) writeonly buffer Output { float data[]; } mlTensor;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= targetWidth || pos.y >= targetHeight) return;
+
+    // 1. Hardware-Accelerated Bilinear Sample
+    // We sample from the normalized UV coordinate.
+    // The GPU's fixed-function texture units handle the interpolation for us.
+    vec2 uv = (vec2(pos) + 0.5) / vec2(targetWidth, targetHeight);
+    vec3 yuv = texture(cameraTexture, uv).rgb;
+
+    // 2. Manual YUV -> RGB
+    // We implement the math ourselves to avoid driver bugs with YCbCr extensions.
+    vec3 rgb;
+    rgb.r = yuv.x + 1.402 * (yuv.z - 0.5);
+    rgb.g = yuv.x - 0.344 * (yuv.y - 0.5) - 0.714 * (yuv.z - 0.5);
+    rgb.b = yuv.x + 1.772 * (yuv.y - 0.5);
+
+    // 3. Normalization (ImageNet constants)
+    // Most models expect pixels to be centered around zero with unit variance.
+    vec3 normalized = (rgb - vec3(0.485, 0.456, 0.406)) / vec3(0.229, 0.224, 0.225);
+
+    // 4. Planar NCHW Write
+    // ONNX Runtime expects Red plane, then Green plane, then Blue plane.
+    uint planeSize = targetWidth * targetHeight;
+    uint pixelIdx = pos.y * targetWidth + pos.x;
+    mlTensor.data[0 * planeSize + pixelIdx] = normalized.r;
+    mlTensor.data[1 * planeSize + pixelIdx] = normalized.g;
+    mlTensor.data[2 * planeSize + pixelIdx] = normalized.b;
+}
+----
+
+== クロスドライバ同期: ハンドシェイク
+
+カメラセンサーと GPU は同じ「机」（メモリ）で動く 2 つの独立プロセッサです。カメラがまだ書き込み中に GPU が読み始めると **ティアリング**（フレーム上半分が新、下半分が旧）が発生します。
+
+=== `dma_buf_sync` の使用
+Linux では `DMA_BUF_IOCTL_SYNC` で意図をカーネルに伝えます。CPU/センサーキャッシュをフラッシュし GPU が新鮮なデータを見られるようにします。
+
+[source,cpp]
+----
+// 1. BEFORE GPU READS: Tell kernel to flush sensor caches
+// This is mandatory on ARM Mali and Adreno GPUs.
+struct dma_buf_sync sync_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+ioctl(sharedFd, DMA_BUF_IOCTL_SYNC, &sync_start);
+
+// 2. EXECUTE VULKAN COMPUTE JOB
+// We use a timeline semaphore to signal when Vulkan is finished.
+submitVulkanInference(cameraImage);
+
+// 3. AFTER GPU FINISH: Tell kernel we are done
+struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+ioctl(sharedFd, DMA_BUF_IOCTL_SYNC, &sync_end);
+----
+
+== ISP vs. GPU: どこでリサイズするか
+
+組み込み SoC には **画像信号プロセッサ（ISP）** があることが多い。ISP はカメラデータ専用の専用ハードウェアブロック。ほぼゼロ電力でリサイズ、回転、色変換が可能。
+
+*   **ISP の利点**: GPU 使用ゼロ、極低電力。
+*   **ISP の欠点**: ISP ドライバは proprietary（Pi の Broadcom など）で、標準 Vulkan フローへの統合が難しいことが多い。
+*   **プロの戦略**: ISP で主要ダウンスケール（例: 4K センサーデータを 1080p `dmabuf` へ）、Vulkan コンピュートシェーダで ML 固有の最終クロップと正規化。
+
+== トラブルシューティング: よくある落とし穴
+
+1.  **キャッシュ非一貫性**: ML モデルがちらつきアーティファクトを見るなら、`dma_buf_sync` 呼び出しが欠けている可能性。RAM スティックを共有していてもハードウェアが「統合」とは限らない——キャッシュは CPU や GPU 専用のことが多い。
+2.  **ハンドルリーク**: `VIDIOC_EXPBUF` 呼び出しごとにプロセステーブルに新しいファイルディスクリプタが作成。終了時に **必ず** `close(sharedFd)` を呼ぶ。さもないとプロセス上限に達しクラッシュ。
+3.  **メモリアライメント**: 多くのカメラドライバは画像幅が 16 または 32 の倍数を要求。センサーが 1920 幅でもドライバが 1936 にパディングすると、Vulkan UV 座標がずれ AI が「斜めストリーク」を見る。
+
+== まとめ: ゼロコピーチェックリスト
+
+1.  **V4L2 MMAP**: センサードライバから 4 バッファのプールを要求。
+2.  **dmabuf エクスポート**: 各物理バッファのファイルディスクリプタを取得。
+3.  **Vulkan インポート**: 外部メモリ拡張で FD を `VkDeviceMemory` にインポート。
+4.  **融合コンピュート**: リサイズ + 色変換 + 正規化を単一 1ms パスで実行。
+5.  **Sync IOCTL**: 各フレームの前後で `dma_buf_sync` を使いキャッシュ一貫性を維持。
+
+ゼロコピーパイプラインを習得すれば、組み込みビジョンの主要性能ボトルネックを除去しました。アプリケーションはより速く、より冷たく、低電力シリコンでリアルタイム AI が可能になります。
+
+次は **電力とサーマル最適化** でハードウェアの物理限界を管理する方法を見ます。
+
+xref:ML_Inference/Embedded_Applications/02_cross_compilation.adoc[前へ: クロスコンパイル] | xref:ML_Inference/Embedded_Applications/04_power_optimization.adoc[次へ: 電力最適化]

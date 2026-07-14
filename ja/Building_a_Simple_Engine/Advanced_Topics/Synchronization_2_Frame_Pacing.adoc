@@ -1,0 +1,65 @@
+= Synchronization 2 とこのエンジンのフレームペーシング
+
+Vulkan Synchronization 2 は、バリアとサブミットを読みやすくします。このサンプルでは、ストールなしでアップロードと描画の歩調を合わせるために使います。
+
+ここでの目標は「最大の巧妙さ」ではありません。予測可能な順序付けです:
+
+* transfer キューがデータを GPU に載せる
+* graphics キューが準備できたものを使って描画する
+* CPU は、GPU がそのリソースを使い終わったと分かってからだけ、フレームごとのリソースを変更する
+
+== 動いている部品
+
+* transfer キュー上の timeline semaphore — テクスチャアップロードのバッチが増加する値をシグナルする。
+* graphics のサブミットが最新のアップロード値を待つ — 描画の時点ではテクスチャがサンプル可能になっている。
+* フレーム fence — 各フレームインフライトに fence があり、次フレームの CPU 作業開始時に待つ。
+
+== 依拠しているバリア
+
+アップロード経路:
+
+* `UNDEFINED → TRANSFER_DST_OPTIMAL`（dstStage: TRANSFER、dstAccess: TRANSFER_WRITE）
+* コピー後: `TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL`（srcStage: TRANSFER、dstStage: FRAGMENT_SHADER）
+
+レンダー経路:
+
+* アタッチメント画像の遷移は、アクティブな dynamic rendering ブロックの外で `vkCmdPipelineBarrier2` を使う。
+* スワップチェーン遷移: composite／transparent の前に `COLOR_ATTACHMENT_OPTIMAL`、最後のレンダリングパス終了後に `PRESENT_SRC_KHR`。
+
+== 安全な時点でのディスクリプタ更新
+
+フレーム開始時、フレーム fence を待ったあと、このフレームのディスクリプタセットだけを更新します。これにより「update-after-bind」の落とし穴と、ストリーミング中のフレーム間フリッカーを避けます。
+
+== 要点
+
+* 遷移はアクティブな `beginRendering`／`endRendering` スコープの外に保つ。
+* stage／access の組を明確にし、可読性のために Synchronization 2 を優先する。
+* timeline semaphore と fence を組にする: timeline はキュー間を調整し、fence は CPU の番を区切る。
+
+== コードの参照先
+
+* アップロードのサブミットと timeline semaphore のシグナル:
+** `renderer_resources.cpp`
+** `renderer_utils.cpp`
+* graphics サブミットの待ち（「最新アップロード値」を含む）:
+** `renderer_rendering.cpp`
+* レンダー経路のイメージバリア（アタッチメント + スワップチェーン）:
+** `renderer_rendering.cpp`
+* スワップチェーンと present の統合:
+** `swap_chain.h`
+** `renderer_rendering.cpp`
+
+== 今後のアイデア
+
+ペーシングとレイテンシを実験したい場合:
+
+* frames-in-flight 数の UI トグルを追加し、入力レイテンシとスループットを測る。
+* 再現可能な GPU タイミング比較のための「固定カメラパス」モード（開発専用）を追加する。
+* 大きなパス周りに GPU タイムスタンプクエリを追加し、時間がどこに行くかを可視化する。
+* （デバイスがサポートすれば）Forward+ のライトリスト構築など向けに async compute の実験を追加する。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_and_Streaming.adoc[同期とストリーミング]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Descriptor_Indexing_UpdateAfterBind.adoc[Descriptor Indexing UpdateAfterBind]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Rendering_Pipeline_Overview.adoc[レンダリングパイプライン概要]

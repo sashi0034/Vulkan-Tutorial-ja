@@ -1,0 +1,104 @@
+:pp: {plus}{plus}
+
+= 組み込みデバイスでの ML コンパイラ
+
+== 小さなデバイスでコンパイラがゲームを変える理由
+
+組み込みプラットフォームでは、ミリワットもメガバイトも重要です。タイトなメモリ、可変 GPU/CPU クロック（サーマルでスロットルされがち）、デスクトップ cousin と異なるドライバ——3 つの制約を同時にバランスします。汎用インタープリタは許容できないオーバーヘッドを持ちます。コンパイラは学習済みモデルを出荷先デバイス向けに特化し、コンパクトな成果物と GPU をうまく動かす小さなランタイムを生成します。
+
+重要な心構えの転換: 「モデルをロードして op を解釈する」から「そのモデルから生成されたプログラムを出荷する」へ。そのプログラムには SPIR-V カーネル（Vulkan ターゲット向け）と、バッファをバインドし正しい順序でディスパッチするホスト側ロジックが含まれます。仕事は「カーネルを書く」から「正しいコンパイラ経路を選び、ランタイムをきれいに統合し、数値を検証する」へ移ります。
+
+== 境界契約: 誰が何を所有するか
+
+アプリとコンパイラランタイムは狭い境界で出会うと考えてください。
+
+- アプリが所有: 製品上の関心事——カメラ I/O、前/後処理シェーダ、UI、ストレージ、電力ポリシー、ログ、クラッシュ処理。
+- コンパイラランタイムが所有: モデル実行——デバイス選択、SPIR-V モジュール、ディスクリプタレイアウト、モデル内ディスパッチスケジューリング、モデル内同期。
+
+境界は退屈に保つ。数個の明確なバッファまたはイメージでデータを交換。境界では単純なホスト可視コピーから始め、正しさが固まったら、ランタイムが安定フックを公開する場合のみゼロコピーまたはハンドルレベル相互運用を検討。
+
+== 経路の選択: IREE か TVM
+
+IREE と Apache TVM の両方が組み込み GPU 向け Vulkan をターゲットできます。アプローチが異なり、日々の作業に影響します。
+
+- IREE: StableHLO/MLIR を供給し、Vulkan バックエンドでコンパイル、小さな C/C++ ランタイムをリンク。強み: スリムなフットプリント、Vulkan ファースト設計、良い組み込みストーリー。通常、コンパイル前のステージング IR として ONNX/TFLite/NNEF などソースを StableHLO に変換。正確なスイッチと最小埋め込みは xref:ML_Inference/Third_Party_Libraries/12_iree.adoc[IREE] を参照。
+
+- TVM: Relay にインポート（通常 ONNX から）、`target="vulkan"` でビルド、TVM ランタイム（graph executor または AOT/CRT）経由で生成モジュールをロード。強み: 広いインポートサポート、特定デバイス向け自動スケジューリング、柔軟性。具体的な Python と C++ 形状は xref:ML_Inference/Third_Party_Libraries/13_apache_tvm.adoc[TVM] を参照。
+
+永遠に選ぶ必要はありません——両方をプロトタイプし、レイテンシ/分散/電力を測定し、最小複雑さで制約を満たす方を出荷。
+
+== 持っているデバイス向けにモデルを形作る
+
+コンパイラは推論しやすいモデルでより多くをします。エクスポート時にいくつかの原則的選択で助けられます:
+
+- ホットパスでは静的形状を優先。動的形状はコードサイズを膨らませ積極的スケジューリングを制限。入力が可変（カメラ解像度など）なら、境界で少数の固定サイズに正規化。
+- 精度を最初に決める。タスクで INT8 を安全に検証できれば、コンパイル前に量子化を有効化——帯域を減らしモバイル iGPU でレイテンシを大幅削減。fp16/fp32 のままなら、変換がどこで起きるか明示し隠れたコストを払わない。
+- レイアウトを一貫させる。channels-last vs channels-first はメモリアクセスパターンを一転。前/後処理をコンパイラが選ぶまたは固定するものに合わせる。
+
+== 最初の動作ビルド（概念、買い物リストではない）
+
+「デバイス上で正しく動く」まで確実に到達する弧:
+
+1. モデルの単一固定形状バリアントをエクスポート。真実のソースが NNEF なら、まず ONNX または StableHLO に変換（xref:ML_Inference/Building_the_Inference_Engine/06_nnef_introduction.adoc[NNEF introduction] がクリーンなステージングステップの理由を説明）。
+2. 選んだツールチェーンで Vulkan 向けコンパイル。IREE では Vulkan HAL バックエンド、TVM では Relay ビルド時に `target="vulkan"`。
+3. まず開発マシンで成果物を実行。必要ならヘッドレス Vulkan ICD（xref:ML_Inference/Desktop_Applications/04_ci_render_validation.adoc[Headless Vulkan]）でデバイス立ち上げ変数を排除。
+4. その後のみボードにデプロイし、デバイス上で同じ正しさチェックを繰り返す。
+
+アイデアを固定する小さなコマンドブロック（詳細は専用章）:
+
+[source]
+----
+# IREE (conceptual): compile to a Vulkan module
+iree-compile model.stablehlo  \
+  --iree-hal-target-backends=vulkan \
+  -o model.vmfb
+
+# TVM (conceptual): build an ONNX model for Vulkan
+# (Python) relay.build(mod, target="vulkan", params=params)
+----
+
+ここにないものに注意: SPIR-V を編集したりディスクリプタセットを自分で弄ったりしない。コンパイラが生成したランタイムがそれを所有。
+
+== Vulkan アプリへのランタイム統合
+
+コンパイラランタイムを ONNX Runtime や TFLite と同様に扱う: 一度初期化、入出力バッファを準備、フレームまたはリクエストごとに呼び出し、結果をアプリに返す。
+
+実際の感覚:
+
+1. Vulkan バックエンドでランタイムを初期化（IREE）または Vulkan デバイスターゲットを作成（TVM）。
+2. 入出力テンソルを作成またはラップ。ホスト可視割り当てと memcpy から始め、正しさ後に明示コピー付きデバイスローカルへ。
+3. 名前でコンパイル済み関数を呼び出し。
+4. 出力を読み取りパイプラインを続行。
+
+[source]
+----
+// Pseudocode: not production code, just the call cadence
+auto runtime = init_compiler_runtime_vulkan(/* VkInstance/Device if supported */);
+auto module  = runtime.load("model.vmfb" /* or model_vulkan.so */);
+Tensor in    = runtime.make_tensor(shape, dtype);
+Tensor out   = runtime.make_tensor(out_shape, dtype);
+
+runtime.set_input(module, "input", in);
+runtime.run(module);
+runtime.get_output(module, 0, out);
+----
+
+後でより密な相互運用（VkDevice やメモリ共有）が必要なら、ランタイムのサポートフックを探す。自前 Vulkan コードベース内でホスト側スケジューラを再実装するのは今日安定した経路ではない。
+
+== 正しさの証明（チューニング前）
+
+信頼するゴールデンパスを構築し、コンパイル済みパスの隣に置く。CPU 上の ONNX Runtime が usual 選択。同一入力を供給、平均絶対誤差などの誤差指標を計算、最初の不一致で停止。量子化モデルでは現実的許容差を設定し、最初の発散までレイヤごとに差を分解。
+
+この規律が、量子化設定変更、コンパイラ切り替え、前/後処理リファクタリングを恐れずにできる理由。
+
+== 組み込みで重要なものの測定
+
+レイテンシ分布が単一数値に勝る——ウォームキャッシュ 1 回ではなく、現実的ウィンドウで p50/p90/p99 を測定。クロックとサーマルを監視——多くの SoC は 10〜30 秒後にダウンクロック。コンパイラランタイム内の時間と境界コピー時間を分離——大きい方を先に最適化。INT8 が勝つとき、通常 ALU を魔法のように速くするのではなくメモリトラフィックを減らすことで勝つ。
+
+== 短いデプロイチェックリスト（決定として）
+
+成果物の置き場（ディスク、APK、ファームウェア）とバージョニング方法を決める。サポート ABI を決め CI でランタイムのクロスコンパイルを設定。フォールバックを決める——Vulkan 経路が使えないとき CPU 版を動かすか機能を無効にするか。毎コミットの検証方法を決める——CI のヘッドレス Vulkan と固定テストベクトル数個で多くの場合十分です。
+
+これらを明示的に決めれば、残りの立ち上げはスムーズになりがちです。
+
+xref:ML_Inference/Embedded_Applications/06_scene_understanding_openxr.adoc[前へ: OpenXR でのシーン理解] | xref:ML_Inference/Embedded_Applications/08_nnef_example.adoc[次へ: 組み込み NNEF: 小さな例]

@@ -1,0 +1,265 @@
+:pp: {plus}{plus}
+
+= 物理デバイスとキューファミリー
+
+== 物理デバイスの選択
+
+vk::raii::Instance 経由で Vulkan ライブラリを初期化した後、必要な機能をサポートするグラフィックスカードをシステム内で探して選択する必要があります。実際には任意の数のグラフィックスカードを選んで同時に使うこともできますが、本チュートリアルでは要件を満たす最初のグラフィックスカードに留めます。
+
+関数 `pickPhysicalDevice` を追加し、`initVulkan` 関数から呼び出します。
+
+[,c++]
+----
+void initVulkan()
+{
+    createInstance();
+    setupDebugMessenger();
+    pickPhysicalDevice();
+}
+
+void pickPhysicalDevice()
+{
+}
+----
+
+最終的に選ぶグラフィックスカードは、新しいクラスメンバとして追加した vk::raii::PhysicalDevice に格納します。
+
+[,c++]
+----
+vk::raii::PhysicalDevice physicalDevice = nullptr;
+----
+
+グラフィックスカードの列挙は拡張の列挙とよく似ており、まず個数を問い合わせるところから始まります。
+
+[,c++]
+----
+auto physicalDevices = instance.enumeratePhysicalDevices()
+----
+
+Vulkan をサポートするデバイスがなければ、先に進む意味はありません。
+
+[,c++]
+----
+if (physicalDevices.empty())
+{
+    throw std::runtime_error("failed to find GPUs with Vulkan support!");
+}
+----
+
+次にそれぞれを評価し、行いたい操作に適しているかを確認する必要があります。すべてのグラフィックスカードが同じではないからです。いずれかの物理デバイスが、その関数に追加する要件を満たすかを確認します。
+
+[,c++]
+----
+for (physicalDevice : physicalDevices)
+{
+    break;
+}
+----
+
+== 基本的なデバイス適合性チェック
+
+デバイスの適合性を評価するには、まずいくつかの詳細を問い合わせられます。名前、種類、サポートする Vulkan バージョンといった基本的なデバイスプロパティは、vk::raii::PhysicalDevice::getProperties で問い合わせられます。
+
+[,c++]
+----
+auto deviceProperties = physicalDevice.getProperties();
+----
+
+テクスチャ圧縮、64 ビット浮動小数点、マルチビューポートレンダリング（VR に有用）などのオプション機能のサポートは、vk::raii::PhysicalDevice::getFeatures で問い合わせられます。
+
+[,c++]
+----
+auto deviceFeatures = physicalDevice.getFeatures();
+----
+
+デバイスメモリとキューファミリー（次節参照）に関して、後で議論するより多くの詳細をデバイスから問い合わせられます。
+
+例として、ジオメトリシェーダをサポートする専用グラフィックスカードでのみアプリケーションが使えるとします。すると `isDeviceSuitable` 関数は次のようになります。
+
+[,c++]
+----
+bool isDeviceSuitable(vk::raii::PhysicalDevice const & physicalDevice)
+{
+    auto deviceProperties = physicalDevice.getProperties();
+    auto deviceFeatures = physicalDevice.getFeatures();
+
+    if (deviceProperties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu && deviceFeatures.geometryShader) {
+        return true;
+    }
+
+    return false;
+}
+----
+
+デバイスが適しているかどうかだけを見て最初のものを選ぶ代わりに、各デバイスにスコアを付けて最高のものを選ぶこともできます。そうすれば専用グラフィックスカードに高いスコアを付けて優先しつつ、それが唯一の場合は統合 GPU にフォールバックできます。次のように実装できます。
+
+[,c++]
+----
+#include <map>
+
+...
+
+void pickPhysicalDevice()
+{
+    auto physicalDevices = vk::raii::PhysicalDevices( instance );
+    if (physicalDevices.empty())
+    {
+        throw std::runtime_error( "failed to find GPUs with Vulkan support!" );
+    }
+    
+    // Use an ordered map to automatically sort candidates by increasing score
+    std::multimap<int, vk::raii::PhysicalDevice> candidates;
+
+    for (const auto& pd : physicalDevices)
+    {
+        auto deviceProperties = pd.getProperties();
+        auto deviceFeatures = pd.getFeatures();
+        uint32_t score = 0;
+
+        // Discrete GPUs have a significant performance advantage
+        if (deviceProperties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+            score += 1000;
+        }
+
+        // Maximum possible size of textures affects graphics quality
+        score += deviceProperties.limits.maxImageDimension2D;
+
+        // Application can't function without geometry shaders
+        if (!deviceFeatures.geometryShader)
+        {
+           continue;
+        }
+        candidates.insert(std::make_pair(score, pd));
+    }
+
+    // Check if the best candidate is suitable at all
+    if (!candidates.empty() && candidates.rbegin()->first > 0)
+    {
+        physicalDevice = candidates.rbegin()->second;
+    }
+    else
+    {
+        throw std::runtime_error("failed to find a suitable GPU!");
+    }
+}
+----
+
+本チュートリアルではそのすべてを実装する必要はありませんが、デバイス選択プロセスをどう設計できるかのアイデアとして示しています。もちろん、選択肢の名前を表示してユーザーに選ばせることもできます。
+
+本チュートリアルでは、物理デバイスが選ばれるためにすべて満たさなければならない次の 4 つの基準を使います。
+- Vulkan 1.3 のサポート
+- グラフィックス操作をサポートするキューファミリー
+- 必要なすべての拡張のサポート（ここでは vk::KHRSwapchainExtensionName のみ必要）
+- 必要なすべての機能のサポート
+
+=== API バージョンのチェック
+
+Vulkan 1.3 サポートを確認するには、物理デバイスプロパティの apiVersion を確認できます。
+
+[,c++]
+----
+bool supportsVulkan1_3 = physicalDevice.getProperties().apiVersion >= vk::ApiVersion13;
+----
+
+=== キューファミリーのチェック
+
+以前簡単に触れたように、Vulkan では描画からテクスチャのアップロードまで、ほぼすべての操作でコマンドをキューに投入する必要があります。異なる種類のキューは異なる *キューファミリー* に由来し、各キューファミリーはコマンドの部分集合だけを許可します。たとえば、コンピュートコマンドの処理だけを許可するキューファミリーや、メモリ転送関連コマンドだけを許可するものがあり得ます。
+
+デバイスがどのキューファミリーをサポートしているか、またそのうちどれが使いたいコマンドをサポートしているかを確認する必要があります。今はグラフィックスコマンドをサポートするキューだけを探すので、コードは次のようになります。
+
+[,c++]
+----
+auto queueFamilies = physicalDevice.getQueueFamilyProperties();
+bool supportsGraphics =
+    std::ranges::any_of(queueFamilies, [](auto const &qfp) { return !!(qfp.queueFlags & vk::QueueFlagBits::eGraphics); });
+----
+
+=== 必要な拡張のチェック
+
+現時点では必要な拡張は vk::KHRSwapchainExtensionName の 1 つだけです。ただし必要な拡張がいくつであっても、各必須デバイス拡張が物理デバイスで実際にサポートされていることを検証しなければなりません。
+[,c++]
+----
+std::vector<const char*> requiredDeviceExtension = {vk::KHRSwapchainExtensionName};
+
+auto availableDeviceExtensions = physicalDevice.enumerateDeviceExtensionProperties();
+bool supportsAllRequiredExtensions =
+  std::ranges::all_of( requiredDeviceExtension,
+                       [&availableDeviceExtensions]( auto const & requiredDeviceExtension )
+                       {
+                           return std::ranges::any_of( availableDeviceExtensions,
+                                                       [requiredDeviceExtension]( auto const & availableDeviceExtension )
+                                                       { return strcmp( availableDeviceExtension.extensionName, requiredDeviceExtension ) == 0; } );
+                       } );
+----
+
+=== 必要な機能のチェック
+
+最後に、オプションとしてサポートされる必須機能がすべて実際にサポートされていることを確認する必要があります。
+
+[,c++]
+----
+auto features                 = physicalDevice.template getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                                     vk::PhysicalDeviceVulkan11Features,
+                                                                     vk::PhysicalDeviceVulkan13Features,
+                                                                     vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
+                                features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
+                                features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+----
+
+== 完成した関数
+
+これらの部品をすべて組み合わせると、物理デバイスを選択する次の関数になります。
+
+[,c++]
+----
+std::vector<const char*> requiredDeviceExtension = {vk::KHRSwapchainExtensionName};
+
+bool isDeviceSuitable( vk::raii::PhysicalDevice const & physicalDevice )
+{
+  // Check if the physicalDevice supports the Vulkan 1.3 API version
+  bool supportsVulkan1_3 = physicalDevice.getProperties().apiVersion >= vk::ApiVersion13;
+
+  // Check if any of the queue families support graphics operations
+  auto queueFamilies    = physicalDevice.getQueueFamilyProperties();
+  bool supportsGraphics = std::ranges::any_of( queueFamilies, []( auto const & qfp ) { return !!( qfp.queueFlags & vk::QueueFlagBits::eGraphics ); } );
+
+  // Check if all required physicalDevice extensions are available
+  auto availableDeviceExtensions = physicalDevice.enumerateDeviceExtensionProperties();
+  bool supportsAllRequiredExtensions =
+    std::ranges::all_of( requiredDeviceExtension,
+                         [&availableDeviceExtensions]( auto const & requiredDeviceExtension )
+                         {
+                           return std::ranges::any_of( availableDeviceExtensions,
+                                                       [requiredDeviceExtension]( auto const & availableDeviceExtension )
+                                                       { return strcmp( availableDeviceExtension.extensionName, requiredDeviceExtension ) == 0; } );
+                         } );
+
+  // Check if the physicalDevice supports the required features (shader draw parameters, dynamic rendering and extended dynamic state)
+  auto features                 = physicalDevice.template getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                                       vk::PhysicalDeviceVulkan11Features,
+                                                                       vk::PhysicalDeviceVulkan13Features,
+                                                                       vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+  bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
+                                  features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
+                                  features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+
+  // Return true if the physicalDevice meets all the criteria
+  return supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures;
+}
+
+void pickPhysicalDevice()
+{
+  std::vector<vk::raii::PhysicalDevice> physicalDevices = instance.enumeratePhysicalDevices();
+  auto const devIter = std::ranges::find_if( physicalDevices, [&]( auto const & physicalDevice ) { return isDeviceSuitable( physicalDevice ); } );
+  if ( devIter == physicalDevices.end() )
+  {
+    throw std::runtime_error( "failed to find a suitable GPU!" );
+  }
+  physicalDevice = *devIter;
+}
+----
+
+これで当面、適切な物理デバイスを見つけるのに必要なものはすべて揃いました。次のステップは、それとやり取りするための xref:./04_Logical_device_and_queues.adoc[論理デバイスの作成] です。
+
+link:/attachments/03_physical_device_selection.cpp[C{pp} code]

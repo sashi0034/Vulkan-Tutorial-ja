@@ -1,0 +1,386 @@
+:pp: {plus}{plus}
+= モバイルを超えて: 組み込みとヘッドレスコンピュート
+
+== Vulkan デバイスの長い尾
+
+モバイルスマートフォンが見出しを取りますが、Vulkan コンピュートははるかに広い **組み込み** ハードウェアの宇宙で動きます。これらのデバイスはモバイルの制約——限られた電力、共有メモリ、タイルベース GPU、厳しい熱エンベロープ——を借り、独自のものも追加します。ディスプレイなし、リアルタイム期限、安全認証、年や数十年で測られる製品寿命です。本セクションではその風景、ツーリング、効果的にターゲットするために必要な開発環境を概観します。
+
+== 組み込み Vulkan コンピュートが生きる場所
+
+*   **シングルボードコンピュータ（SBC）。** Raspberry Pi 4/5 は VideoCore GPU 上で適合 Vulkan 1.2+ ドライバ（`v3dv`）を公開し、無数の Arm SBC が Mali や Adreno 部品を出荷します。趣味とエッジコンピュート実験に人気です。
+*   **エッジ AI モジュール。** NVIDIA Jetson、Qualcomm ロボティクスプラットフォーム、類似モジュールは、オンデバイス推論とコンピュータビジョンを動かすために能力のある GPU を組み込み CPU と組み合わせます。
+*   **自動車。** インフォテインメント、デジタルインストルメントクラスタ、運転支援システムがますます Vulkan に標準化し、しばしば認証可能システム向けの派生 API である **安全クリティカル** プロファイル **Vulkan SC** 経由です。
+*   **産業とロボティクス。** マシンビジョンカメラ、lidar 処理ユニット、ロボティクスコントローラが、センサに近い低レイテンシセンサ処理に Vulkan コンピュートを使います。
+*   **デジタルサイネージとセットトップボックス。** 動画と画像処理パイプラインを連続実行する、長寿命でファンレスのデバイスです。
+
+== 組み込みターゲット向け開発環境のセットアップ
+
+モバイルと一般組み込み開発の最大の単一の違いはツールチェーンです。典型的には強力な x86 ホストマシンで *クロスコンパイル* し、結果の ARM バイナリをターゲットデバイスへデプロイします。正しい IDE とクロスコンパイルセットアップの選択が、反復ループが分か単位か日単位かを決めます。
+
+=== 組み込みとクロスプラットフォーム開発向け CLion
+
+JetBrains の link:https://www.jetbrains.com/clion/[**CLion**] (https://www.jetbrains.com/clion/) は、組み込みとクロスプラットフォーム Vulkan 作業向けの最も能力のある C{pp} IDE です。商用ですが 30 日トライアルがあり、学生は link:https://www.jetbrains.com/community/education/[jetbrains.com/community/education] で無料教育ライセンスを得られます。
+
+組み込み作業で特に価値のある CLion 機能が 2 つあります。
+
+==== リモート開発（SSH）
+
+CLion の **Remote Development** モード（CLion 2022.3 で導入）により、フル IDE UI をローカルで動かしながら、SSH 越しにターゲットデバイス（Raspberry Pi、Jetson など）*上*でプロジェクトを開けます。編集、コード補完、デバッグはすべてデバイス*上*のネイティブコンパイラとライブラリを使うため、クロスコンパイルツールチェーンの不一致が無関係になります。有効化手順:
+
+1.  CLion で **File → Remote Development → SSH** を選ぶ。
+2.  ターゲットデバイスの IP アドレス、SSH ポート（デフォルト 22）、ユーザー名を指す接続エントリを追加する。
+3.  CLion は初回接続時に小さなサーババックエンドをデバイスへアップロードし、フルエディタでリモートプロジェクトを開く。
+
+デバイスには少なくとも数百メガバイトの空きストレージが必要で、64 ビット ARM Linux を動かす必要があります。Raspberry Pi 5 と Jetson モジュールは余裕があり、フル Raspberry Pi OS（64 ビット）の Raspberry Pi 4 も動きます。
+
+==== CMake ツールチェーンファイル経由のクロスコンパイル
+
+ターゲットデバイスがリモート開発にはリソース制約が厳しすぎる場合——またはベアメタル組み込み OS 向けにビルドする場合——CLion はツールチェーンファイル付きの **CMake クロスコンパイル** もサポートします。ホストにクロスコンパイラをインストールし、CLion を `CMakeToolchain-arm64.cmake` ファイルへ向けます。
+
+[source,cmake]
+----
+# CMakeToolchain-aarch64-linux.cmake
+# Ubuntu/Debian でツールチェーンをインストール:  sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+set(CMAKE_C_COMPILER   aarch64-linux-gnu-gcc)
+set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+
+# Raspberry Pi OS または Jetson L4T rootfs からの sysroot がある場合は指す。
+# クロスツールチェーンのデフォルト sysroot のみに頼る場合は未設定のまま。
+# set(CMAKE_SYSROOT /opt/sysroots/aarch64-rpi)
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+----
+
+CLion で **CMake プロファイル**（**Settings → Build, Execution, Deployment → CMake → +**）を追加し、**CMake options** を `-DCMAKE_TOOLCHAIN_FILE=/path/to/CMakeToolchain-aarch64-linux.cmake` に設定し、ターゲット向けビルド時にそのプロファイルを選んでください。ホストで反復するためのネイティブ x86 ビルド用に別プロファイルを保てます。
+
+32 ビット ARM ターゲット（古い SBC、一部自動車 SoC）では `aarch64-linux-gnu` を `arm-linux-gnueabihf` に置き換えてください。
+
+== Raspberry Pi: Vulkan コンピュートセットアップ
+
+Raspberry Pi 4 と 5 は、Mesa オープンソースグラフィックススタックの一部である **v3dv** Vulkan ドライバを動かします。Raspberry Pi OS（Bookworm、64 ビット）時点で、十分新しい Mesa がデフォルトでインストールされています。ドライバの存在を確認してください。
+
+[source,bash]
+----
+# Raspberry Pi 上（64 ビット RPi OS Bookworm 以降）:
+sudo apt update && sudo apt install -y mesa-vulkan-drivers vulkan-tools
+
+# v3dv が認識されることを確認:
+vulkaninfo --summary | grep driverName
+# 期待出力:  driverName = V3DV (Broadcom)
+----
+
+Vulkan 開発ヘッダと Validation Layers をインストールします。
+
+[source,bash]
+----
+sudo apt install -y \
+    libvulkan-dev \
+    vulkan-validationlayers \
+    spirv-tools \
+    glslang-tools      # glslangValidator を提供
+----
+
+`slangc` については、link:https://github.com/shader-slang/slang/releases[github.com/shader-slang/slang/releases] から事前ビルドの Linux AArch64 リリースをダウンロードし、`PATH` に置いてください。
+
+=== Raspberry Pi 上の Vulkan 制限
+
+VideoCore VI GPU（Pi 4、Mesa 23.3+）は Vulkan 1.2 をサポートし、VideoCore VII（Pi 5、Mesa 24.0+）は Vulkan 1.3 に達します。どちらもタイルベースハードウェアに典型的な厳しい制限を持ちます。
+
+*   `maxComputeWorkGroupInvocations`: **256**（Pi 4）/ **256**（Pi 5）
+*   `maxComputeSharedMemorySize`: **16 384 バイト**（16 KB）
+*   サブグループサイズ: **16**（Pi 4 — 問い合わせよ。ハードコードするな）
+*   Pi 4 に `shaderInt64` なし。Pi 5 はファームウェア版により異なる可能性
+
+Android セクションの防御的問い合わせとワークグループクランプの実践をすべて適用してください。ここでも同様に重要です。
+
+=== Raspberry Pi 向けコンピュートアプリのビルド（リモート開発）
+
+CLion の Remote Development が Pi に接続されていれば、ワークフローは通常の CMake 開発です。
+
+[source,bash]
+----
+# Raspberry Pi 上、CLion がリモートで開いたプロジェクトディレクトリ内:
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j4           # Pi 4 は 4 コア。-j4 で飽和
+./my_headless_compute
+----
+
+CLion のネイティブデバッガ（Pi にインストールされている LLDB または GDB）は同じ SSH トンネル越しに動きます——ブレークポイントを設定し、`VkResult` 値を検査し、デスクトップとまったく同じようにコマンドバッファ記録コードをステップ実行できます。
+
+=== Raspberry Pi リソース
+
+*   link:https://docs.mesa3d.org/drivers/v3dv.html[Mesa v3dv ドライバドキュメント] — 機能マトリクス、既知の制限、カーネルバージョン要件。
+*   link:https://www.raspberrypi.com/documentation/computers/raspberry-pi.html[Raspberry Pi ハードウェアドキュメント] — GPU 仕様と `start_x.elf` ファームウェアノート。
+*   link:https://github.com/Igalia/v3dv[v3dv ソース] — オープンソースドライバ。欠けた機能に当たったときに読むと有用。
+
+== NVIDIA Jetson: Vulkan コンピュートセットアップ
+
+NVIDIA Jetson モジュール（Jetson Orin、Jetson AGX Xavier、Jetson Nano）は、**JetPack SDK** の一部としてプロプライエタリな NVIDIA Vulkan ドライバを動かします——NVIDIA のモバイル部品と同じ基盤 GPU IP が、フル Vulkan 実装経由で公開されます。
+
+=== JetPack SDK のインストール
+
+link:https://developer.nvidia.com/embedded/jetpack[developer.nvidia.com/embedded/jetpack] から **JetPack** をダウンロードしてください。JetPack は次を含む包括的 SDK です。
+
+*   **L4T（Linux for Tegra）** — Jetson 固有の Ubuntu ベース OS イメージ。
+*   **CUDA** — NVIDIA の GPGPU コンピュート API（同じハードウェア上で Vulkan と並んで動く）。
+*   **cuDNN** — ディープラーニングプリミティブ。
+*   **TensorRT** — 推論オプティマイザ。
+*   **Vulkan ヘッダとローダ** — JetPack 5.x 以降の L4T に含まれる。
+
+SDK Manager ツール（Windows/Linux ホスト）でターゲットモジュールをフラッシュするか、JetPack ドキュメントの Jetson 固有フラッシュ手順に従ってください。フラッシュ後、Vulkan を確認します。
+
+[source,bash]
+----
+# Jetson 上:
+vulkaninfo --summary | grep -E "driverName|apiVersion"
+# 期待:  driverName = NVIDIA（または類似）、apiVersion = 1.x
+----
+
+開発ヘッダをインストールします。
+
+[source,bash]
+----
+sudo apt install -y libvulkan-dev vulkan-validationlayers
+----
+
+=== x86 ホストからの Jetson 向けクロスコンパイル
+
+Jetson は 64 ビット ARM（aarch64）です。Raspberry Pi セクションと同じ `CMakeToolchain-aarch64-linux.cmake` を使えますが、Raspberry Pi OS sysroot の代わりに Jetson L4T sysroot を使います。NVIDIA はフル L4T rootfs とツールチェーンを一緒にパッケージする Docker ベースのクロスコンパイル環境 **Jetson Linux Developer Guide** を提供します——JetPack リリースに一致する版は link:https://docs.nvidia.com/jetson/archives/l4t-archived/[docs.nvidia.com/jetson] を参照してください。
+
+あるいは、モジュールが十分速い（Orin の Cortex-A78AE）ため CLion サーババックエンドを快適に動かせることから、SSH 越しの CLion Remote Development は Jetson で非常にうまく働きます。
+
+=== Jetson 上の CUDA と Vulkan 相互運用
+
+Jetson は **CUDA–Vulkan 相互運用**（`VK_KHR_external_memory`、`VK_KHR_external_semaphore`）が本当に有用な数少ない組み込みターゲットの一つです。`VkDeviceMemory` を CUDA の `cudaExternalMemory_t` と共有することで、同じデータ上で、同じハードウェアエンジン上で、CUDA カーネルと Vulkan コンピュートカーネルを動かせます。これにより段階的移行が可能です。パイプラインの残りは CUDA のまま、1 ステージを Vulkan コンピュートへ書き換える。NVIDIA はこれを link:https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#interoperability-with-vulkan[CUDA Interoperability Guide] で文書化しています。
+
+=== Jetson リソース
+
+*   link:https://developer.nvidia.com/embedded/jetpack[JetPack SDK] — ダウンロード、フラッシュ手順、リリースノート。
+*   link:https://developer.nvidia.com/embedded/community/jetson-projects[Jetson AI Projects] — コミュニティサンプルの多くが TensorRT と並んで Vulkan コンピュートを使う。
+*   link:https://docs.nvidia.com/jetson/archives/l4t-archived/[L4T Developer Guide] — Vulkan レイヤパスとドライバノートを含むフル Linux レベルドキュメント。
+
+== ヘッドレスコンピュート: ウィンドウなし、サーフェスなし
+
+多くの組み込みシステムの定義的特徴は、**ディスプレイがまったくない**ことです。朗報は、Vulkan コンピュートはそれを必要としないことです。本チュートリアルシリーズのすべて——パイプライン、ディスクリプタ、ディスパッチ——は、`VkSurfaceKHR` やスワップチェーンを一度も作らずに動きます。
+
+ヘッドレスで動かすには、サーフェスとプレゼンテーション機構を単純に*省略*します。
+
+*   `VK_KHR_surface`、`VK_KHR_swapchain`、または任意のプラットフォーム `*_surface` 拡張を**有効にしない**。
+*   `VK_QUEUE_COMPUTE_BIT` を報告するキューファミリーを選ぶ。プレゼンテーションサポートは不要なので、`vkGetPhysicalDeviceSurfaceSupportKHR` チェックを完全にスキップする。
+*   前セクションの Android リードバック例とまったく同じように、ディスパッチを投入しバッファ経由で結果を読み戻す。
+
+[source,cpp]
+----
+// ヘッドレスデバイス: コンピュート対応キューを要求。サーフェス／プレゼンテーション不要。
+uint32_t computeFamily = findQueueFamily(physicalDevice, VK_QUEUE_COMPUTE_BIT);
+
+float priority = 1.0f;
+VkDeviceQueueCreateInfo queueInfo{
+    .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+    .queueFamilyIndex = computeFamily,
+    .queueCount       = 1,
+    .pQueuePriorities = &priority,
+};
+// 有効デバイス拡張に VK_KHR_swapchain なし — 純粋コンピュート。
+----
+
+上の `findQueueFamily` ヘルパーは明示する価値があります。組み込み部品ではしばしば *専用* コンピュートキュー（グラフィックスも広告しないもの）を欲し、ディスパッチがディスプレイ作業と競合しないようにするためです。
+
+[source,cpp]
+----
+uint32_t findQueueFamily(VkPhysicalDevice dev, VkQueueFlags required) {
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(dev, &count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(dev, &count, families.data());
+
+    // 第 1 パス: 競合回避のためコンピュート専用ファミリー（グラフィックスなし）を好む。
+    for (uint32_t i = 0; i < count; ++i) {
+        const bool hasCompute  = families[i].queueFlags & VK_QUEUE_COMPUTE_BIT;
+        const bool hasGraphics = families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT;
+        if (hasCompute && !hasGraphics) return i;
+    }
+    // フォールバック: 要件を満たす任意のファミリー。
+    for (uint32_t i = 0; i < count; ++i)
+        if ((families[i].queueFlags & required) == required) return i;
+
+    throw std::runtime_error("no suitable compute queue family");
+}
+----
+
+この同じヘッドレスパスは、サーバ側コンピュートノード、カーネルを検証する CI ランナー、画面のないロボティクスコントローラで使うものです。
+
+== ドライバと適合性はデスクトップよりばらつく
+
+組み込み部品では、最新 Vulkan バージョンや完全なオプション機能セットを想定できません。
+
+*   常にオプション機能を機能問い合わせの後ろにゲートしてください。実質すべての出荷組み込みハードウェア（Raspberry Pi 4/5、NVIDIA Jetson JetPack ≥ 5.1、Android API 33+）が Vulkan 1.3 をサポートします。古いまたは高度に専門化された産業デバイスでは Vulkan 1.1 や 1.2 に遭遇するかもしれませんが、新規プロジェクトでは 1.3 が妥当なベースラインです。
+*   一部の組み込みドライバは、当然と思っていたオプション能力——`shaderInt64`、特定のサブグループ演算、**Buffer Device Address** など——を省略します。フォールバックパスを提供するか、明確なメッセージで優雅に失敗してください。
+*   Mesa ドライバ（`v3dv`、ソフトウェアフォールバック用 `lavapipe`）がここで一般的です。特に `lavapipe` は、GPU のないマシンでコンピュートをテストするための有用な CPU ベース適合 Vulkan 実装です。
+
+`lavapipe` は完全に CPU 上で動くため、GPU のないビルドマシンでもカーネルを検証する CI ゲートに理想的です。ヘッドレスアプリ起動前に `VK_ICD_FILENAMES` を Mesa ソフトウェア ICD へ向け、標準 Vulkan ローダ経由で選択します。
+
+[source,bash]
+----
+# CPU ベース lavapipe ドライバに対してヘッドレスコンピュートアプリを実行。
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+./my_headless_compute --validate
+----
+
+これにより、組み込みデバイスに出荷する *同じバイナリ* を CI でスモークテストでき、実ハードウェアが乏しいときに非常に価値があります。
+
+== clvk と OpenCL による移植性
+
+組み込みベンダーは、特にビジョンと ML ツールチェーンで、手書き Vulkan コンピュートパスではなく OpenCL スタックを出荷することがよくあります。`clvk` は Vulkan 上にレイヤされた適合 OpenCL 3.0 ランタイムを提供します。組み込みにとってこれは強力な移植性の物語です。
+
+*   OpenCL に対して書かれたロボティクスやビジョンコードベースは、カーネルもホストコードの書き換えも不要で、`clvk` にリンクするだけで Vulkan 専用ドライバを持つ任意の組み込みデバイスで動ける。
+*   逆に、Vulkan を直接ターゲットする場合、`clspv` により既存 OpenCL C カーネルをこれらの同じデバイス上で SPIR-V として再利用できる。
+
+組み込みチームにとって、これが既存アルゴリズムライブラリを Vulkan 専用 SoC にそもそもデプロイできるかをしばしば決めます。
+
+=== 組み込み Linux 向け clvk のビルド
+
+上のクロスコンパイルセクションと同じ aarch64 ツールチェーンで x86 ホスト上で `clvk` をクロスコンパイルし、結果のライブラリをデバイスへデプロイします。
+
+[source,bash]
+----
+git clone --recursive https://github.com/kpet/clvk.git
+cd clvk && mkdir build-arm64 && cd build-arm64
+
+cmake .. \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=/path/to/CMakeToolchain-aarch64-linux.cmake \
+    -DCLVK_COMPILER_AVAILABLE=OFF   # 事前コンパイル SPIR-V を使用。デバイス上に clspv なし
+
+ninja OpenCL
+
+# ターゲットへデプロイ。
+scp libOpenCL.so pi@raspberrypi.local:/usr/local/lib/
+ssh pi@raspberrypi.local "sudo ldconfig"
+----
+
+デバイス上で *ネイティブに* ビルドする場合（Jetson では実用的、Pi では遅いが可能）、`-DCMAKE_TOOLCHAIN_FILE` 引数を省略します。
+
+[source,bash]
+----
+# Pi または Jetson 上で直接:
+git clone --recursive https://github.com/kpet/clvk.git
+cd clvk && mkdir build && cd build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLVK_COMPILER_AVAILABLE=OFF
+ninja OpenCL
+sudo cp libOpenCL.so /usr/local/lib/ && sudo ldconfig
+----
+
+=== clinfo による clvk の検証
+
+`clinfo` ユーティリティはシステム上に見えるすべての OpenCL プラットフォームとデバイスを報告します。`libOpenCL.so` をデプロイした後、テストしてください。
+
+[source,bash]
+----
+# ターゲットデバイス上。
+sudo apt install -y clinfo    # または古いディストロではソースからビルド
+
+LD_PRELOAD=/usr/local/lib/libOpenCL.so clinfo
+----
+
+成功出力は `clvk` や `Vulkan-backed OpenCL` のような名前のプラットフォームと、GPU デバイスエントリを示します。「No platforms found」が出る場合、`libOpenCL.so` がリンカー検索パス上にあること（`ldconfig -p | grep OpenCL`）と、Vulkan 対応ドライバがインストールされていること（まず `vulkaninfo --summary` が成功しなければならない）を再確認してください。
+
+=== 組み込み Linux 上の CMake プロジェクトへの clvk 統合
+
+`libOpenCL.so` がデプロイされたら、CMake プロジェクトからの消費は素直です。
+
+[source,cmake]
+----
+# プロジェクトの CMakeLists.txt 内:
+find_package(OpenCL REQUIRED)   # pkg-config または find_library 経由で libOpenCL.so を見つける
+target_link_libraries(my_vision_app OpenCL::OpenCL)
+----
+
+実行時、`LD_LIBRARY_PATH` または `ldconfig` は、存在するかもしれないベンダー提供 OpenCL ランタイムではなく、`clvk` ライブラリへ `libOpenCL.so` を解決しなければなりません。NVIDIA が独自の CUDA バック OpenCL を出荷する Jetson では、どのライブラリがロードされるかを意図的にしてください。
+
+[source,bash]
+----
+# NVIDIA OpenCL ランタイムの代わりに clvk を強制。
+LD_PRELOAD=/usr/local/lib/clvk/libOpenCL.so ./my_vision_app
+----
+
+=== clvk 経由で Raspberry Pi 上で OpenCL カーネルを動かす — 完全な例
+
+次のエンドツーエンド例は、`v3dv` Vulkan ドライババックの `clvk` 経由で Raspberry Pi 5 上で OpenCL ベクトルスケールカーネルを動かします。カーネルは第 5 章と同じもので、Pi 固有のものはありません。
+
+*ステップ 1: ホストで `clspv` によりカーネルをコンパイル。*
+
+[source,bash]
+----
+# x86 ホスト上（clspv は Linux x86-64 向けに利用可能）:
+clspv scale.cl -o scale.spv --spv-version=1.3
+scp scale.spv pi@raspberrypi.local:~/my_app/
+----
+
+*ステップ 2: Pi 上でホストアプリケーションを実行。*
+
+[source,bash]
+----
+# Pi 上でコンパイルして実行（またはクロスコンパイルしてバイナリを scp）。
+g++ -std=c++20 scale_host.cpp -o scale_app -lOpenCL
+./scale_app scale.spv
+----
+
+*ステップ 3: Vulkan が仕事をしていることを確認。*
+
+実行前に Vulkan Validation Layer を有効にし、`clvk` が `v3dv` ドライバ経由で呼び出しをルーティングしていることを検証します。
+
+[source,bash]
+----
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ./scale_app scale.spv 2>&1 | head -20
+# 「VUID」メッセージが見えるなら clvk は Vulkan と話している — メッセージなしはすべてクリーン。
+----
+
+== リアルタイムと安全の考慮
+
+多くの組み込みワークロードは厳しい期限（次の lidar フレームが来る前に処理しなければならない）や安全義務（インストルメントクラスタは決してフリーズしてはならない）を持ちます。
+
+*   **予測可能な**ディスパッチサイズを好み、カーネル内で反復回数が非有界なデータ依存ループを避ける。
+*   `vkQueueWaitIdle` に頼るのではなく、**タイムラインセマフォ**（第 8 章）で決定的で期限意識のパイプラインを構築する。
+*   認証が必要な場合、**Vulkan SC** をターゲットにする。非決定的振る舞いや実行時エラー報告を取り除き、オフライン検証された決定的実行モデルを好む。Vulkan SC 仕様は link:https://www.khronos.org/vulkansc/[khronos.org/vulkansc] で公開されています。
+*   長いデバイス寿命を考慮する。既知のドライバ版にピン留めし、それに対してカーネルを再検証する。フィールド更新は稀または不可能なことがある。
+
+== 追加ツールと参照
+
+下の表は、本章全体で参照したサードパーティツールを一箇所に集めます。
+
+[cols="1,1,1"]
+|===
+|ツール |目的 |リンク
+
+|Android Studio |NDK とネイティブデバッガ付き Android IDE |link:https://developer.android.com/studio[developer.android.com/studio]
+|Android NDK |Native Development Kit（Android 向け C{pp}） |link:https://developer.android.com/ndk[developer.android.com/ndk]
+|Android GPU Inspector（AGI） |Android 向けベンダー中立 Vulkan フレームプロファイラ |link:https://gpuinspector.dev/[gpuinspector.dev]
+|Arm Performance Studio |Mali/Immortalis プロファイリング + オフラインシェーダ分析 |link:https://developer.arm.com/Tools%20and%20Software/Arm%20Performance%20Studio[developer.arm.com]
+|Qualcomm Snapdragon Profiler |Adreno GPU プロファイラとカウンタキャプチャ |link:https://developer.qualcomm.com/software/snapdragon-profiler[developer.qualcomm.com]
+|PVRTune / PowerVR SDK |Imagination GPU プロファイリングとツール |link:https://developer.imaginationtech.com/pvrtune/[developer.imaginationtech.com]
+|CLion |SSH リモート開発付き C{pp} IDE |link:https://www.jetbrains.com/clion/[jetbrains.com/clion]
+|JetPack SDK |NVIDIA Jetson OS + Vulkan + CUDA |link:https://developer.nvidia.com/embedded/jetpack[developer.nvidia.com/embedded/jetpack]
+|Raspberry Pi OS |Mesa v3dv 付き Vulkan 対応 OS |link:https://www.raspberrypi.com/software/[raspberrypi.com/software]
+|Mesa v3dv |Raspberry Pi 向けオープンソース Vulkan ドライバ |link:https://docs.mesa3d.org/drivers/v3dv.html[docs.mesa3d.org/drivers/v3dv.html]
+|lavapipe（Mesa） |ヘッドレス CI 向け CPU ベース適合 Vulkan |link:https://docs.mesa3d.org/drivers/llvmpipe.html[docs.mesa3d.org/drivers/llvmpipe.html]
+|clvk |Vulkan 上の OpenCL 3.0 ランタイム |link:https://github.com/kpet/clvk[github.com/kpet/clvk]
+|clspv |OpenCL C から SPIR-V コンパイラ |link:https://github.com/google/clspv[github.com/google/clspv]
+|OpenCL-ICD-Loader |プラットフォーム非依存 OpenCL エントリポイントローダ |link:https://github.com/KhronosGroup/OpenCL-ICD-Loader[github.com/KhronosGroup/OpenCL-ICD-Loader]
+|Slang（slangc） |本チュートリアルの主シェーダ言語 |link:https://github.com/shader-slang/slang/releases[github.com/shader-slang/slang/releases]
+|Vulkan SC |自動車／医療向け安全クリティカル Vulkan プロファイル |link:https://www.khronos.org/vulkansc/[khronos.org/vulkansc]
+|===
+
+== まとめ
+
+組み込み Vulkan コンピュートは、モバイルのマインドセットを画面のない世界——SBC、エッジ AI モジュール、自動車クラスタ、ロボティクスコントローラ——へ拡張します。Android では、フル開発環境は NDK と CMake 付き **Android Studio**、`jniLibs` 共有ライブラリとしての `clvk`、オフラインでカーネルをコンパイルする `clspv` を中心とします。Raspberry Pi や Jetson のような組み込み Linux ターゲットでは、ネイティブ感のある IDE ループのために SSH 越しの **CLion Remote Development** を使うか、リソース制約のあるデバイス向けに aarch64 クロスコンパイルツールチェーンをセットアップしてください。`clvk` をビルド・デプロイして、カーネル書き換えなしで任意の OpenCL コードベースを Vulkan 専用ドライバへ移植してください。サーフェスとスワップチェーンを単純に省略して **ヘッドレス** で動かし、ドライバカバレッジがばらつくため能力を防御的に問い合わせ、決定的で期限意識のパイプラインでリアルタイムと安全の制約を尊重してください。本シリーズの残りのコンピュート技法は変更なしに当てはまります——ただし、さらに厳しく長寿命のエンベロープの中で生きなければなりません。
+
+xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/03_mobile_optimization.adoc[前へ: モバイル GPU 向け最適化] | xref:Advanced_Vulkan_Compute/conclusion.adoc[次へ: シリーズのまとめ]

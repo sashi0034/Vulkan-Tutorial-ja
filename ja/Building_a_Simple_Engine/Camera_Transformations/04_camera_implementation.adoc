@@ -1,0 +1,694 @@
+:pp: {plus}{plus}
+
+= カメラと変換: カメラ実装
+
+== カメラ実装
+
+数学的基礎と変換行列を理解したので、Vulkan アプリケーションに柔軟なカメラシステムを実装してみましょう。 3D シーンのナビゲートに使用できるカメラ クラスを作成します。この実装は汎用 3D アプリケーションまたはゲーム エンジン向けに設計されており、その概念は一人称ゲームから建築視覚化ツールまで、さまざまな種類のアプリケーションに適用できます。
+
+=== カメラの種類
+
+3D アプリケーションで一般的に使用されるカメラにはいくつかの種類があります。
+
+* *一人称カメラ*: キャラクターの目を通して世界を見ることをシミュレートします。
+* *三人称カメラ*: キャラクターを後ろから、または別の固定された相対位置から追跡します。
+* *軌道カメラ*: 固定点の周りを回転し、物体の検査に役立ちます。
+* *フリーカメラ*: 全方向に無制限に移動できます。
+
+実装では、さまざまなユースケースに合わせて構成できる多用途のカメラに焦点を当てます。
+
+=== カメラクラス設計
+
+私たちのカメラシステムは、3D ナビゲーションとビューの生成を管理する Camera クラスを中心に構築されています。各コンポーネントの背後にある技術的な詳細と設計上の決定の両方を理解するために、実装を論理的なセクションに分割してみましょう。
+
+=== カメラアーキテクチャ: コアデータメンバと空間表現
+
+まず、3D 空間内のカメラの位置、方向、座標系を表す基本的なデータ構造を確立します。
+
+[source,cpp]
+----
+class Camera {
+private:
+    // Spatial positioning and orientation vectors
+    // These form the camera's local coordinate system in world space
+    glm::vec3 position;     // Camera's location in world coordinates
+    glm::vec3 front;        // Forward direction (where camera is looking)
+    glm::vec3 up;           // Camera's local up direction (for roll control)
+    glm::vec3 right;        // Camera's local right direction (perpendicular to front and up)
+    glm::vec3 worldUp;      // Global up vector reference (typically Y-axis)
+----
+
+空間表現では右手座標系が使用され、カメラはワールド空間内で独自のローカル座標フレームを維持します。 `position` ベクトルはカメラが存在する場所を定義し、`front`、`up`、および `right` ベクトルはカメラの向きを定義する正規直交基底を形成します。このアプローチでは、カメラの現在の方向に対して、`front` ベクトルに沿って移動するとカメラが前方に移動し、`right` が横に移動し、`up` が垂直に移動する直感的な制御が提供されます。
+
+`worldUp` ベクトルは、適切な方向を維持するための基準点として機能し、通常はワールドの Y 軸に沿って指します。この基準により、複雑な回転中にカメラの向きが崩れるのを防ぎ、「地平線を水平にする」などの操作で一貫した基準点が確保されます。
+
+=== カメラアーキテクチャ: オイラー角表現と制御パラメータ
+
+次に、数学的な複雑さを内部で管理しながら、直感的なユーザー入力のためにオイラー角を使用して、回転がどのように表現および制御されるかを定義します。
+
+[source,cpp]
+----
+    // Rotation representation using Euler angles
+    // Provides intuitive control while managing gimbal lock and other rotation complexities
+    float yaw;              // Horizontal rotation around the world up-axis (left-right looking)
+    float pitch;            // Vertical rotation around the camera's right axis (up-down looking)
+
+    // User interaction and behavior parameters
+    // These control how the camera responds to input and environmental factors
+    float movementSpeed;    // Units per second for translation movement
+    float mouseSensitivity; // Multiplier for mouse input to rotation angle conversion
+    float zoom;             // Field of view control for perspective projection
+----
+
+オイラー角は、ユーザー入力デバイスに自然にマッピングされるカメラ回転の直感的なインターフェイスを提供します。ヨーは水平方向の回転 (左右を見る) を制御し、ピッチは垂直方向の回転 (上下を見る) を制御します。システムを拡張してロールをサポートすることも可能ですが、ユーザーが方向感覚を失う可能性があるため、ほとんどのアプリケーションではロールを意図的に避けています。
+
+パラメーター システムにより、さまざまなユースケースに合わせてカメラの動作を微調整できます。移動速度はさまざまなシーンのスケールに合わせて調整でき、マウスの感度はユーザーの好みやさまざまな入力デバイスに対応でき、ズームはゲームプレイや映画効果のための動的な視野制御を提供します。
+
+=== カメラアーキテクチャ: 内部メソッドと状態管理
+
+次に、数学的一貫性を維持し、回転が変化したときにカメラの座標系を更新する内部メソッドを定義します。
+
+[source,cpp]
+----
+    // Internal coordinate system maintenance
+    // Ensures mathematical consistency when orientation changes occur
+    void updateCameraVectors();
+
+public:
+----
+
+`updateCameraVectors` メソッドはカメラシステムの数学的基礎として機能し、オイラー角が変化するたびに `front`、`right`、`up` ベクトルを再計算します。このプロセスには、直観的なオイラー角表現を行列演算と移動計算に必要な正規直交ベクトル基底に変換する三角関数の計算が含まれます。
+
+このアプローチにより、ユーザーフレンドリーな角度インターフェイスが計算効率の高いベクトル演算から分離され、正確な 3D 変換に必要な数学的厳密性を維持しながら、カメラがシンプルなコントロールを提供できるようになります。
+
+=== カメラアーキテクチャ: 公開インターフェースとコンストラクタ設計
+
+次に、外部コードがカメラ インスタンスの作成、構成、および対話に使用するパブリック インターフェイスを確立します。
+
+[source,cpp]
+----
+    // Constructor with sensible defaults for common use cases
+    // Provides flexibility while ensuring the camera starts in a predictable state
+    Camera(
+        glm::vec3 position = glm::vec3(0.0f, 0.0f, 0.0f),  // Start at world origin
+        glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f),        // Y-axis as world up
+        float yaw = -90.0f,                                 // Look along negative Z-axis (OpenGL convention)
+        float pitch = 0.0f                                  // Level horizon
+    );
+----
+
+コンストラクターの設計には、一般的な 3D グラフィックスの規則と実際のデフォルトが反映されています。原点のデフォルト位置は予測可能な開始点を提供し、Y 軸ワールドは標準の数学座標系と一致します。 -90 度の初期ヨーは、デフォルト ビューが負の Z 軸を見下ろす OpenGL 規則に従い、ユーザーにとって自然に感じられる右手座標系を作成します。
+
+パラメーターのデフォルトにより、単純な使用例では複雑な初期化の必要がなくなりますが、特殊なアプリケーションで必要な場合には完全なカスタマイズが可能になります。
+
+=== カメラアーキテクチャ: 行列生成と幾何変換インターフェース
+
+次に、カメラの空間表現をグラフィックス パイプラインに必要な行列に変換するコアとなる数学的インターフェイスを定義します。
+
+[source,cpp]
+----
+    // Matrix generation for graphics pipeline integration
+    // These methods bridge between the camera's spatial representation and GPU requirements
+    glm::mat4 getViewMatrix() const;
+    glm::mat4 getProjectionMatrix(float aspectRatio, float nearPlane = 0.1f, float farPlane = 100.0f) const;
+----
+
+マトリックス生成方法は、直感的なカメラ表現と 3D グラフィックス パイプラインの数学的要件の間の重要な橋渡しとして機能します。ビュー マトリックスは世界座標をカメラ空間に変換し、カメラの視点を基準にして世界を効果的に配置します。次に、投影マトリックスはカメラ空間をクリップ空間に変換し、遠近効果を処理し、ラスター化のための座標を準備します。
+
+ビュー マトリックスと投影マトリックスの分離は標準グラフィックス パイプライン アーキテクチャに従っており、カメラの位置と遠近特性を独立して制御できます。この設計により、カメラの空間関係を再計算することなく、ズーム効果のために視野を変更するなどのテクニックが可能になります。
+
+=== カメラアーキテクチャ: 入力処理とユーザー操作
+
+最後に、カメラがさまざまな形のユーザー入力にどのように応答し、人間のインタラクションとカメラの動きの間のインターフェイスを提供するかを定義しましょう。
+
+[source,cpp]
+----
+    // Input processing methods for different interaction modalities
+    // Each method handles a specific type of user input with appropriate transformations
+    void processKeyboard(CameraMovement direction, float deltaTime);     // Keyboard-based translation
+    void processMouseMovement(float xOffset, float yOffset, bool constrainPitch = true);  // Mouse-based rotation
+    void processMouseScroll(float yOffset);                              // Scroll-based zoom control
+
+    // Property access methods for external systems
+    // Provide controlled access to internal state without exposing implementation details
+    glm::vec3 getPosition() const { return position; }
+    glm::vec3 getFront() const { return front; }
+    float getZoom() const { return zoom; }
+};
+----
+
+入力処理アーキテクチャは、カメラ制御において異なる入力モダリティが異なる目的を果たすことを認識します。通常、キーボード入力は個別の方向の動きを処理し、マウスの動きは連続的な回転制御を提供し、スクロール ホイールは直感的なズーム調整を提供します。各メソッドは、適切な数学的変換とタイミングを考慮して、その特定の入力タイプを処理するように設計されています。
+
+ゲッター メソッドは内部状態への制御されたアクセスを提供し、内部実装の詳細を公開したり、カメラの状態を制御されずに変更したりすることなく、外部システム (リスナーの位置を必要とするオーディオ システムや、ビューの方向を必要とするカリング システムなど) がカメラのプロパティにアクセスできるようにします。
+
+=== カメラ移動
+
+カメラの移動方向の列挙型を定義します。
+
+[source,cpp]
+----
+enum class CameraMovement {
+    FORWARD,
+    BACKWARD,
+    LEFT,
+    RIGHT,
+    UP,
+    DOWN
+};
+----
+
+そして、移動ロジックを実装します。
+
+[source,cpp]
+----
+void Camera::processKeyboard(CameraMovement direction, float deltaTime) {
+    float velocity = movementSpeed * deltaTime;
+
+    switch (direction) {
+        case CameraMovement::FORWARD:
+            position += front * velocity;
+            break;
+        case CameraMovement::BACKWARD:
+            position -= front * velocity;
+            break;
+        case CameraMovement::LEFT:
+            position -= right * velocity;
+            break;
+        case CameraMovement::RIGHT:
+            position += right * velocity;
+            break;
+        case CameraMovement::UP:
+            position += up * velocity;
+            break;
+        case CameraMovement::DOWN:
+            position -= up * velocity;
+            break;
+    }
+}
+----
+
+==== 入力イベントの処理
+
+カメラ クラスは入力を処理するメソッドを提供しますが、これらをアプリケーションの入力システムと統合するには、さまざまな入力モダリティとその固有の特性を注意深く考慮する必要があります。入力処理の実装を分解して、効果的なカメラ制御の背後にある技術的統合と設計原則の両方を実証しましょう。
+
+=== 入力統合: キーボード入力処理と移動変換
+
+まず、キーボードからの個別の方向入力を処理し、適切なフレームレートに依存せずにキーの押下をカメラの移動コマンドに変換します。
+
+[source,cpp]
+----
+// Keyboard input processing for camera translation
+// Handles discrete directional commands with frame-rate independent timing
+void processInput(GLFWwindow* window, Camera& camera, float deltaTime) {
+    // WASD movement scheme following standard FPS conventions
+    // Each key press translates to a specific directional movement relative to camera orientation
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+        camera.processKeyboard(CameraMovement::FORWARD, deltaTime);    // Move forward along camera's front vector
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+        camera.processKeyboard(CameraMovement::BACKWARD, deltaTime);   // Move backward opposite to front vector
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+        camera.processKeyboard(CameraMovement::LEFT, deltaTime);       // Strafe left along camera's right vector
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+        camera.processKeyboard(CameraMovement::RIGHT, deltaTime);      // Strafe right along camera's right vector
+
+    // Vertical movement controls for 3D navigation
+    // Space and Control provide intuitive up/down movement
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
+        camera.processKeyboard(CameraMovement::UP, deltaTime);         // Move up along camera's up vector
+    if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS)
+        camera.processKeyboard(CameraMovement::DOWN, deltaTime);       // Move down opposite to up vector
+}
+----
+
+キーボード入力処理は、WASD キーが水平方向の動きを制御し、Space/Control が垂直方向の動きを制御する、一人称視点ゲームで確立された規則に従います。このマッピングはユーザーにとって直感的であり、完全な 6 自由度の動き制御を提供します。デルタタイムによって実現されるフレーム レートの独立性により、レンダリング パフォーマンスに関係なく一貫した移動速度が保証されます。これは、さまざまなハードウェア構成にわたって予測可能なユーザー エクスペリエンスにとって重要です。
+
+各移動コマンドは、世界座標ではなくカメラのローカル座標系を使用します。 「前方」は常にカメラが向いている方向に移動し、「右」はビュー方向に対して垂直に移動し、「上」はカメラのローカル垂直軸に沿って移動します。このアプローチにより、カメラの向きの変化に自然に反応する直感的なコントロールが提供されます。
+
+=== 入力統合: マウス移動処理と回転状態管理
+
+次に、カメラの回転のための連続マウス入力を処理し、状態の永続性と座標系の変換を管理してスムーズなカメラ制御を行います。
+
+[source,cpp]
+----
+// Mouse movement callback for continuous camera rotation
+// Manages state persistence and coordinate transformations for smooth rotation control
+void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
+    // State persistence for calculating movement deltas
+    // Static variables maintain state between callback invocations
+    static bool firstMouse = true;          // Flag to handle initial mouse position
+    static float lastX = 0.0f, lastY = 0.0f;  // Previous mouse position for delta calculation
+
+    // Handle initial mouse position to prevent sudden camera jumps
+    // First callback provides absolute position, not relative movement
+    if (firstMouse) {
+        lastX = xpos;               // Initialize previous position
+        lastY = ypos;
+        firstMouse = false;         // Disable special handling for subsequent calls
+    }
+
+    // Calculate mouse movement deltas since last callback
+    // These deltas represent the amount and direction of mouse movement
+    float xoffset = xpos - lastX;                   // Horizontal movement (left-right)
+    float yoffset = lastY - ypos;                   // Vertical movement (inverted: screen Y increases downward, camera pitch increases upward)
+
+    // Update state for next callback iteration
+    lastX = xpos;
+    lastY = ypos;
+
+    // Convert mouse movement to camera rotation
+    // Delta values drive continuous camera orientation changes
+    camera.processMouseMovement(xoffset, yoffset);
+}
+----
+
+マウス コールバックは、イベント駆動型システムにおける連続入力の処理の複雑さを示しています。静的変数はコールバック呼び出し間の状態を維持します。これは、マウスの動きが相対的なデルタではなく絶対的な位置として報告されるために必要です。最初のマウスの処理により、マウス カーソルが最初にキャプチャされたときの不快なカメラ ジャンプが防止されます。
+
+Y 軸反転 (`lastY - ypos`) は、スクリーン空間 (Y が下方向に増加する) とカメラ空間 (正のピッチが上方向に見える) の間の座標系の不一致に対処します。この反転により、マウスを上に動かすとカメラが回転して上を向くようになり、他の 3D アプリケーションからのユーザーの期待と一致します。
+
+=== 入力統合: スクロール入力処理とズーム制御
+
+次に、スクロール ホイール入力を使用してズーム制御を行い、ユーザーにとって自然な視野調整のためのシンプルなインターフェイスを提供します。
+
+[source,cpp]
+----
+// Scroll wheel callback for zoom control
+// Provides intuitive field-of-view adjustment through scroll wheel interaction
+void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    // Direct scroll-to-zoom mapping
+    // Positive yoffset (scroll up) typically zooms in, negative (scroll down) zooms out
+    camera.processMouseScroll(yoffset);
+}
+----
+
+スクロール コールバックは、スクロール デルタをカメラのズーム処理メソッドに直接渡すことで単純さを維持します。この設計は、ズーム制御の数学的詳細をカメラ クラスに委任すると同時に、スクロール ホイール イベントにクリーンなインターフェイスを提供します。スクロール方向の規則 (ズームインの場合は正、ズームアウトの場合は負) は、標準のユーザー インターフェイス パターンに従います。
+
+=== 入力統合: システム統合と入力モード設定
+
+最後に、入力コールバックとウィンドウ システムの間の統合を確立し、完全なカメラ制御のためにマウス キャプチャとコールバック登録を構成します。
+
+[source,cpp]
+----
+// Input system initialization and callback registration
+// Establishes the connection between windowing system and camera control callbacks
+void setupInputCallbacks(GLFWwindow* window) {
+    // Register callback functions with the windowing system
+    // These establish the event-driven connection between hardware input and camera control
+    glfwSetCursorPosCallback(window, mouseCallback);        // Connect mouse movement to camera rotation
+    glfwSetScrollCallback(window, scrollCallback);          // Connect scroll wheel to camera zoom
+
+    // Configure mouse capture mode for first-person camera behavior
+    // Disabling the cursor provides continuous mouse input without cursor interference
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+}
+----
+
+システム統合は、カメラ コントロールがより広範なアプリケーション アーキテクチャとどのように統合されるかを示します。コールバック登録により、ハードウェア入力とカメラ応答の間にイベント駆動型の接続が作成され、カーソルの無効化により、3D アプリケーションで期待されるシームレスなマウス コントロールが提供されます。
+
+`GLFW_CURSOR_DISABLED` モードはマウス カーソルをキャプチャし、カーソルが画面の境界に当たることなく無制限にマウスを移動できます。この構成は、ユーザーがカーソルの制限なしにカメラをあらゆる方向に継続的に回転できることを期待する一人称視点のカメラ制御に不可欠です。
+
+[NOTE]
+====
+入力処理の具体的な実装は、ウィンドウ処理ライブラリとアプリケーション アーキテクチャによって異なります。上の例では GLFW を使用していますが、同様の原則が SDL、Qt、またはプラットフォーム固有の API などの他のライブラリにも適用されます。 GLFW での入力処理の詳細については、link:https://www.glfw.org/docs/latest/input_guide.html[GLFW入力ガイド] を参照してください。
+====
+
+=== カメラ回転
+
+カメラの回転では、マウス入力を使用してヨー角とピッチ角を調整します。
+
+[source,cpp]
+----
+void Camera::processMouseMovement(float xOffset, float yOffset, bool constrainPitch) {
+    xOffset *= mouseSensitivity;
+    yOffset *= mouseSensitivity;
+
+    yaw += xOffset;
+    pitch += yOffset;
+
+    // Constrain pitch to avoid flipping
+    if (constrainPitch) {
+        pitch = std::clamp(pitch, -89.0f, 89.0f);
+    }
+
+    // Update camera vectors based on updated Euler angles
+    updateCameraVectors();
+}
+----
+
+=== カメラベクトルの更新
+
+カメラの向きを変更した後、前方、右方、上方のベクトルを再計算する必要があります。
+
+[source,cpp]
+----
+void Camera::updateCameraVectors() {
+    // Calculate the new front vector
+    glm::vec3 newFront;
+    newFront.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+    newFront.y = sin(glm::radians(pitch));
+    newFront.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+    front = glm::normalize(newFront);
+
+    // Recalculate the right and up vectors
+    right = glm::normalize(glm::cross(front, worldUp));
+    up = glm::normalize(glm::cross(right, front));
+}
+----
+
+=== ビュー行列
+
+ビュー行列は、ワールド座標をビュー座標 (カメラ空間) に変換します。
+
+[source,cpp]
+----
+glm::mat4 Camera::getViewMatrix() const {
+    return glm::lookAt(position, position + front, up);
+}
+----
+
+=== プロジェクション行列
+
+射影行列はビュー座標をクリップ座標に変換します。
+
+[source,cpp]
+----
+glm::mat4 Camera::getProjectionMatrix(float aspectRatio, float nearPlane, float farPlane) const {
+    return glm::perspective(glm::radians(zoom), aspectRatio, nearPlane, farPlane);
+}
+----
+
+=== 発展トピック: 三人称カメラ実装
+
+このセクションでは、オクルージョンを回避し、キャラクターへのフォーカスを維持しながらキャラクターを追跡する三人称カメラを実装するための高度なテクニックを検討します。
+
+==== 三人称カメラの設計
+
+三人称カメラには通常、次のことが必要です。
+
+1. 指定された距離でキャラクターを追跡します
+2. キャラクターに対する一貫した見方を維持する
+3. 環境内のオブジェクトによって遮られるのを避ける
+4. 移動と回転中にスムーズな移行を実現
+
+キャラクター追従カメラシステム固有の課題に対応する専用の ThirdPersonCamera を構築し、これらの機能をサポートするようカメラクラスを拡張しましょう。
+
+=== 三人称カメラアーキテクチャ: ターゲット追跡と空間関係管理
+
+ものを見る目的に使用できなければ、カメラに何の意味があるでしょうか。  おそらく、キャラクターがお互いを見つめたり、カメラを見つめたりすることも必要でしょう。  「ルックアット」システムがどのように機能するのか、またカメラがどのようにターゲットを追跡するのかを理解することから、この作業を始めましょう。
+
+ゲッター メソッドは内部状態への制御されたアクセスを提供し、外部システム (リスナーの位置を必要とするオーディオ システムや、ビューの方向を必要とするカリング システムなど) が実装と密接に結合することなくカメラにクエリできるようにします。これにより、カメラの保守や機能の追加による拡張が容易になります。
+
+==== ルックアットの基本: カメラを何かに向ける
+
+カメラの動作を自動化する前に、「見る」ための直感を構築しましょう。考え方は単純です。カメラがどこにあるか (「目」) がわかっているとすると、カメラがどの点に向かうべきか (「ターゲット」) もわかり、どちらの方向が「上」であるかもわかります。  その情報を使用して、地平線を安定させながらカメラをターゲットに向ける方向を構築したいと考えています。
+
+実際のカメラを並べるように考えてください。
+
+- アイ：「私はどこに立っているの？」
+- ターゲット: 「ファインダーの中央に私は何を映しているでしょうか?」
+- 上: 「（写真が傾かないように）フレームの上部はどの方向を向くべきですか？」
+
+したがって、「look at」の出力に到達すると、ビューの方向が決まります。  通常、便宜上アフィン行列を使用しますが、それは単なる方向です。  結局のところ、何かを「見る」ために回転する場合、新しい位置に移動する必要はありません。そのため、目はルックアット コード全体にわたって位置を維持します。
+
+重要なポイント:
+
+- 「視線」は位置ではなく方向を定義します。位置は目から得られます。 look-at は、目→ターゲットと選択された上への方向 (前方/右/上) を計算します。
+- 上方向は目→ターゲット方向と平行であってはなりません。それらがほぼ揃っている場合、カメラは水平線を水平に保つ方法がわかりません (カメラは「予期せず回転する」可能性があります)。
+- ルックアットはカメラとオブジェクトの両方に使用できます。キャラクターは互いに向き合うことも、同じコンセプトでターゲットにスポットライトや砲塔を向けることもできます。
+
+次のセクションでは、この 1 回限りの「ターゲットをポイントする」というアイデアを動作に変換します。つまり、ジッターや突然のスナップを発生させずに、動く被写体を追跡するスムーズで継続的なカメラ ターゲットの追跡です。
+
+=== カメラとターゲット関係の実装
+
+まず、カメラとそのターゲットの間の基本的な関係を確立し、三人称カメラのすべての動作を制御する空間追跡情報を管理します。
+
+[source,cpp]
+----
+class ThirdPersonCamera : public Camera {
+private:
+    // Target entity tracking and spatial relationship data
+    // These properties define the relationship between camera and the character being followed
+    glm::vec3 targetPosition;      // Current world position of the target character
+    glm::vec3 targetForward;       // Target's forward direction vector for contextual camera positioning
+----
+
+ターゲット追跡システムは、カメラと追跡対象のキャラクターとの間の継続的な接続を維持することにより、三人称カメラの動作の基礎を形成します。 `targetPosition` はカメラが回転する空間アンカーを提供し、`targetForward` はキャラクターがどこを移動したり見たりしているかを予測できるコンテキスト認識型のカメラ位置決めを可能にします。
+
+このアプローチにより、カメラはキャラクターの状態と方向に基づいてインテリジェントな位置決定を行うことができ、単純な固定オフセット追従よりも動的で応答性の高いカメラ動作を作成できます。
+
+=== 三人称カメラアーキテクチャ: 挙動設定と制御パラメータ
+
+次に、カメラがターゲットに対してどのように動作するかを制御するパラメータに取り組んで、カメラの特性を芸術的およびゲームプレイで制御できるようにします。
+
+[source,cpp]
+----
+    // Camera behavior configuration parameters
+    // These values control the aesthetic and functional characteristics of camera following
+    float followDistance;          // Desired distance from target (affects intimacy and field of view)
+    float followHeight;            // Height offset above target (provides better scene visibility)
+    float followSmoothness;        // Interpolation factor for smooth camera transitions (0 = instant, 1 = never)
+----
+
+動作パラメータは、カメラの個性と機能特性を芸術的に制御します。追従距離は、キャラクターとの視覚的な親密さと、フレーム内に表示される周囲環境の量の両方に影響します。高さオフセットにより、カメラはキャラクターと周囲の地形や障害物の両方を良好に視認できるようになります。
+
+スムーズネス パラメーターは、ターゲットの動きに対するカメラの応答性を制御し、デザイナーが即時応答 (ぎくしゃくと感じる場合があります) とスムーズな動き (ラグを感じる場合があります) の間でバランスをとることができます。このパラメータは、さまざまなゲームプレイ状況に自然に反応するカメラの動作を作成するために重要です。
+
+=== 三人称カメラアーキテクチャ: 衝突検出とオクルージョン管理
+
+これで、基本的な状況で機能するカメラシステムが完成しました。  ただし、障害物が望ましい位置決めを妨げる場合でも、カメラがターゲットの可視性を維持することを保証する、環境オクルージョンの複雑な問題について簡単に説明しましょう。
+
+[source,cpp]
+----
+    // Occlusion avoidance and collision management
+    // These parameters control how the camera responds to environmental obstacles
+    float minDistance;             // Minimum allowed distance from target (prevents camera from getting too close)
+    float raycastDistance;         // Maximum distance for occlusion detection rays
+----
+
+オクルージョン管理システムは、三人称カメラ実装の最も困難な側面の 1 つである、環境ジオメトリが望ましいカメラ位置と干渉する場合の可視性の維持に対処します。最小距離は、衝突状況中にカメラがキャラクターに不快に近づくことを防ぎます。一方、レイキャスト距離は、潜在的なオクルージョンの問題に対してカメラがどれだけ先を見るかを定義します。
+
+このシステムにより、カメラは環境の制約に積極的に対応し、プレーヤーの方向感覚を失わせるような不快な遷移や突然の位置変更を行わずに、最適な視認性を維持するために位置をスムーズに調整することができます。
+
+=== 三人称カメラアーキテクチャ: 内部状態管理とモーション制御
+
+スムーズなカメラの動きを実現するには、カメラ アーキテクチャの FSM (有限状態マシン) 設計を理解できる必要があります。インテリジェントな位置決定に必要な内部計算状態を管理し、スムーズなカメラの動きの解決を支援します。
+
+[source,cpp]
+----
+    // Internal computational state for smooth motion control
+    // These variables manage the mathematical aspects of camera positioning and movement
+    glm::vec3 desiredPosition;     // Target position the camera wants to reach (before collision adjustments)
+    glm::vec3 smoothDampVelocity;  // Velocity state for smooth damping interpolation algorithms
+
+public:
+----
+
+内部状態管理により、望ましいカメラの動作と実際のカメラの位置が分離され、複数の力がカメラの位置に影響を与える複雑なシナリオをシステムが処理できるようになります。望ましい位置は、フォロー パラメーターに基づいてカメラが理想的に配置される場所を表し、滑らかな減衰速度により、物理学にインスピレーションを得た自然なカメラの動きを作成する高度な補間アルゴリズムが可能になります。
+
+この関心の分離により、カメラシステムは、望ましい位置と環境制約の間の矛盾を適切に処理し、カメラが望ましい位置から大幅に逸脱する必要がある場合でもスムーズな動きを維持することができます。
+
+=== 三人称カメラアーキテクチャ: 公開インターフェースと設定制御
+
+ここで、密結合を回避し、カメラを独自のモジュールとして維持できる方法で、ゲーム コードが三人称カメラシステムと対話し、設定できるようにする外部インターフェイスを調べてみましょう。
+
+[source,cpp]
+----
+    // Constructor with gameplay-tuned defaults
+    // Default values chosen for common third-person game scenarios
+    ThirdPersonCamera(
+        float followDistance = 5.0f,        // Medium distance providing good character visibility and environment context
+        float followHeight = 2.0f,          // Height above target for clear sightlines over low obstacles
+        float followSmoothness = 0.1f,      // Moderate smoothing for responsive but stable camera motion
+        float minDistance = 1.0f            // Minimum distance to prevent uncomfortable close-ups
+    );
+
+    // Core functionality methods for camera behavior control
+    void updatePosition(const glm::vec3& targetPos, const glm::vec3& targetFwd, float deltaTime);
+    void handleOcclusion(const Scene& scene);
+    void orbit(float horizontalAngle, float verticalAngle);
+
+    // Runtime configuration methods for dynamic camera adjustment
+    void setFollowDistance(float distance) { followDistance = distance; }
+    void setFollowHeight(float height) { followHeight = height; }
+    void setFollowSmoothness(float smoothness) { followSmoothness = smoothness; }
+};
+----
+
+パブリック インターフェイスのデザインは、使いやすさと強力な機能のバランスをとっており、一般的な第三者のシナリオに適した適切なデフォルトを提供すると同時に、必要に応じて完全なカスタマイズを可能にします。デフォルト値は、サードパーソン ゲームの一般的な要件に基づいて選択されます。つまり、キャラクターの視認性を高めるための中距離、環境認識のための適度な高さ、応答性がありながら安定したモーションのためのバランスの取れたスムージングです。
+
+メソッド構成では、コア更新機能 (通常、フレームごとに実行される) を、構成メソッド (それほど頻繁には呼び出されない) およびオービットなどの特殊な動作 (特定のユーザー入力によってトリガーされる可能性がある) から分離します。この設計により、懸念事項を明確に分離しながら、カメラをさまざまなゲーム ループ アーキテクチャに簡単に統合できます。
+
+==== 文字追従アルゴリズム
+
+三人称カメラの中核は、キャラクターに対してカメラを配置するアルゴリズムです。 `updatePosition` メソッドの実装は次のとおりです。
+
+[source,cpp]
+----
+void ThirdPersonCamera::updatePosition(
+    const glm::vec3& targetPos,
+    const glm::vec3& targetFwd,
+    float deltaTime
+) {
+    // Update target properties
+    targetPosition = targetPos;
+    targetForward = glm::normalize(targetFwd);
+
+    // Calculate the desired camera position
+    // Position the camera behind and above the character
+    glm::vec3 offset = -targetForward * followDistance;
+    offset.y = followHeight;
+
+    desiredPosition = targetPosition + offset;
+
+    // Smooth camera movement using exponential smoothing
+    position = glm::mix(position, desiredPosition, 1.0f - pow(followSmoothness, deltaTime * 60.0f));
+
+    // Update the camera to look at the target
+    front = glm::normalize(targetPosition - position);
+
+    // Recalculate right and up vectors
+    right = glm::normalize(glm::cross(front, worldUp));
+    up = glm::normalize(glm::cross(right, front));
+}
+----
+
+この実装:
+
+1. キャラクターの前向き方向に基づいてカメラをキャラクターの後ろに配置します。
+2. 高さを加えてキャラクターと周囲の様子を見やすくします
+3. 指数平滑化を使用して自然なカメラの動きを作成します
+4. 常にカメラの焦点をキャラクターに合わせ続ける
+
+==== オクルージョン回避
+
+三人称カメラの最も困難な側面の 1 つは、環境内のオブジェクトがキャラクターの視界を遮るオクルージョンの処理です。オクルージョン回避の実装は次のとおりです。
+
+[source,cpp]
+----
+void ThirdPersonCamera::handleOcclusion(const Scene& scene) {
+    // Cast a ray from the target to the desired camera position
+    Ray ray;
+    ray.origin = targetPosition;
+    ray.direction = glm::normalize(desiredPosition - targetPosition);
+
+    // Check for intersections with scene objects
+    RaycastHit hit;
+    if (scene.raycast(ray, hit, glm::length(desiredPosition - targetPosition))) {
+        // If there's an intersection, move the camera to the hit point
+        // minus a small offset to avoid clipping
+        float offsetDistance = 0.2f;
+        position = hit.point - (ray.direction * offsetDistance);
+
+        // Ensure we don't get too close to the target
+        float currentDistance = glm::length(position - targetPosition);
+        if (currentDistance < minDistance) {
+            position = targetPosition + ray.direction * minDistance;
+        }
+
+        // Update the camera to look at the target
+        front = glm::normalize(targetPosition - position);
+        right = glm::normalize(glm::cross(front, worldUp));
+        up = glm::normalize(glm::cross(right, front));
+    }
+}
+----
+
+この実装:
+
+1. キャラクターから希望のカメラ位置に光線をキャストします。
+2. 光線がオブジェクトに当たると、カメラがヒット ポイントに移動します (オフセットは小さい)
+3. カメラがキャラクターに近づきすぎないようにする
+4. キャラクターへのフォーカスを維持するためにカメラの向きを更新します
+
+===== オクルージョン回避のパフォーマンスに関する考慮事項
+
+オクルージョン回避を実装するときは、パフォーマンスに注意してください。
+
+* *単純化された衝突ジオメトリを使用*: レイキャストの場合は、レンダリング ジオメトリよりも単純な衝突形状を使用します。
+* *オクルージョン チェックの頻度を制限する*: 低速のデバイスではすべてのフレームをチェックする必要がない場合があります
+* *空間分割を考慮する*: オクツリーのような構造を使用して、レイと交差する可能性のないオブジェクトをすばやく排除することでレイキャストを高速化します。
+* *モバイル プラットフォーム向けに最適化*: パフォーマンスに制約のあるデバイスの場合は、オクルージョン アルゴリズムを簡素化するか、その精度を下げることを検討してください。
+
+==== 軌道制御の実装
+
+多くの三人称ゲームでは、プレイヤーはキャラクターの周りをカメラで周回できます。この機能を実装する方法は次のとおりです。
+
+[source,cpp]
+----
+void ThirdPersonCamera::orbit(float horizontalAngle, float verticalAngle) {
+    // Update yaw and pitch based on input
+    yaw += horizontalAngle;
+    pitch += verticalAngle;
+
+    // Constrain pitch to avoid flipping
+    pitch = std::clamp(pitch, -89.0f, 89.0f);
+
+    // Calculate the new camera position based on spherical coordinates
+    float radius = followDistance;
+    float yawRad = glm::radians(yaw);
+    float pitchRad = glm::radians(pitch);
+
+    // Convert spherical coordinates to Cartesian
+    glm::vec3 offset;
+    offset.x = radius * cos(yawRad) * cos(pitchRad);
+    offset.y = radius * sin(pitchRad);
+    offset.z = radius * sin(yawRad) * cos(pitchRad);
+
+    // Set the desired position
+    desiredPosition = targetPosition + offset;
+
+    // Update camera vectors
+    front = glm::normalize(targetPosition - desiredPosition);
+    right = glm::normalize(glm::cross(front, worldUp));
+    up = glm::normalize(glm::cross(right, front));
+}
+----
+
+この実装:
+
+1. ユーザー入力に基づいてカメラのヨーとピッチを更新します
+2. カメラが反転しないようにピッチを制限します。
+3. 球面座標を使用して新しいカメラ位置を計算します
+4. カメラの焦点をキャラクターに合わせ続ける
+
+==== キャラクターの動きとの統合
+
+完全な三人称カメラシステムを作成するには、それをキャラクターの動きと統合する必要があります。ゲーム ループで三人称カメラを使用する方法の例を次に示します。
+
+[source,cpp]
+----
+void gameLoop(float deltaTime) {
+    // Update character position and orientation based on input
+    character.update(deltaTime);
+
+    // Update camera position to follow the character
+    thirdPersonCamera.updatePosition(
+        character.getPosition(),
+        character.getForward(),
+        deltaTime
+    );
+
+    // Handle camera occlusion
+    thirdPersonCamera.handleOcclusion(scene);
+
+    // Process camera orbit input (if any)
+    if (mouseInputDetected) {
+        thirdPersonCamera.orbit(mouseDeltaX, mouseDeltaY);
+    }
+
+    // Get the view and projection matrices for rendering
+    glm::mat4 viewMatrix = thirdPersonCamera.getViewMatrix();
+    glm::mat4 projMatrix = thirdPersonCamera.getProjectionMatrix(aspectRatio);
+
+    // Use these matrices for rendering the scene
+    renderer.render(scene, viewMatrix, projMatrix);
+}
+----
+
+[NOTE]
+====
+より高度なカメラ技術については、xref:Building_a_Simple_Engine/Appendix/appendix.adoc[付録] の「高度なカメラ技術」セクションを参照してください。
+====
+
+次のセクションでは、カメラシステムを Vulkan と統合して 3D シーンをレンダリングします。
+
+xref:Building_a_Simple_Engine/Camera_Transformations/03_transformation_matrices.adoc[前へ: 変換行列] | xref:Building_a_Simple_Engine/Camera_Transformations/05_vulkan_integration.adoc[次へ: Vulkan の統合]

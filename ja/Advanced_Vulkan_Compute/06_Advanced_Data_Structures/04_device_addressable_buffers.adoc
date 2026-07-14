@@ -1,0 +1,103 @@
+:pp: {plus}{plus}
+
+= デバイスアドレス可能バッファ: ポインタのような柔軟性
+
+== ディスクリプタセット地獄の終わり
+
+Vulkan に時間を費やしたことがあるなら、**ディスクリプタセット** の苦痛を知っているでしょう。レイアウトの管理、プールの更新、ドローやディスパッチの前のセットバインドは、API で最もボイラープレートが多い部分の一つです。
+
+しかし何もバインドしなくてよかったらどうでしょう。生の 64 ビットアドレスをシェーダに渡し、C{pp} のポインタのようにメモリへ直接アクセスできたらどうでしょう。それが **Buffer Device Address（BDA）** の許すことです。
+
+== BDA とは？
+
+**Buffer Device Address**（Vulkan 1.1 で `VK_KHR_buffer_device_address`、Vulkan 1.2 からコア、Vulkan 1.3 から必須）により、任意の `VkBuffer` の 64 ビット GPU アドレスを問い合わせられます。このアドレスは生ポインタであり、他のバッファに格納したり、プッシュ定数経由でシェーダへ渡したり、異なるメモリ領域をまたぐ複雑でリンクされたデータ構造の構築にさえ使えます。
+
+NOTE: BDA はバッファにのみ適用されます。イメージは依然としてディスクリプタバインディング（またはバインドレスディスクリプタインデックス付け）が必要です——`VkImage` オブジェクト向けの同等の生アドレスパスはありません。
+
+BDA を使うには、`bufferDeviceAddress` 機能を有効にし、バッファを `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` で作成しなければなりません。
+
+[source,cpp]
+----
+// C++ 側: デバイスアドレスの取得
+vk::BufferDeviceAddressInfo info {
+    .buffer = *myBuffer // vk::raii::Buffer からハンドルを取り出す
+};
+uint64_t myGPUAddress = device.getBufferAddress(info);
+
+// myGPUAddress をプッシュ定数経由でシェーダへ渡す！
+----
+
+== シェーダ内の BDA
+
+Slang や GLSL では、この 64 ビットアドレスを生ポインタとして扱えます。多くのユースケースでディスクリプタセットの必要性を完全に迂回します。
+
+[source,slang]
+----
+// BDA を使う Slang 例
+struct MyData {
+    float4 value;
+    MyData* next; // 生の BDA ポインタ！
+};
+
+// 開始アドレスを 64 ビット整数（uint64_t）として受け取る
+void process(uint64_t startAddress) {
+    MyData* p = (MyData*)startAddress;
+
+    // C++ と同様に構造を走査できる！
+    while (p != nullptr) {
+        doSomething(p->value);
+        p = p->next;
+    }
+}
+----
+
+=== GLSL: buffer_reference
+
+GLSL では `GL_EXT_buffer_reference` と `GL_EXT_shader_explicit_arithmetic_types_int64` 拡張が必要です。生の C{pp} ポインタの代わりに、`buffer_reference` キーワードでバッファブロックへの「ポインタ」を定義します。
+
+[source,glsl]
+----
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+// バッファブロックを参照型として定義
+layout(buffer_reference, std430) buffer MyData {
+    vec4 value;
+    MyData next; // 別の MyData へのポインタ風参照
+};
+
+layout(push_constant) uniform Constants {
+    MyData startPtr; // 64 ビットアドレスを参照として受け取る
+};
+
+void main() {
+    MyData p = startPtr;
+
+    while (uint64_t(p) != 0) {
+        doSomething(p.value);
+        p = p.next;
+    }
+}
+----
+
+Slang 構文は C{pp} にはるかに近い一方、どちらも 64 ビットアドレス計算とメモリアクセス向けの同じ低レベル **SPIR-V** 命令を生成します。
+
+== なぜ BDA が画期的か
+
+1.  **ゼロバインドオーバーヘッド**: 単一のプッシュ定数または「ポインタバッファ」経由で何千ものバッファアドレスを単一シェーダへ渡せ、ディスクリプタプールとセット管理の CPU コストを完全に迂回できます。
+2.  **複雑なデータ構造**: ノードが他ノードへの実際の 64 ビットポインタを含む真のリンクリスト、木、グラフを構築でき、以前は不可能だった「ポインタチェイシング」が可能になります。
+3.  **ヘテロジニアスプログラミング**: BDA はポインタベースの GPU メモリモデルを可能にし、C{pp} のポインタベースの世界と Vulkan の明示的な世界のギャップを埋めます——高レベルコンピュート API が統一ポインタセマンティクスに使うのと同じ基盤です。
+
+=== 自由のコスト: 安全性と性能
+
+大きな力には大きな責任が伴います。Vulkan バリデーションレイヤがしばしば範囲外アクセスを捕捉できるディスクリプタセットと異なり、**BDA は生でチェックされません**。無効なアドレスにアクセスしたり範囲外へ行くと、有用なエラーメッセージは得られず——おそらく **GPU ハング**（画面が固まる）や「Device Lost」エラーを引き起こします。
+
+性能面では、BDA は一般に標準バッファアクセスと同程度に高速です。ただしハードウェアはアクセスされるバッファのサイズを知らないため、明示的ディスクリプタと同じキャッシュ最適化を常に行えるわけではありません。ほとんどの高度なコンピュートタスクでは、生ポインタの柔軟性がこれらの小さなトレードオフをはるかに上回ります。
+
+== まとめ
+
+64 ビットアトミック、サブグループ演算、生の Buffer Device Address を組み合わせることで、GPU 上に複雑で自律的なデータ構造を構築するために必要なすべての道具が揃いました。もはや伝統的コンピュートの「平坦配列」モデルに制限されません。
+
+次の章では、これをさらに進め、これらの構造を使ってレンダリングパイプライン全体を GPU から直接駆動する方法を見ます。**インダイレクトディスパッチと GPU 駆動パイプライン** です。
+
+xref:Advanced_Vulkan_Compute/06_Advanced_Data_Structures/03_global_atomic_management.adoc[前へ: グローバルアトミック管理] | xref:Advanced_Vulkan_Compute/07_GPU_Driven_Pipelines/01_introduction.adoc[次へ: インダイレクトディスパッチ]

@@ -1,0 +1,920 @@
+:pp: {plus}{plus}
+
+= エンジンアーキテクチャ: リソース管理
+
+== リソース管理
+
+効率的なリソース管理は、あらゆるレンダリングエンジンの重要な側面です。この節では、テクスチャ、メッシュ、シェーダー、マテリアルなど、さまざまな種類のリソースを管理する戦略を探ります。
+
+=== リソース管理の課題
+
+リソース管理システムを設計するときは、次の課題に対処する必要があります。
+
+1. *読み込みとアンロード* — リソースはディスクから読み込み、不要になったらアンロードする必要がある。
+2. *キャッシング* — 頻繁に使うリソースは冗長な読み込みを避けるためキャッシュすべき。
+3. *参照カウント* — リソースを使っているオブジェクト数を追跡し、安全にアンロードできるタイミングを知る。
+4. *ホットリロード* — アプリケーション実行中にリソースを更新できるようにする（開発時に有用）。
+5. *ストリーミング* — メインスレッドをブロックしないよう、リソースを非同期に読み込む。ここでの「ストリーミング」は、データをある場所から別の場所へチャンク単位で送る意味だと理解しておくとよい。ネットワークやインターネットダウンロードで馴染みのある種類のアルゴリズムと同じだが、システムメモリと GPU メモリ間のデータ転送に関係する点だけが異なる。
+6. *メモリ管理* — リソースのメモリを効率的に割り当て・解放する。
+
+=== リソースハンドル
+
+リソースポインタを直接公開する代わりに、リソースハンドルを使う方がよいことが多いです。
+
+[source,cpp]
+----
+// Resource handle
+template<typename T>
+class ResourceHandle {
+private:
+    std::string resourceId;
+    ResourceManager* resourceManager;
+
+public:
+    ResourceHandle() : resourceManager(nullptr) {}
+
+    ResourceHandle(const std::string& id, ResourceManager* manager)
+        : resourceId(id), resourceManager(manager) {}
+
+    T* Get() const {
+        if (!resourceManager) return nullptr;
+        return resourceManager->GetResource<T>(resourceId);
+    }
+
+    bool IsValid() const {
+        return resourceManager && resourceManager->HasResource<T>(resourceId);
+    }
+
+    const std::string& GetId() const {
+        return resourceId;
+    }
+
+    // Convenience operators
+    T* operator->() const {
+        return Get();
+    }
+
+    T& operator*() const {
+        return *Get();
+    }
+
+    operator bool() const {
+        return IsValid();
+    }
+};
+----
+
+ハンドルを直接ポインタの代わりに使うと、次の利点があります。
+
+1. *間接参照* — リソースマネージャは参照を無効化せずにメモリ上でリソースを移動できる。
+2. *検証* — 使用前にハンドルの有効性を確認できる。
+3. *自動リソース管理* — リソースマネージャはどのリソースが使用中かを追跡できる。
+
+=== 基本的なリソースマネージャ
+
+異なる種類のリソースを扱える基本的なリソースマネージャを実装しましょう。この実装には、レンダリングエンジン向けの効率的なリソース管理を提供するために連携する、いくつかの重要なステップが含まれます。
+
+=== リソースマネージャ: 基底リソースアーキテクチャと状態管理
+
+まず、リソース管理の基本インフラを確立し、システム内でリソースが識別子と読み込み状態をどう追跡するかを定義します。
+
+[source,cpp]
+----
+// Resource base class
+class Resource {
+private:
+    std::string resourceId;     // Unique identifier for this resource within the system
+    bool loaded = false;        // Loading state flag for resource lifecycle management
+
+public:
+    explicit Resource(const std::string& id) : resourceId(id) {}
+    virtual ~Resource() = default;
+
+    // Core resource identity and state access methods
+    const std::string& GetId() const { return resourceId; }
+    bool IsLoaded() const { return loaded; }
+
+    // Virtual interface for resource-specific loading and unloading behavior
+    bool Load() {
+        loaded = doLoad();
+        return loaded;
+    }
+
+    void Unload() {
+        doUnload();
+        loaded = false;
+    }
+
+    protected:
+        virtual bool doLoad() = 0;
+        virtual bool doUnload() = 0;
+};
+----
+
+Resource 基底クラスは、すべてのリソース型が満たすべき基盤となる契約を提供します。リソース ID は、リソースマネージャが特定のリソースを曖昧さなく探し参照できる一意の識別子として働きます。この文字列ベースのアプローチにより、「main_character_texture」や「level_1_audio」のような人が読めるリソース名を使えつつ、ファイルパスや他の命名方式を使う柔軟性も保てます。
+
+ブールフラグによる読み込み状態管理は、不可欠なライフサイクル追跡を提供します。この単純なアプローチにより、高価な検証チェックなしにリソースが使用可能かを素早く判定できます。仮想の読み込みインターフェースはポリモーフィックな振る舞いを可能にし、異なるリソース型が独自の専門的な読み込みロジックを実装しつつ、管理システムには一貫したインターフェースを提示できます。
+
+=== リソースマネージャ: ストレージアーキテクチャと型安全性
+
+次に、型安全性と効率的なアクセスパターンを保ちつつ、リソースを型ごとに整理するコアストレージシステムを実装します。
+
+[source,cpp]
+----
+// Resource manager
+class ResourceManager {
+private:
+    // Two-level storage system: organize by type first, then by unique identifier
+    // This approach enables type-safe resource access while maintaining efficient lookup
+    std::unordered_map<std::type_index,
+                       std::unordered_map<std::string, std::shared_ptr<Resource>>> resources;
+
+    // Two-level reference counting system for automatic resource lifecycle management
+    // First level maps resource type, second level maps resource IDs to their data
+    struct ResourceData {
+        std::shared_ptr<Resource> resource;  // The actual resource
+        int refCount;                        // Reference count for this resource
+    };
+    std::unordered_map<std::type_index,
+                       std::unordered_map<std::string, ResourceData>> refCounts;
+----
+
+ストレージアーキテクチャは、リソース管理におけるいくつかの重要な問題を解く、洗練された二段マッピングシステムを使います。外側のマップは `std::type_index` でキー付けされ、完全な型分離を保証し、異なるリソース型間の名前衝突を防ぎます。例えば、「stone」という名前のテクスチャと「stone」という名前の効果音を、型ごとの別コンテナに格納するため衝突なく持てます。
+
+内側のマップは個々のリソースに対して平均 O(1) のルックアップ性能を提供し、レンダリングシステムがフレームごとに数百〜数千のリソースにアクセスする必要があるときに重要です。`std::shared_ptr` の使用は自動メモリ管理を提供し、手動の寿命管理なしに異なるシステム間でリソースを安全に共有できます。
+
+参照カウントシステムは shared_ptr の参照カウントとは独立に動作し、アプリケーションレベルのライフサイクル制御を提供します。この分離により、リソースマネージャは単純なメモリ管理を超えるカスタム方針（例: 直近で参照されていなくても頻繁に使うリソースを読み込み済みのままにする）を実装できます。
+
+=== リソースマネージャ: リソース読み込みとキャッシングのロジック
+
+次に、キャッシング、参照カウント、エラー回復を扱い、効率的なリソース管理を行う賢いリソース読み込みシステムを実装します。
+
+[source,cpp]
+----
+public:
+    template<typename T>
+    ResourceHandle<T> Load(const std::string& resourceId) {
+        static_assert(std::is_base_of<Resource, T>::value, "T must derive from Resource");
+
+        // Step 3a: Check existing resource cache to avoid redundant loading
+        auto& typeResources = resources[std::type_index(typeid(T))];
+        auto it = typeResources.find(resourceId);
+
+        if (it != typeResources.end()) {
+            // Resource exists in cache - increment reference count and return handle
+            refCounts[resourceId]++;
+            return ResourceHandle<T>(resourceId, this);
+        }
+
+        // Step 3b: Create new resource instance and attempt loading
+        auto resource = std::make_shared<T>(resourceId);
+        if (!resource->Load()) {
+            // Loading failed - return invalid handle rather than corrupting cache
+            return ResourceHandle<T>();
+        }
+
+        // Step 3c: Cache successful resource and initialize reference tracking
+        typeResources[resourceId] = resource;
+        refCounts[resourceId] = 1;
+
+        return ResourceHandle<T>(resourceId, this);
+    }
+----
+
+読み込みロジックは、パフォーマンスとメモリ効率のバランスを取る洗練されたキャッシング戦略を実装します。キャッシュ優先のアプローチは冗長な I/O とリソース処理を防ぎ、大きなテクスチャ、複雑なメッシュ、コンパイル済みシェーダーではコストが高くなり得ます。この戦略は、同じリソースが複数のオブジェクトやシステムから参照されるレンダリングエンジンで特に重要です。
+
+コンパイル時型チェック付きのテンプレートベース設計は、基底 Resource クラスから派生する任意のリソース型と柔軟に連携しつつ型安全性を保証します。static_assert は開発中に明確なエラーメッセージを提供し、複雑なレンダリングシナリオでデバッグが難しい実行時型エラーを防ぎます。
+
+エラー処理は優雅な劣化の原則に従い、読み込み失敗時は例外を投げる・キャッシュを壊すのではなく無効なハンドルを返します。このアプローチにより、特定のアセットが利用できない・破損している場合でも、フォールバックリソースや代替レンダリングパスでレンダリングシステムを継続できます。
+
+=== リソースマネージャ: リソースアクセスと検証インターフェース
+
+その後、リソースライフサイクル全体を通じて適切な検証と型チェックを伴う、キャッシュ済みリソースへの安全なアクセス用インターフェースを提供します。
+
+[source,cpp]
+----
+    template<typename T>
+    T* GetResource(const std::string& resourceId) {
+        // Access type-specific resource container using compile-time type information
+        auto& typeResources = resources[std::type_index(typeid(T))];
+        auto it = typeResources.find(resourceId);
+
+        if (it != typeResources.end()) {
+            // Resource found - perform safe downcast and return typed pointer
+            return static_cast<T*>(it->second.get());
+        }
+
+        // Resource not found - return null for safe handling by caller
+        return nullptr;
+    }
+
+    template<typename T>
+    bool HasResource(const std::string& resourceId) {
+        // Efficient existence check without resource access overhead
+        auto resourceIt = resources.find(std::type_index(typeid(T)));
+        return resourceIt != resources.end();
+    }
+----
+
+リソースアクセスインターフェースは、安全性とパフォーマンスを同等に重視します。テンプレートベースのアプローチによりクライアントは常に正しく型付けされたリソースポインタを受け取り、手動キャストが不要になり、型関連の実行時エラーの可能性が減ります。static_cast が安全なのは、type_index ベースのストレージが各型固有コンテナに型 T のオブジェクトだけを格納することを保証するからです。
+
+存在チェックは、フルのリソースアクセスのオーバーヘッドなしにリソース可用性を検証する効率的な方法を提供します。この能力は条件付きレンダリングロジックで価値があり、高価なキャッシュミスや I/O を起こさずに、リソース可用性に基づいて代替レンダリングパスを選べます。
+
+=== リソースマネージャ: 参照カウントと自動クリーンアップ
+
+最後に、メモリリークを防ぎリソース利用を最適化するため、参照カウントと自動クリーンアップによる賢いリソースライフサイクル管理を実装します。
+
+[source,cpp]
+----
+    void Release(const std::string& resourceId) {
+        // Locate reference count entry for this resource
+        auto it = refCounts.find(resourceId);
+        if (it != refCounts.end()) {
+            it->second--;
+
+            // Check if resource has no remaining references
+            if (it->second <= 0) {
+                // Step 5a: Locate and unload the unreferenced resource across all type containers
+                for (auto& [type, typeResources] : resources) {
+                    auto resourceIt = typeResources.find(resourceId);
+                    if (resourceIt != typeResources.end()) {
+                        resourceIt->second->Unload();      // Allow resource to clean up its data
+                        typeResources.erase(resourceIt);   // Remove from cache
+                        break;
+                    }
+                }
+
+                // Step 5b: Clean up reference counting entry
+                refCounts.erase(it);
+            }
+        }
+    }
+
+    void UnloadAll() {
+        // Emergency cleanup method for system shutdown or major state changes
+        for (auto& [type, typeResources] : resources) {
+            for (auto& [id, resource] : typeResources) {
+                resource->Unload();     // Ensure all resources clean up properly
+            }
+            typeResources.clear();      // Clear type-specific containers
+        }
+        refCounts.clear();              // Reset all reference counts
+    }
+};
+----
+
+参照カウントシステムは、もはや積極的に使われていないリソースの自動ガベージコレクションを提供します。このアプローチはメモリリークを防ぎつつ、アプリケーション全体でリソース使用を常時監視するオーバーヘッドを避けます。デクリメントして確認するパターンにより、未使用になったリソースは即座にアンロードされ、メモリ使用を最適に保てます。
+
+クリーンアップ処理は徹底的かつ安全に設計され、キャッシュから取り除く前にリソースが内部データ（GPU メモリ、ファイルハンドルなど）を適切に解放する機会を確保します。この二相クリーンアップはリソースリークを防ぎ、エラー条件下でもシステムの安定性を保ちます。
+
+グローバルなアンロード機能は、レベル変更やアプリケーション終了のような大きな状態遷移用の安全弁を提供し、参照カウントに関わらずすべてのリソースを適切にクリーンアップしたいときに使います。この能力は、長時間実行で蓄積し得るリソースリークの防止に不可欠です。
+
+=== 具体的なリソース型の実装
+
+次に、異なるアセット型をリソース管理システムにどう統合できるかを示す、具体的なリソース型を実装します。これらの実装は、基底 Resource インターフェースの柔軟性を示しつつ、異なるコンテンツ型の固有要件に対応します。
+
+=== Texture リソースの実装
+
+Texture リソースはレンダリングエンジンで最も複雑なリソース型の一つであり、GPU メモリ、フォーマット変換、サンプリングパラメータの慎重な管理が必要です。技術的課題と設計上の解決の両方を示す論理フェーズに分けて実装を見ていきましょう。
+
+=== Texture リソース: リソース構造と Vulkan 状態管理
+
+まず、適切なテクスチャ利用に必要な GPU リソースとメタデータを含む、Vulkan テクスチャ管理に必要な基本データ構造を確立します。
+
+[source,cpp]
+----
+// Texture resource
+class Texture : public Resource {
+private:
+    // Core Vulkan GPU resources for texture representation
+    vk::Image image;              // GPU image object containing pixel data
+    vk::DeviceMemory memory;      // GPU memory allocation backing the image
+    vk::DeviceSize offset;        // Offset within the memory allocation for this texture
+    vk::ImageView imageView;      // Shader-accessible view into the image
+    vk::Sampler sampler;          // Sampling configuration (filtering, wrapping, etc.)
+
+    // Texture metadata for validation and debugging
+    int width = 0;                // Image width in pixels
+    int height = 0;               // Image height in pixels
+    int channels = 0;             // Number of color channels (RGB=3, RGBA=4, etc.)
+
+public:
+    explicit Texture(const std::string& id) : Resource(id) {}
+
+    ~Texture() override {
+        Unload();                 // Ensure proper cleanup when object is destroyed
+    }
+----
+
+Vulkan のテクスチャパイプラインは、完全なテクスチャ機能を提供するために連携する 4 つの異なる GPU オブジェクトを必要とします。`vk::Image` は GPU 上の実際のピクセルデータ格納を表し、`vk::DeviceMemory` はバッキングとなるメモリ割り当てを提供します。イメージとメモリの分離により、サブロケーションやメモリプーリングなどの高度なメモリ管理技法が可能になります。
+
+`vk::ImageView` はシェーダーとイメージデータ間のインターフェースとして働き、シェーダーがピクセルフォーマット、ミップマップレベル、配列レイヤーをどう解釈するかを定義します。`vk::Sampler` は、GPU がピクセル間をどう補間し、[0,1] 範囲外のテクスチャ座標をどう扱うかを制御するフィルタリングとアドレッシングモードをカプセル化します。この関心の分離により、同じイメージを異なるサンプリング設定で同時に使えます。
+
+=== Texture リソース: 読み込みパイプラインとデータ取得
+
+次に、慎重なエラー処理とフォーマット変換を通じて、ディスク上の画像ファイルを GPU 向けリソースへ変換するテクスチャ読み込みパイプラインを実装します。
+
+[source,cpp]
+----
+    bool Load() override {
+        // Step 2a: Construct file path using resource ID and expected format
+        std::string filePath = "textures/" + GetId() + ".ktx";
+
+        // Step 2b: Load raw image data from disk with format detection
+        unsigned char* data = LoadImageData(filePath, &width, &height, &channels);
+        if (!data) {
+            return false;           // Failed to load - return failure without partial state
+        }
+
+        // Step 2c: Transform raw pixel data into Vulkan GPU resources
+        CreateVulkanImage(data, width, height, channels);
+
+        // Step 2d: Clean up temporary CPU memory to prevent leaks
+        FreeImageData(data);
+
+        return Resource::Load();    // Mark resource as successfully loaded
+    }
+----
+
+読み込みパイプラインは、ファイルベースのデータから GPU リソースへの複雑な変換を扱う明確なシーケンスに従います。ファイルパス構築は、リソース ID を物理ファイルに対応付ける標準の命名規則を仮定し、プロジェクト全体で一貫したアセット整理を可能にします。KTX 形式を使うと、GPU ネイティブ形式の格納、ミップマップサポート、圧縮互換性などいくつかの利点があります。
+
+各段階でのエラー処理は、リソースを不整合な状態にし得る部分的な読み込み状態を防ぎます。画像データの読み込みが失敗した場合、関数は GPU リソースを作成せずに即座に戻り、Texture オブジェクトをクリーンな未読み込み状態に保ちます。このアプローチはリソースリークを防ぎ、呼び出し側のエラー回復をより予測可能にします。
+
+CPU 側画像データの一時性は、ピクセルデータが GPU へのアップロードに必要な間だけ必要となる典型的なテクスチャ読み込みワークフローを反映します。GPU リソースが作成・投入されたら、CPU コピーは安全に破棄でき、メモリ圧迫を減らし不要なデータ複製を防ぎます。
+
+=== Texture リソース: GPU リソースのクリーンアップとメモリ管理
+
+次に、テクスチャが不要になったときにすべての GPU リソースを適切に解放し、長時間実行アプリケーションでのメモリリークを防ぐ包括的なリソースクリーンアップを実装します。vk::raii オブジェクトを使っている場合、vk::raii オブジェクトのデストラクタが GPU リソースのクリーンアップを自動的に処理することに注意してください。一方、vk::Device オブジェクトを使っている場合は、メモリリークを防ぐために GPU リソースを手動で破棄する必要があります。さらに、vk::Device オブジェクト型のために defaultDispatcher を初期化しておく必要があります。vk::Device オブジェクトを使っている場合、以下の Unload 関数がオブジェクトの明示的な解放を詳述します。
+
+[source,cpp]
+----
+    void Unload() override {
+        // Only perform cleanup if resource is currently loaded
+        if (IsLoaded()) {
+            // Step 3a: Obtain device handle for resource destruction
+            vk::Device device = GetDevice();
+
+            // Step 3b: Destroy GPU objects in reverse creation order
+            // This ordering prevents use-after-free errors in GPU drivers
+            device.destroySampler(sampler);       // Destroy sampling configuration
+            device.destroyImageView(imageView);   // Destroy shader view
+            device.destroyImage(image);           // Destroy image object
+            device.freeMemory(memory);            // Release GPU memory allocation
+
+            // Step 3c: Update base class state to reflect unloaded status
+            Resource::Unload();
+        }
+    }
+
+    // Public interface for accessing Vulkan resources safely
+    vk::Image GetImage() const { return image; }
+    vk::ImageView GetImageView() const { return imageView; }
+    vk::Sampler GetSampler() const { return sampler; }
+----
+
+クリーンアップの順序は Vulkan のオブジェクト依存要件に従い、検証エラーや潜在的なドライバクラッシュを避けるため、オブジェクトは作成の逆順で破棄する必要があります。サンプラーとイメージビューはイメージに依存するため、先に破棄する必要があります。メモリ割り当てはイメージオブジェクトを支えるため最後に解放します。
+
+条件付きクリーンアップチェックは、Unload() が複数回呼ばれた場合に起こり得る二重破棄エラーを防ぎます。この安全機構は、エラー処理やシャットダウン時に複数のコードパスがクリーンアップを起こし得るリソース管理システムで特に重要です。
+
+公開ゲッターインターフェースは、実装詳細を公開したり外部コードがリソース状態を変更したりせずに、内部 Vulkan リソースへの制御されたアクセスを提供します。このカプセル化により、Texture オブジェクトは寿命全体を通じて GPU リソースを完全に制御し続けます。
+
+=== Texture リソース: ヘルパーメソッドと実装詳細
+
+最後に、画像読み込みと Vulkan リソース作成のプラットフォーム固有の詳細を扱う、支援インフラメソッドを提供します。
+
+[source,cpp]
+----
+private:
+    unsigned char* LoadImageData(const std::string& filePath, int* width, int* height, int* channels) {
+        // Implementation using stb_image or ktx library
+        // This method abstracts the details of different image format support
+        // and provides a consistent interface for pixel data loading
+        // ...
+        return nullptr; // Placeholder
+    }
+
+    void FreeImageData(unsigned char* data) {
+        // Implementation using stb_image or ktx library
+        // Ensures proper cleanup of image loader specific memory allocations
+        // Different libraries may require different cleanup approaches
+        // ...
+    }
+
+    void CreateVulkanImage(unsigned char* data, int width, int height, int channels) {
+        // Implementation to create Vulkan image, allocate memory, and upload data
+        // This involves complex Vulkan operations including:
+        // - Format selection based on channel count and data type
+        // - Memory allocation with appropriate usage flags
+        // - Image creation with optimal tiling and layout
+        // - Data upload via staging buffers for efficiency
+        // - Image view creation for shader access
+        // - Sampler creation with appropriate filtering settings
+        // ...
+    }
+
+    vk::Device GetDevice() {
+        // Get device from somewhere (e.g., singleton or parameter)
+        // Production code would use dependency injection or service location
+        // to provide the Vulkan device handle without tight coupling
+        // ...
+        return vk::Device(); // Placeholder
+    }
+};
+----
+
+ヘルパーメソッドは、テクスチャ読み込みと GPU リソース作成のプラットフォーム固有・ライブラリ固有の詳細を抽象化します。`LoadImageData` メソッドは異なる画像形式と読み込みライブラリのサポートをカプセル化し、STB Image、DevIL、FreeImage、その他の画像読み込みソリューションのどれを使っても一貫したインターフェースを提供します。
+
+`CreateVulkanImage` メソッドはテクスチャ管理で最も複雑な操作の一つを表し、フォーマット選択、メモリアラインメント、パフォーマンス最適化に注意を払った複数の Vulkan API 呼び出しを伴います。本番実装では通常、効率的なデータ転送にステージングバッファを使い、ミップマップ生成、フォーマット変換、圧縮サポートを含むことがあります。
+
+ここでプレースホルダとして示したデバイスアクセスパターンは、リソース管理システムでよくある設計課題を表します。コアエンジンサービスへのアクセスを、密結合を作らずにどう提供するかです。本番システムは通常、依存性注入、サービスロケーター、コンテキストオブジェクトを使って Vulkan デバイスや他のコアリソースへのアクセスを提供します。
+
+=== Mesh リソースの実装
+
+Mesh リソースは 3D レンダリングの幾何学的基盤を表し、3D オブジェクトの形状と構造を定義する頂点・インデックスデータを管理します。この実装は、幾何データ向けの GPU バッファリソースを効率的に管理する方法を示します。
+
+=== Mesh リソース: 幾何データ構造とバッファ管理
+
+まず、頂点属性とインデックス接続情報の両方を含む、GPU 上で幾何データを格納・管理するために必要な基本データ構造を確立します。
+
+[source,cpp]
+----
+// Mesh resource
+class Mesh : public Resource {
+private:
+    // Vertex data management - stores per-vertex attributes like position, normal, UV coordinates
+    vk::Buffer vertexBuffer;                // GPU buffer containing vertex attribute data
+    vk::DeviceMemory vertexBufferMemory;    // GPU memory backing the vertex buffer
+    vk::DeviceSize vertexBufferOffset;      // Offset within the memory allocation for vertex buffer
+    uint32_t vertexCount = 0;               // Number of vertices in this mesh
+
+    // Index data management - defines triangle connectivity using vertex indices
+    vk::Buffer indexBuffer;                 // GPU buffer containing triangle index data
+    vk::DeviceMemory indexBufferMemory;     // GPU memory backing the index buffer
+    vk::DeviceSize indexBufferOffset;       // Offset within the memory allocation for index buffer
+    uint32_t indexCount = 0;                // Number of indices in this mesh (typically 3 per triangle)
+
+public:
+    explicit Mesh(const std::string& id) : Resource(id) {}
+
+    ~Mesh() override {
+        Unload();                           // Ensure GPU resources are cleaned up
+    }
+----
+
+メッシュリソースアーキテクチャは、モダンなグラフィックス API のベストプラクティスに従い、頂点データとインデックスデータを別々の GPU バッファに分離します。頂点バッファは位置、法線、テクスチャ座標、色情報などの頂点ごとの属性を含み、インデックスバッファは頂点がどう接続して三角形を形成するかを定義します。この分離により効率的な頂点再利用が可能になり、1 つの頂点を複数の三角形から参照でき、典型的な 3D モデルのメモリ使用を大幅に削減します。
+
+バッファとメモリのペアリングは、バッファオブジェクトとそのバッキングメモリ割り当てが別々に管理される Vulkan の明示的メモリ管理モデルを反映します。このアプローチはメモリ割り当て戦略の細かい制御を提供し、レンダリングパフォーマンスに大きく影響し得るメモリプーリング、サブロケーション、カスタムアライメント要件などの技法を可能にします。
+
+カウント追跡は二重の目的を持ちます。処理する頂点数・インデックス数を指定するレンダリング呼び出しに不可欠な情報を提供し、バッファ内容が期待されるデータサイズと一致することをシステムが検証できるようにして検証とデバッグを可能にします。
+
+=== Mesh リソース: データ読み込みとフォーマット処理パイプライン
+
+次に、フォーマット解析とデータ検証を通じて、ファイルベースの幾何データを GPU 向けバッファリソースへ変換するメッシュ読み込みパイプラインを実装します。
+
+[source,cpp]
+----
+    bool Load() override {
+        // Step 2a: Construct file path using standardized naming convention
+        std::string filePath = "models/" + GetId() + ".gltf";
+
+        // Step 2b: Parse geometric data from file format into CPU-accessible structures
+        std::vector<Vertex> vertices;      // Temporary CPU storage for vertex attributes
+        std::vector<uint32_t> indices;     // Temporary CPU storage for triangle indices
+        if (!LoadMeshData(filePath, vertices, indices)) {
+            return false;                   // Failed to parse file - abort loading
+        }
+
+        // Step 2c: Transform CPU data into optimized GPU buffer resources
+        CreateVertexBuffer(vertices);       // Upload vertex attributes to GPU
+        CreateIndexBuffer(indices);         // Upload triangle connectivity to GPU
+
+        // Step 2d: Cache metadata for efficient rendering operations
+        vertexCount = static_cast<uint32_t>(vertices.size());
+        indexCount = static_cast<uint32_t>(indices.size());
+
+        return Resource::Load();            // Mark resource as successfully loaded
+    }
+----
+
+読み込みパイプラインは、ファイル解析と GPU リソース作成を分離する構造化されたアプローチに従い、より良いエラー処理とコード再利用を可能にします。glTF 形式の選択は、業界標準のメッシュ表現、埋め込みマテリアル情報、スケルタルアニメーションやモーフターゲットなどの高度な機能のサポートなど、いくつかの利点を提供します。
+
+一時的な CPU 側ストレージのアプローチにより、GPU リソースにコミットする前の幾何データの検証と処理が可能になります。この中間ステップにより、頂点キャッシュ最適化、トライアングルストリップ生成、LOD 処理など、レンダリングパフォーマンスを大きく改善し得るメッシュ最適化技法が可能になります。
+
+メタデータキャッシング戦略は、レンダリング中の高価な GPU クエリを避けるため、頻繁にアクセスする情報をローカルに格納します。これらのカウントはドローコールに不可欠で、GPU は処理する頂点数と描画する三角形数を正確に知る必要があり、ローカル格納は GPU バッファを繰り返しクエリするよりはるかに効率的です。
+
+=== Mesh リソース: GPU リソースのクリーンアップとメモリ回収
+
+次に、メッシュが不要になったときにすべての GPU リソースとメモリ割り当てを適切に解放し、長時間実行アプリケーションでの堅牢なメモリ管理を確保する包括的なクリーンアップを実装します。前述のとおり、vk::raii オブジェクトを使っている場合、デストラクタが GPU リソースのクリーンアップを自動処理します。一方、vk::Device オブジェクトを使っている場合は、メモリリークを防ぐために手動で破棄する必要があります。さらに、vk::Device オブジェクト型のために defaultDispatcher を初期化しておく必要があります。vk::Device オブジェクトを使っている場合、以下の Unload 関数がオブジェクトの明示的な解放を詳述します。
+
+[source,cpp]
+----
+    void Unload() override {
+        // Only proceed with cleanup if resources are currently loaded
+        if (IsLoaded()) {
+            // Phase 3a: Obtain device handle for resource destruction
+            vk::Device device = GetDevice();
+
+            // Phase 3b: Destroy buffers and free GPU memory in proper sequence
+            // Index resources cleaned up first to maintain clear dependency order
+            device.destroyBuffer(indexBuffer);         // Destroy index buffer object
+            device.freeMemory(indexBufferMemory);      // Release index buffer memory
+
+            // Vertex resources cleaned up second
+            device.destroyBuffer(vertexBuffer);        // Destroy vertex buffer object
+            device.freeMemory(vertexBufferMemory);     // Release vertex buffer memory
+
+            // Phase 3c: Update base class state to reflect unloaded condition
+            Resource::Unload();
+        }
+    }
+
+    // Public interface for safe access to GPU resources and metadata
+    vk::Buffer GetVertexBuffer() const { return vertexBuffer; }
+    vk::Buffer GetIndexBuffer() const { return indexBuffer; }
+    uint32_t GetVertexCount() const { return vertexCount; }
+    uint32_t GetIndexCount() const { return indexCount; }
+----
+
+クリーンアップの順序は、検証エラーやドライバ不安定を起こさずに GPU リソースを適切に解放することを保証します。Vulkan はバッファ破棄に厳密な順序要件を課しませんが、一貫したパターン（インデックスリソースを頂点リソースより先）に従うと、問題発生時のコード予測性とデバッグが容易になります。
+
+条件付きクリーンアップチェックは、エラー処理中や複数システムが同時にクリーンアップしようとするときに起こり得る二重破棄シナリオを防ぎます。この安全機構は、リソース所有が複数コンポーネント間で共有され得る複雑なレンダリングシステムで特に重要です。
+
+公開アクセスインターフェースはカプセル化を保ちつつ、内部 GPU リソースへの制御されたアクセスを提供します。これらのゲッターメソッドにより、レンダリングシステムはドロー操作に適切なバッファをバインドでき、外部コードがメッシュの内部状態を誤って変更したり、時期尚早なリソース破棄を起こしたりするのを防ぎます。
+
+=== Mesh リソース: ヘルパーメソッドと実装支援インフラ
+
+最終フェーズでは、完全なメッシュリソース機能に必要なメッシュデータ解析、バッファ作成、システム統合の複雑な詳細を扱う支援メソッドを提供します。
+
+[source,cpp]
+----
+private:
+    bool LoadMeshData(const std::string& filePath, std::vector<Vertex>& vertices, std::vector<uint32_t>& indices) {
+        // Implementation using tinygltf or similar library
+        // This method handles the complex task of:
+        // - Opening and validating the mesh file format
+        // - Parsing vertex attributes (positions, normals, UVs, etc.)
+        // - Extracting index data that defines triangle connectivity
+        // - Converting from file format to engine-specific vertex structures
+        // - Performing validation to ensure data integrity
+        // ...
+        return true; // Placeholder
+    }
+
+    void CreateVertexBuffer(const std::vector<Vertex>& vertices) {
+        // Implementation to create Vulkan buffer, allocate memory, and upload data
+        // This involves several complex Vulkan operations:
+        // - Calculating buffer size requirements based on vertex count and structure
+        // - Creating buffer with appropriate usage flags (vertex buffer usage)
+        // - Allocating GPU memory with optimal memory type selection
+        // - Uploading data via staging buffer for efficient transfer
+        // - Setting up memory barriers to ensure data availability
+        // ...
+    }
+
+    void CreateIndexBuffer(const std::vector<uint32_t>& indices) {
+        // Implementation to create Vulkan buffer, allocate memory, and upload data
+        // Similar to vertex buffer creation but optimized for index data:
+        // - Buffer creation with index buffer specific usage flags
+        // - Memory allocation optimized for read-heavy access patterns
+        // - Efficient data transfer using appropriate staging mechanisms
+        // - Index format validation (16-bit vs 32-bit indices)
+        // ...
+    }
+
+    vk::Device GetDevice() {
+        // Get device from somewhere (e.g., singleton or parameter)
+        // Production implementations typically use dependency injection
+        // to avoid tight coupling between resource classes and core engine systems
+        // ...
+        return vk::Device(); // Placeholder
+    }
+};
+----
+
+ヘルパーメソッドはメッシュリソース管理で最も複雑な側面をカプセル化し、実装詳細を隠しつつコアの読み込み・作成ロジックにきれいなインターフェースを提供します。`LoadMeshData` メソッドは異なるメッシュファイル形式と解析ライブラリの複雑さを抽象化し、リソースシステムが一貫したインターフェース経由で複数形式をサポートできるようにします。
+
+バッファ作成メソッドはメッシュリソースシステムで最もパフォーマンスが重要なコードの一部であり、非効率な GPU メモリ管理はレンダリングパフォーマンスに大きく影響し得ます。本番実装では通常、データアップロードにステージングバッファを使い、割り当てオーバーヘッドを減らすメモリプーリングを実装し、GPU アーキテクチャ特性に基づいてメモリ型を慎重に選択します。
+
+デバイスアクセスパターンは、リソース管理システムでよくあるアーキテクチャ課題——利便性と疎結合のバランス——を示します。グローバルシングルトンへの直接アクセスは実装を単純化できますが、本番システムは通常、コアエンジンサービスへのアクセスを提供しつつテスト容易性と柔軟性を保つために、依存性注入やサービスロケーターパターンを使います。
+
+=== Shader リソースの実装
+
+Shader リソースはグラフィックスパイプラインのプログラマブルステージを表し、シェーダープログラムのコンパイル、読み込み、実行時管理を行います。
+この実装は、SPIR-V シェーダーモジュールの扱い方と、開発中のホットリロードサポートを含むシェーダーステージ管理のきれいなインターフェースを示します。
+
+[source,cpp]
+----
+// Shader resource
+class Shader : public Resource {
+private:
+    vk::ShaderModule shaderModule;
+    vk::ShaderStageFlagBits stage;
+
+public:
+    Shader(const std::string& id, vk::ShaderStageFlagBits shaderStage)
+        : Resource(id), stage(shaderStage) {}
+
+    ~Shader() override {
+        Unload();
+    }
+
+    bool Load() override {
+        // Determine file extension based on shader stage
+        std::string extension;
+        switch (stage) {
+            case vk::ShaderStageFlagBits::eVertex: extension = ".vert"; break;
+            case vk::ShaderStageFlagBits::eFragment: extension = ".frag"; break;
+            case vk::ShaderStageFlagBits::eCompute: extension = ".comp"; break;
+            default: return false;
+        }
+
+        // Load shader from file
+        std::string filePath = "shaders/" + GetId() + extension + ".spv";
+
+        // Read shader code
+        std::vector<char> shaderCode;
+        if (!ReadFile(filePath, shaderCode)) {
+            return false;
+        }
+
+        // Create shader module
+        CreateShaderModule(shaderCode);
+
+        return Resource::Load();
+    }
+
+    void Unload() override {
+        // Destroy Vulkan resources
+        if (IsLoaded()) {
+            // Get device from somewhere (e.g., singleton or parameter)
+            vk::Device device = GetDevice();
+
+            device.destroyShaderModule(shaderModule);
+
+            Resource::Unload();
+        }
+    }
+
+    // Getters for Vulkan resources
+    vk::ShaderModule GetShaderModule() const { return shaderModule; }
+    vk::ShaderStageFlagBits GetStage() const { return stage; }
+
+private:
+    bool ReadFile(const std::string& filePath, std::vector<char>& buffer) {
+        // Implementation to read binary file
+        // ...
+        return true; // Placeholder
+    }
+
+    void CreateShaderModule(const std::vector<char>& code) {
+        // Implementation to create Vulkan shader module
+        // ...
+    }
+
+    vk::Device GetDevice() {
+        // Get device from somewhere (e.g., singleton or parameter)
+        // ...
+        return vk::Device(); // Placeholder
+    }
+};
+----
+
+=== リソースマネージャの利用
+
+アプリケーションでリソースマネージャを使う例です。
+
+[source,cpp]
+----
+// Create resource manager
+ResourceManager resourceManager;
+
+// Load resources
+auto texture = resourceManager.Load<Texture>("brick");
+auto mesh = resourceManager.Load<Mesh>("cube");
+auto vertexShader = resourceManager.Load<Shader>("basic", vk::ShaderStageFlagBits::eVertex);
+auto fragmentShader = resourceManager.Load<Shader>("basic", vk::ShaderStageFlagBits::eFragment);
+
+// Use resources
+if (texture && mesh && vertexShader && fragmentShader) {
+    // Create material using shaders
+    Material material(vertexShader, fragmentShader);
+
+    // Set texture in material
+    material.SetTexture("diffuse", texture);
+
+    // Create entity with mesh and material
+    Entity entity("MyEntity");
+    auto meshComponent = entity.AddComponent<MeshComponent>(mesh.Get(), &material);
+}
+
+// Resources will be automatically released when handles go out of scope
+// or you can explicitly release them
+resourceManager.Release(texture.GetId());
+----
+
+=== 高度なリソース管理技法
+
+==== 非同期読み込み
+
+大きなリソースでは、メインスレッドをブロックしないよう非同期に読み込むことがしばしば有益です。
+
+[source,cpp]
+----
+class AsyncResourceManager {
+private:
+    ResourceManager resourceManager;
+    std::thread workerThread;
+    std::queue<std::function<void()>> taskQueue;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    bool running = false;
+
+public:
+    AsyncResourceManager() {
+        Start();
+    }
+
+    ~AsyncResourceManager() {
+        Stop();
+    }
+
+    void Start() {
+        running = true;
+        workerThread = std::thread([this]() {
+            WorkerThread();
+        });
+    }
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            running = false;
+        }
+        condition.notify_one();
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+    }
+
+    template<typename T>
+    void LoadAsync(const std::string& resourceId, std::function<void(ResourceHandle<T>)> callback) {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        taskQueue.push([this, resourceId, callback]() {
+            auto handle = resourceManager.Load<T>(resourceId);
+            callback(handle);
+        });
+        condition.notify_one();
+    }
+
+private:
+    void WorkerThread() {
+        while (running) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                condition.wait(lock, [this]() {
+                    return !taskQueue.empty() || !running;
+                });
+
+                if (!running && taskQueue.empty()) {
+                    return;
+                }
+
+                task = std::move(taskQueue.front());
+                taskQueue.pop();
+            }
+
+            task();
+        }
+    }
+};
+
+// Usage example
+AsyncResourceManager asyncResourceManager;
+
+asyncResourceManager.LoadAsync<Texture>("large_texture", [](ResourceHandle<Texture> texture) {
+    // This callback will be called when the texture is loaded
+    if (texture) {
+        std::cout << "Texture loaded successfully!" << std::endl;
+    } else {
+        std::cout << "Failed to load texture." << std::endl;
+    }
+});
+----
+
+==== リソースストリーミング
+
+高解像度テクスチャや詳細なメッシュのような非常に大きなリソースでは、ストリーミングの実装を検討できます。
+
+1. *Level of Detail (LOD)* — まず低解像度版を読み込み、その後より高解像度版を段階的に読み込む。
+2. *テクスチャストリーミング* — 最小のものから順に、ミップマップレベルを段階的に読み込む。
+3. *メッシュストリーミング* — まず簡略化版のメッシュを読み込み、その後ディテールを追加する。
+
+==== ホットリロード
+
+開発中は、アプリケーションを再起動せずにリソースを更新できると便利です。
+
+[source,cpp]
+----
+class HotReloadResourceManager : public ResourceManager {
+private:
+    std::unordered_map<std::string, std::filesystem::file_time_type> fileTimestamps;
+    std::thread watcherThread;
+    bool running = false;
+
+public:
+    HotReloadResourceManager() {
+        StartWatcher();
+    }
+
+    ~HotReloadResourceManager() {
+        StopWatcher();
+    }
+
+    void StartWatcher() {
+        running = true;
+        watcherThread = std::thread([this]() {
+            WatcherThread();
+        });
+    }
+
+    void StopWatcher() {
+        running = false;
+        if (watcherThread.joinable()) {
+            watcherThread.join();
+        }
+    }
+
+    template<typename T>
+    ResourceHandle<T> Load(const std::string& resourceId) {
+        auto handle = ResourceManager::Load<T>(resourceId);
+
+        // Store file timestamp
+        std::string filePath = GetFilePath<T>(resourceId);
+        try {
+            fileTimestamps[filePath] = std::filesystem::last_write_time(filePath);
+        } catch (const std::filesystem::filesystem_error& e) {
+            // File doesn't exist or can't be accessed
+        }
+
+        return handle;
+    }
+
+private:
+    template<typename T>
+    std::string GetFilePath(const std::string& resourceId) {
+        // Determine file path based on resource type and ID
+        if constexpr (std::is_same_v<T, Texture>) {
+            return "textures/" + resourceId + ".ktx";
+        } else if constexpr (std::is_same_v<T, Mesh>) {
+            return "models/" + resourceId + ".gltf";
+        } else if constexpr (std::is_same_v<T, Shader>) {
+            // Simplified for example
+            return "shaders/" + resourceId + ".spv";
+        } else {
+            return "";
+        }
+    }
+
+    void WatcherThread() {
+        while (running) {
+            // Check for file changes
+            for (auto& [filePath, timestamp] : fileTimestamps) {
+                try {
+                    auto currentTimestamp = std::filesystem::last_write_time(filePath);
+                    if (currentTimestamp != timestamp) {
+                        // File has changed, reload resource
+                        ReloadResource(filePath);
+                        timestamp = currentTimestamp;
+                    }
+                } catch (const std::filesystem::filesystem_error& e) {
+                    // File doesn't exist or can't be accessed
+                }
+            }
+
+            // Sleep to avoid high CPU usage
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    void ReloadResource(const std::string& filePath) {
+        // Extract resource ID and type from file path
+        // Reload the resource
+        // ...
+    }
+};
+----
+
+=== まとめ
+
+よく設計されたリソース管理システムは、レンダリングエンジンでアセットを効率的に扱ううえで不可欠です。この節で述べた技法を実装することで、次のようなシステムを作れます。
+
+1. リソースを効率的に読み込み・アンロードする
+2. キャッシングにより冗長な読み込みを防ぐ
+3. 参照カウントによりメモリ使用を管理する
+4. より良いパフォーマンスのための非同期読み込みをサポートする
+5. より速い開発のためのホットリロードを可能にする
+
+次の節では、柔軟で効率的なレンダリングシステムを作るためにリソース管理システムの上に築く、レンダリングパイプライン設計を探ります。
+
+xref:Building_a_Simple_Engine/Engine_Architecture/03_component_systems.adoc[前へ: コンポーネントシステム] | xref:Building_a_Simple_Engine/Engine_Architecture/05_rendering_pipeline.adoc[次へ: レンダリングパイプライン]

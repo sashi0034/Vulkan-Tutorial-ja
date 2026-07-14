@@ -1,0 +1,25 @@
+= SIGGRAPH 2025: ダイナミックレンダリングを使った Vulkan レイトレーシング実践 — 帰属表示
+
+このフォルダには、「SIGGRAPH 2025: Hands-on Vulkan Ray Tracing with Dynamic Rendering」ラボの教材が含まれています。
+
+公式イベントページ:
+- https://www.khronos.org/events/siggraph-2025#vulkan-ray-tracing-lab
+
+セッション詳細（SIGGRAPH の掲載より）:
+
+- タイトル: Hands-on Vulkan Ray Tracing With Dynamic Rendering
+- 日時: Thursday, August 14 — 11:45am–1:15pm（SIGGRAPH Lab）
+- 場所: Vancouver Convention Centre, West Building, Exhibit Hall B
+- 備考: 参加には SIGGRAPH の登録が必要です。座席数に限りがあり、先着順です。
+
+著者／発表者:
+
+- Jose Emilio Muñoz Lopez（Arm）
+- Steve Winston（Holochip）
+
+帰属表示:
+
+- ここでの教材の流れとラボ内容は、上記 SIGGRAPH 2025 ラボから適応したものです。本資料を参照または再利用する際は、上記の著者を引用してください。
+- コードとガイダンスの一部は、オープンソースの Khronos Vulkan Tutorial を基にしており、ラボ説明で言及されている Vulkan-RAII などのヘルパーライブラリを使用しています。
+
+公式の SIGGRAPH 掲載（タイトル、時間、場所、発表者）と食い違いがある場合は、帰属表示を速やかに修正できるよう issue を開いてください。

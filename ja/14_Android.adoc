@@ -1,0 +1,843 @@
+:pp: {plus}{plus}
+
+= Android: Vulkan アプリをモバイルへ
+
+== はじめに
+
+前章では、Vulkan プロファイルが機能検出を単純化し、コードの保守性をどう高めるかを探りました。今度は、Android でアプリケーションをモバイルの世界へ持ち込み、Vulkan の知識をさらに一歩進めましょう。
+
+Vulkan は当初からクロスプラットフォームに設計されていますが、Android へのデプロイには新しい課題と機会があります。コアの Vulkan API は同じままですが、ウィンドウ管理からビルドシステムまで、周囲のエコシステムには異なるアプローチが必要です。
+
+この章では、できるだけ多くのコードを再利用しつつ、プラットフォーム固有の要件に対応して、Vulkan アプリケーションを Android 向けに適応させる方法を案内します。適切なセットアップがあれば、デスクトップとモバイルの両方で動く単一のコードベースを維持できることが分かるでしょう。
+
+== Android 固有の考慮事項
+
+実装の詳細に入る前に、デスクトップと比べて Android 向けに Vulkan アプリケーションを開発するときの主な違いを理解しましょう。
+
+1. *ウィンドウシステム統合*: GLFW の代わりに、Android のネイティブウィンドウシステムとアクティビティライフサイクルを使う。
+2. *アプリケーションライフサイクル*: Android アプリはいつでもシステムによって一時停止、再開、終了され得るため、慎重なリソース管理が必要。
+3. *アセット読み込み*: リソースは APK ファイルにパッケージされ、Android のアセットマネージャ経由でアクセスする。
+4. *ビルドシステム*: Android アプリケーションのビルドには Gradle と CMake を併用する。
+5. *入力処理*: タッチ入力がマウスとキーボードに代わり、異なるイベント処理が必要。
+
+これらの違いは最初は大変に見えるかもしれませんが、適切なアプローチで、きれいで保守しやすいコードベースを維持しながら対応できます。
+
+== プロジェクトセットアップ
+
+主な違いが分かったので、Android プロジェクトをセットアップしましょう。目標は、Android 固有の要件に対応しつつ、デスクトップ実装からできるだけ多くのコードを再利用することです。
+
+=== 前提条件
+
+始める前に、次のツールがインストールされていることを確認してください。
+
+* *link:++https://developer.android.com/studio[Android Studio]++[Android Studio]*: Android 開発の公式 IDE
+* *Android NDK（Native Development Kit）*: Android 上でのネイティブ C++ 開発を可能にする
+* *Android SDK*: Vulkan サポートのため、最近の API レベル（24+、Android 7.0 以降に相当）付き
+* *CMake と Ninja ビルドツール*: ネイティブコードのビルド用（Android Studio 経由でインストール可能）
+* *Vulkan SDK*: シェーダコンパイルツールとバリデーションレイヤ用
+
+[IMPORTANT]
+====
+デスクトップ環境とは異なり、Vulkan HPP（Vulkan の C++ バインディング）は Android NDK にデフォルトでは含まれていません。https://github.com/KhronosGroup/Vulkan-Hpp[Vulkan-Hpp GitHub リポジトリ]から別途ダウンロードするか、Vulkan SDK に含まれるバージョンを使う必要があります。
+====
+
+=== プロジェクト構造
+
+まず Android プロジェクトの構造を理解しましょう。標準の Android アプリケーション構造に従いますが、メインプロジェクトからコードを効率的に再利用するための変更を加えます。
+
+[source]
+----
+android/
+├── app/
+│   ├── build.gradle            // App-level build configuration
+│   ├── src/
+│   │   ├── main/
+│   │   │   ├── AndroidManifest.xml  // App manifest
+│   │   │   ├── cpp/                 // Native code
+│   │   │   │   ├── CMakeLists.txt   // CMake build script
+│   │   │   │   └── game_activity_bridge.cpp // Bridge between GameActivity and our Vulkan code
+│   │   │   ├── java/                // Java code
+│   │   │   │   └── com/example/vulkantutorial/
+│   │   │   │       └── VulkanActivity.java // Main activity (extends GameActivity)
+│   │   │   └── res/                 // Resources
+│   │   │       └── values/
+│   │   │           ├── strings.xml  // String resources
+│   │   │           └── styles.xml   // Style resources
+├── build.gradle                // Project-level build configuration
+├── gradle/                     // Gradle wrapper
+├── settings.gradle             // Project settings
+----
+
+== Android プロジェクトのセットアップ
+
+プロジェクト構造が整ったので、Android Vulkan アプリケーションの主要なコンポーネントに入りましょう。まず必須の構成ファイルから始め、その後ネイティブコードの実装に進みます。
+
+=== マニフェストファイル
+
+すべての Android アプリケーションには、アプリに関する重要な情報を宣言するマニフェストファイルが必要です。Vulkan アプリケーションでは、Vulkan バージョン要件を指定するため、AndroidManifest.xml ファイルが特に重要です。
+
+[source,xml]
+----
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.vulkan.tutorial">
+
+    <!-- Vulkan requires API level 24 (Android 7.0) or higher -->
+    <uses-sdk android:minSdkVersion="24" />
+
+    <!-- Declare that this app uses Vulkan -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x400003" android:required="true" />
+    <uses-feature android:name="android.hardware.vulkan.level" android:version="0" android:required="true" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+        <activity
+            android:name=".VulkanActivity"
+            android:label="@string/app_name"
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+----
+
+要点:
+
+* Vulkan サポートに必要な最小 SDK バージョン 24（Android 7.0）を指定しています。
+* 特定のバージョン要件付きで、アプリが Vulkan を使うことを宣言しています。
+* メインアクティビティ（VulkanActivity）をアプリケーションのエントリポイントとして設定しています。
+
+=== Java アクティビティ
+
+マニフェストを構成したあと、アプリケーションの Java 側を作成する必要があります。Vulkan コードのほとんどはネイティブ C++ で動きますが、アプリケーションのエントリポイントとして Java アクティビティが依然として必要です。
+
+Vulkan アプリケーションでは、伝統的な NativeActivity の代わりに Android Game SDK の GameActivity を使います。このモダンなアプローチは、ゲームやグラフィックス集約型アプリケーション向けに設計された、より良いパフォーマンスと機能を提供します。
+
+[source,java]
+----
+package com.vulkan.tutorial;
+
+import android.os.Bundle;
+import android.view.WindowManager;
+import com.google.androidgamesdk.GameActivity;
+
+public class VulkanActivity extends GameActivity {
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        // Keep the screen on while the app is running
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+
+    // Load the native library
+    static {
+        System.loadLibrary("vulkan_tutorial_android");
+    }
+}
+----
+
+要点:
+
+* Android Game SDK の GameActivity を継承し、Java とネイティブコード間のより最適化されたブリッジを提供します。
+* GameActivity は NativeActivity と比べて、ゲームやグラフィックス集約型アプリケーション向けにより良いパフォーマンスを提供します。
+* Vulkan 実装を含むネイティブライブラリ（"vulkan_tutorial_android"）をロードします。
+
+=== ビルド構成
+
+Java アクティビティが整ったら、ビルドプロセスを構成する必要があります。Android はビルドシステムとして Gradle を使い、ネイティブの Vulkan コードとアセットと連携するよう構成します。
+
+ビルド構成は複数のファイルに分かれ、それぞれ異なる責務を持ちます。
+
+プロジェクトレベルの build.gradle:
+[source,groovy]
+----
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.2.2'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
+----
+
+アプリレベルの build.gradle:
+[source,groovy]
+----
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    compileSdkVersion 33
+    defaultConfig {
+        applicationId "com.vulkan.tutorial"
+        minSdkVersion 24
+        targetSdkVersion 33
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    ndkVersion "25.2.9519653"
+
+    // Use assets from the main project and locally compiled shaders
+    sourceSets {
+        main {
+            assets {
+                srcDirs = [
+                    // Point to the main project's assets
+                    '../../../../',  // For models and textures in the attachments directory
+                    // Use locally compiled shaders from the build directory for all ABIs
+                    // These paths are relative to the app directory
+                    '.externalNativeBuild/cmake/debug/arm64-v8a/shaders',
+                    '.externalNativeBuild/cmake/debug/armeabi-v7a/shaders',
+                    '.externalNativeBuild/cmake/debug/x86/shaders',
+                    '.externalNativeBuild/cmake/debug/x86_64/shaders',
+                    // Also include release build paths
+                    '.externalNativeBuild/cmake/release/arm64-v8a/shaders',
+                    '.externalNativeBuild/cmake/release/armeabi-v7a/shaders',
+                    '.externalNativeBuild/cmake/release/x86/shaders',
+                    '.externalNativeBuild/cmake/release/x86_64/shaders'
+                ]
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.9.0'
+    implementation 'com.google.androidgamesdk:game-activity:1.2.0'
+}
+----
+
+要点:
+
+* Vulkan サポートのため、最小 SDK バージョンを 24（Android 7.0）に指定しています。
+* ネイティブコードをビルドするよう CMake を構成しています。
+* より良いパフォーマンスのため game-activity 依存関係を含めています。
+* メインプロジェクトのアセットとローカルでコンパイルしたシェーダを参照するようアセットディレクトリを設定しています。
+* このアプローチはアセットの複製を避け、最新バージョンを使うことを保証します。
+
+=== CMake 構成
+
+Gradle が全体の Android ビルドプロセスを扱う一方、ネイティブ C++ コードのビルドには CMake を使います。ここで Vulkan 環境のセットアップ、シェーダのコンパイル、必要なライブラリへのリンクを行います。
+
+ネイティブコード構成の中心である CMakeLists.txt ファイルを見てみましょう。
+
+[source,cmake]
+----
+cmake_minimum_required(VERSION 3.22.1)
+
+project(vulkan_tutorial_android)
+
+# Set the path to the main CMakeLists.txt relative to this file
+set(MAIN_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../CMakeLists.txt")
+
+# Find the Vulkan package
+find_package(Vulkan REQUIRED)
+
+# Set up shader compilation tools
+add_executable(glslang::validator IMPORTED)
+find_program(GLSLANG_VALIDATOR "glslangValidator" HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
+set_property(TARGET glslang::validator PROPERTY IMPORTED_LOCATION "${GLSLANG_VALIDATOR}")
+
+# Define shader building function
+function(add_shaders_target TARGET)
+  cmake_parse_arguments("SHADER" "" "CHAPTER_NAME" "SOURCES" ${ARGN})
+  set(SHADERS_DIR ${SHADER_CHAPTER_NAME}/shaders)
+  add_custom_command(
+    OUTPUT ${SHADERS_DIR}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
+  )
+  add_custom_command(
+    OUTPUT ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv
+    COMMAND glslang::validator
+    ARGS --target-env vulkan1.0 ${SHADER_SOURCES} --quiet
+    WORKING_DIRECTORY ${SHADERS_DIR}
+    DEPENDS ${SHADERS_DIR} ${SHADER_SOURCES}
+    COMMENT "Compiling Shaders"
+    VERBATIM
+  )
+  add_custom_target(${TARGET} DEPENDS ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv)
+endfunction()
+
+# Include the game-activity library
+find_package(game-activity REQUIRED CONFIG)
+include_directories(${ANDROID_NDK}/sources/android/game-activity/include)
+
+# Set C++ standard to match the main project
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# (Optional) Add the Vulkan C++ module when ENABLE_CPP20_MODULE=ON
+add_library(VulkanCppModule SHARED)
+target_compile_definitions(VulkanCppModule
+    PUBLIC VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1 VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
+)
+target_include_directories(VulkanCppModule
+    PRIVATE
+    "${Vulkan_INCLUDE_DIR}"
+)
+target_link_libraries(VulkanCppModule
+    PUBLIC
+    ${Vulkan_LIBRARIES}
+)
+set_target_properties(VulkanCppModule PROPERTIES CXX_STANDARD 20)
+
+# Set up the C++ module file set
+target_sources(VulkanCppModule
+    PUBLIC
+    FILE_SET cxx_modules TYPE CXX_MODULES
+    BASE_DIRS
+    "${Vulkan_INCLUDE_DIR}"
+    FILES
+    "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.cppm"
+)
+
+# Set up shader compilation for 34_android
+set(SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../attachments")
+set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
+
+# Copy shader source files to the build directory
+configure_file(
+    "${SHADER_SOURCE_DIR}/27_shader_depth.frag"
+    "${SHADER_OUTPUT_DIR}/27_shader_depth.frag"
+    COPYONLY
+)
+configure_file(
+    "${SHADER_SOURCE_DIR}/27_shader_depth.vert"
+    "${SHADER_OUTPUT_DIR}/27_shader_depth.vert"
+    COPYONLY
+)
+
+# Compile shaders
+set(SHADER_SOURCES "${SHADER_OUTPUT_DIR}/27_shader_depth.frag" "${SHADER_OUTPUT_DIR}/27_shader_depth.vert")
+add_shaders_target(android_shaders CHAPTER_NAME "${SHADER_OUTPUT_DIR}" SOURCES ${SHADER_SOURCES})
+
+# Add the main native library
+add_library(vulkan_tutorial_android SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../attachments/34_android.cpp
+    game_activity_bridge.cpp
+)
+
+# Add dependency on shader compilation
+add_dependencies(vulkan_tutorial_android android_shaders)
+
+# Set include directories
+target_include_directories(vulkan_tutorial_android PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${Vulkan_INCLUDE_DIR}
+    ${ANDROID_NDK}/sources/android/game-activity/include
+)
+
+# Link against libraries
+target_link_libraries(vulkan_tutorial_android
+    VulkanCppModule
+    game-activity::game-activity
+    android
+    log
+    ${Vulkan_LIBRARIES}
+)
+----
+
+要点:
+
+* Vulkan パッケージを見つけ、native_app_glue の代わりに game-activity ライブラリをインクルードしています。
+* シェーダコンパイルツールをセットアップし、シェーダをコンパイルする関数を定義しています。
+* C{pp} 標準を C{pp}20 に設定し、モジュールが有効なときは任意で Vulkan C{pp} モジュール（推奨）を作成しています。
+* 34_android 章用のシェーダコンパイルをセットアップし、メインプロジェクトからシェーダソースファイルをコピーしています。
+* メインプロジェクトの 34_android.cpp と、GameActivity と接続するブリッジファイルを使うメインネイティブライブラリを追加しています。
+* game-activity を含む必要なライブラリにリンクしています。
+
+== ネイティブ実装
+
+ビルド構成をセットアップしたので、Android 上で Vulkan アプリケーションを動かすネイティブ C++ コードに入りましょう。ここで本領が発揮されます。プラットフォーム固有の変更を最小限にしつつ、既存の Vulkan コードを Android で動くようどう適応させるかを見ていきます。
+
+このアプローチの主な利点のひとつはコードの再利用です。デスクトップと Android で別々のコードベースを維持する代わりに、できるだけ多くのコードを共有するようプロジェクトを構成しています。
+
+1. *34_android.cpp*: メインプロジェクトでも使う同じファイルで、コアの Vulkan 実装を含みます。このファイルを再利用することで、レンダリングコードがプラットフォーム間で同一であることを保証します。
+
+2. *game_activity_bridge.cpp*: Android の GameActivity をコアの Vulkan コードに接続する小さなブリッジファイルです。プラットフォーム固有の初期化とイベント処理を扱います。
+
+この関心の分離により、プラットフォーム固有の詳細に引きずられることなく Vulkan 実装に集中できます。レンダリングコードを改善すると、デスクトップと Android の両方のバージョンが自動的に恩恵を受けます。
+
+=== GameActivity ブリッジ
+
+Java の GameActivity とネイティブの Vulkan 実装を接続する鍵となるブリッジコードを詳しく見てみましょう。この小さくて重要なファイルは、Android の Java ベースのアクティビティライフサイクルと C++ コード間の変換を扱います。
+
+[source,cpp]
+----
+#include <game-activity/GameActivity.h>
+#include <game-activity/native_app_glue/android_native_app_glue.h>
+#include <android/log.h>
+
+// Define logging macros
+#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, "VulkanTutorial", __VA_ARGS__))
+#define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, "VulkanTutorial", __VA_ARGS__))
+#define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, "VulkanTutorial", __VA_ARGS__))
+
+// Forward declaration of the main entry point
+extern "C" void android_main(android_app* app);
+
+// GameActivity entry point
+extern "C" {
+    void GameActivity_onCreate(GameActivity* activity) {
+        LOGI("GameActivity_onCreate");
+
+        // Create an android_app structure
+        android_app* app = new android_app();
+        memset(app, 0, sizeof(android_app));
+
+        // Set up the android_app structure
+        app->activity = activity;
+        app->window = activity->window;
+
+        // Call the original android_main function
+        android_main(app);
+
+        // Clean up
+        delete app;
+    }
+}
+----
+
+このブリッジコードは:
+
+1. Vulkan コードと互換性のある android_app 構造体を作成する
+2. GameActivity と私たちのコード間の必要な接続をセットアップする
+3. 34_android.cpp 内の android_main 関数を呼び出す
+
+=== Android エントリポイント
+
+ブリッジコードが android_app 構造体を作成したあと、ネイティブコードのエントリポイントとなる android_main 関数を呼び出します。この関数は 34_android.cpp で定義され、デスクトップアプリケーションの main() 関数に相当します。
+
+このエントリポイントから Vulkan アプリケーションをどう初期化するかを見てみましょう。
+
+[source,cpp]
+----
+void android_main(android_app* app) {
+    try {
+        // Create and run the Vulkan application
+        HelloTriangleApplication application(app);
+        application.run();
+    } catch (const std::exception& e) {
+        LOGE("Exception caught: %s", e.what());
+    }
+}
+----
+
+=== Vulkan サーフェスの作成
+
+Vulkan 実装における主なプラットフォーム固有の違いのひとつは、サーフェスの作成方法です。デスクトップでは GLFW を使ってウィンドウとサーフェスを作成しました。Android では、ネイティブ Android ウィンドウからサーフェスを作成するために VK_KHR_android_surface 拡張を使う必要があります。
+
+Android で Vulkan サーフェスを作成する方法は次のとおりです。
+
+[source,cpp]
+----
+void createSurface() {
+    VkSurfaceKHR _surface;
+    VkResult result = VK_SUCCESS;
+
+    // Create Android surface
+    result = vkCreateAndroidSurfaceKHR(
+        *instance,
+        &(VkAndroidSurfaceCreateInfoKHR{
+            .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+            .pNext = nullptr,
+            .flags = 0,
+            .window = androidApp->window
+        }),
+        nullptr,
+        &_surface
+    );
+
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Android surface");
+    }
+
+    surface = vk::raii::SurfaceKHR(instance, _surface);
+}
+----
+
+=== Android イベントの処理
+
+もうひとつの重要なプラットフォーム固有の側面はイベント処理です。Android アプリケーションはデスクトップアプリケーションと異なるライフサイクルを持ち、いつでもシステムによって一時停止、再開、終了され得ます。Vulkan リソースが正しく管理されるよう、これらのイベントを適切に処理する必要があります。
+
+アプリケーションで Android 固有のイベントを処理する方法は次のとおりです。
+
+[source,cpp]
+----
+static void handleAppCommand(android_app* app, int32_t cmd) {
+    auto* vulkanApp = static_cast<VulkanApplication*>(app->userData);
+    switch (cmd) {
+        case APP_CMD_INIT_WINDOW:
+            // Window created, initialize Vulkan
+            if (app->window != nullptr) {
+                vulkanApp->initVulkan();
+            }
+            break;
+        case APP_CMD_TERM_WINDOW:
+            // Window destroyed, clean up Vulkan
+            vulkanApp->cleanup();
+            break;
+        default:
+            break;
+    }
+}
+
+static int32_t handleInputEvent(android_app* app, AInputEvent* event) {
+    auto* vulkanApp = static_cast<VulkanApplication*>(app->userData);
+    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION) {
+        // Handle touch events
+        float x = AMotionEvent_getX(event, 0);
+        float y = AMotionEvent_getY(event, 0);
+
+        // Process touch coordinates
+        // ...
+
+        return 1;
+    }
+    return 0;
+}
+----
+
+== クロスプラットフォーム実装
+
+これまで Android 固有のコードに焦点を当ててきましたが、このアプローチにより、デスクトップと Android の両方で動く単一のコードベースを維持できます。これは、プリプロセッサディレクティブとプラットフォーム固有の抽象化を慎重に使うことで実現されます。
+
+=== プラットフォーム検出
+
+クロスプラットフォームアプローチの最初のステップは、どのプラットフォーム向けにビルドしているかを検出することです。プラットフォーム固有の事前定義マクロを確認するためにプリプロセッサディレクティブを使います。
+
+[source,cpp]
+----
+// Platform detection
+#if defined(__ANDROID__)
+    #define PLATFORM_ANDROID 1
+#else
+    #define PLATFORM_DESKTOP 1
+#endif
+----
+
+このアプローチは、Android 向けビルド時にコンパイラが自動的に定義する標準の事前定義マクロ `__ANDROID__` を活用します。これらのプラットフォームマクロは、プラットフォーム固有コードを条件付きでコンパイルするためにコード全体で使われます。
+
+=== 一貫したクラス構造
+
+きれいで一貫したコードベースを維持するため、両方のプラットフォームで同じクラス名（`HelloTriangleApplication`）を使います。これによりコードを理解しやすくなり、プラットフォーム固有の分岐の必要性も減ります。
+
+[source,cpp]
+----
+// Cross-platform application class
+class HelloTriangleApplication {
+public:
+#if PLATFORM_DESKTOP
+    // Desktop constructor
+    HelloTriangleApplication() {
+        // No Android-specific initialization needed
+    }
+#else
+    // Android constructor
+    HelloTriangleApplication(android_app* app) : androidApp(app) {
+        // Android-specific initialization
+    }
+#endif
+    // ... rest of the class ...
+};
+----
+
+=== プラットフォーム固有のインクルード
+
+異なるプラットフォームは異なるヘッダファイルを必要とします。適切なヘッダをインクルードするためにプリプロセッサディレクティブを使います。
+
+[source,cpp]
+----
+// Platform-specific includes
+#if PLATFORM_ANDROID
+    // Android-specific includes
+    #include <android/log.h>
+    #include <android_native_app_glue.h>
+    #include <android/asset_manager.h>
+    #include <android/asset_manager_jni.h>
+#else
+    // Desktop-specific includes
+    #define GLFW_INCLUDE_VULKAN
+    #include <GLFW/glfw3.h>
+    #include <stb_image.h>
+    #include <tiny_obj_loader.h>
+#endif
+----
+
+=== クロスプラットフォームのファイル読み込み
+
+ファイル読み込みは、デスクトップと Android プラットフォーム間の主な違いのひとつです。デスクトップではファイルシステムからファイルを読み込み、Android では APK のアセットから読み込みます。両方のプラットフォームで動くクロスプラットフォームのファイル読み込み関数を作成しました。
+
+[source,cpp]
+----
+// Cross-platform file reading function
+std::vector<char> readFile(const std::string& filename, std::optional<AAssetManager*> assetManager = std::nullopt) {
+#if PLATFORM_ANDROID
+    // On Android, use asset manager if provided
+    if (assetManager.has_value() && *assetManager != nullptr) {
+        // Open the asset
+        AAsset* asset = AAssetManager_open(*assetManager, filename.c_str(), AASSET_MODE_BUFFER);
+        // ... read file from asset ...
+        return buffer;
+    }
+#endif
+
+    // Desktop version or Android fallback to filesystem
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    // ... read file from filesystem ...
+    return buffer;
+}
+----
+
+=== プラットフォーム固有のエントリポイント
+
+各プラットフォームには独自のエントリポイントがあります。デスクトップでは標準の `main()` 関数を使い、Android では `android_main()` 関数を使います。
+
+[source,cpp]
+----
+// Platform-specific entry point
+#if PLATFORM_ANDROID
+// Android main entry point
+void android_main(android_app* app) {
+    // Android-specific initialization
+    try {
+        HelloTriangleApplication vulkanApp(app);
+        vulkanApp.run();
+    } catch (const std::exception& e) {
+        LOGE("Exception caught: %s", e.what());
+    }
+}
+#else
+// Desktop main entry point
+int main() {
+    try {
+        HelloTriangleApplication app;
+        app.run();
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+#endif
+----
+
+=== ビルドシステム統合
+
+クロスプラットフォームアプローチは、コンパイラ組み込みのプラットフォーム検出機能を活用します。`__ANDROID__` マクロは Android 向けビルド時にコンパイラが自動的に定義するため、ビルドシステムでプラットフォームマクロを明示的に定義する必要はありません。
+
+このアプローチにはいくつかの利点があります。
+
+1. *単純さ*: CMake ファイルでプラットフォーム固有のコンパイル定義を維持する必要がない。
+2. *信頼性*: カスタム定義ではなく標準のコンパイラ動作に依存する。
+3. *保守性*: ビルドシステム構成が少ないほど、失敗し得る箇所も少ない。
+
+コンパイラの事前定義マクロを使うことで、プラットフォーム固有コードを最小限にしつつ、デスクトップと Android の両方で動く単一のコードベースを維持できます。レンダリングコードを改善すると、デスクトップと Android の両方のバージョンが自動的に恩恵を受けます。
+
+== Android でのシェーダ処理
+
+コアのネイティブ実装をカバーしたので、Android での Vulkan 開発のもうひとつの重要な側面であるシェーダ処理に取り組みましょう。シェーダはあらゆる Vulkan アプリケーションの重要な部分であり、Android で適切にコンパイル・読み込みされることを保証する必要があります。
+
+私たちのアプローチでは、メインプロジェクトと同様に、ビルドプロセス中にローカルでシェーダをコンパイルします。この戦略にはいくつかの大きな利点があります。
+
+1. *一貫性*: デスクトップと Android ビルドの両方で同じシェーダソースファイルを使い、プラットフォーム間で同一の視覚結果を保証する。
+2. *保守性*: シェーダを更新する必要があるときは 1 か所だけ変更すれば、デスクトップと Android の両方のバージョンが恩恵を受ける。
+3. *ビルド時検証*: シェーダコンパイルエラーは実行時ではなくビルドプロセス中に捕捉され、デバッグがはるかに容易になる。
+
+=== ローカルシェーダコンパイル
+
+ビルドプロセス中にローカルでシェーダをコンパイルするよう CMake 構成をセットアップしています。
+
+1. *シェーダビルド関数を定義する*:
++
+[source,cmake]
+----
+function(add_shaders_target TARGET)
+  cmake_parse_arguments("SHADER" "" "CHAPTER_NAME" "SOURCES" ${ARGN})
+  set(SHADERS_DIR ${SHADER_CHAPTER_NAME}/shaders)
+  add_custom_command(
+    OUTPUT ${SHADERS_DIR}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
+  )
+  add_custom_command(
+    OUTPUT ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv
+    COMMAND glslang::validator
+    ARGS --target-env vulkan1.0 ${SHADER_SOURCES} --quiet
+    WORKING_DIRECTORY ${SHADERS_DIR}
+    DEPENDS ${SHADERS_DIR} ${SHADER_SOURCES}
+    COMMENT "Compiling Shaders"
+    VERBATIM
+  )
+  add_custom_target(${TARGET} DEPENDS ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv)
+endfunction()
+----
+
+2. *メインプロジェクトからシェーダソースファイルをコピーする*:
++
+[source,cmake]
+----
+# Set up shader compilation for 34_android
+set(SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../attachments")
+set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
+
+# Copy shader source files to the build directory
+configure_file(
+    "${SHADER_SOURCE_DIR}/27_shader_depth.frag"
+    "${SHADER_OUTPUT_DIR}/27_shader_depth.frag"
+    COPYONLY
+)
+configure_file(
+    "${SHADER_SOURCE_DIR}/27_shader_depth.vert"
+    "${SHADER_OUTPUT_DIR}/27_shader_depth.vert"
+    COPYONLY
+)
+----
+
+3. *シェーダをコンパイルする*:
++
+[source,cmake]
+----
+# Compile shaders
+set(SHADER_SOURCES "${SHADER_OUTPUT_DIR}/27_shader_depth.frag" "${SHADER_OUTPUT_DIR}/27_shader_depth.vert")
+add_shaders_target(android_shaders CHAPTER_NAME "${SHADER_OUTPUT_DIR}" SOURCES ${SHADER_SOURCES})
+
+# Add dependency on shader compilation
+add_dependencies(vulkan_tutorial_android android_shaders)
+----
+
+4. *Gradle ビルドでコンパイル済みシェーダを参照する*:
++
+[source,groovy]
+----
+sourceSets {
+    main {
+        assets {
+            srcDirs = [
+                // Point to the main project's assets
+                '../../../../',  // For models and textures in the attachments directory
+                // Use locally compiled shaders from the build directory for all ABIs
+                '.externalNativeBuild/cmake/debug/arm64-v8a/shaders',
+                '.externalNativeBuild/cmake/debug/armeabi-v7a/shaders',
+                // ... other ABIs ...
+            ]
+        }
+    }
+}
+----
+
+=== クロスプラットフォームなアセット読み込み
+
+統一された readFile 関数により、クロスプラットフォームな方法でアセットを簡単に読み込めます。シェーダファイルを読み込む使い方は次のとおりです。
+
+[source,cpp]
+----
+// Load shader files using cross-platform function
+#if PLATFORM_ANDROID
+std::optional<AAssetManager*> optionalAssetManager = assetManager;
+#else
+std::optional<AAssetManager*> optionalAssetManager = std::nullopt;
+#endif
+std::vector<char> vertShaderCode = readFile("shaders/vert.spv", optionalAssetManager);
+std::vector<char> fragShaderCode = readFile("shaders/frag.spv", optionalAssetManager);
+----
+
+テクスチャ画像とモデルファイルの読み込みにも同じアプローチを使います。
+
+[source,cpp]
+----
+// Load texture image
+#if PLATFORM_ANDROID
+std::optional<AAssetManager*> optionalAssetManager = assetManager;
+std::vector<char> imageData = readFile(TEXTURE_PATH, optionalAssetManager);
+// Process the image data...
+#else
+// Load directly from filesystem
+// ...
+#endif
+----
+
+この統一アプローチにより、両方の良いところを得られます。両方のプラットフォームで同じコード構造を使い、プラットフォーム固有の違いは readFile 関数自体が処理します。これによりコードはより保守しやすく、理解しやすくなります。
+
+== ビルドと実行
+
+必要なコンポーネントをすべて備えた Android プロジェクトをセットアップしたので、すべてをまとめて Android デバイス上で Vulkan アプリケーションを実行しましょう。
+
+手順は素直です。
+
+1. Android Studio でプロジェクトを開く。
+2. Android デバイスを接続するか、エミュレータを起動する（Vulkan をサポートしていることを確認する）。
+3. Android Studio の「Run」ボタンをクリックする。
+
+Android Studio が残りを処理します。アプリケーションのビルド、シェーダのコンパイル、すべてを APK にパッケージ、デバイス／エミュレータへのインストール、起動です。正しくセットアップされていれば、デスクトップと同じシーンをレンダリングする Vulkan アプリケーションが Android 上で動くはずです。
+
+== まとめ
+
+この章では、Android 向けに適応させることで、Vulkan アプリケーションをデスクトップからモバイルへ持ち込む方法を探りました。コアの Vulkan API はプラットフォーム間で同じままですが、周囲のエコシステムにはプラットフォーム固有の適応が必要であることが分かりました。
+
+このアプローチは、独自の Vulkan プロジェクトに適用できるいくつかの重要な原則を示しています。
+
+1. *コードの再利用*: プロジェクトを適切に構成することで、デスクトップと Android の両方で同じコアレンダリングコード（34_android.cpp）を使え、複製と保守のオーバーヘッドを最小限に抑えられます。
+
+2. *モダンな Android 統合*: 古い NativeActivity アプローチと比べて、より良いパフォーマンスとより合理化された統合のため、Android Game SDK の GameActivity を活用します。
+
+3. *効率的なアセット管理*: アセットを複製する代わりにメインプロジェクトから参照し、一貫性を確保して APK サイズを削減します。
+
+4. *ローカルシェーダコンパイル*: ビルドプロセス中にシェーダをコンパイルすることで、エラーを早期に捕捉し、プラットフォーム間の互換性を保証します。
+
+5. *最小限のプラットフォーム固有コード*: プラットフォーム固有コードを小さなブリッジファイルに分離し、コアの Vulkan 実装をきれいで移植可能に保ちます。
+
+このアプローチは、アプリケーションの保守と更新を容易にするだけでなく、将来ほかのプラットフォームへ拡張するための堅固な基盤も提供します。コアのレンダリングコードを改善すると、デスクトップと Android の両方のバージョンが自動的に恩恵を受けます。
+
+完全な Android の例は attachments/android ディレクトリにあります。Android 上の独自の Vulkan プロジェクトのテンプレートとして自由に使ってください。
+
+Vulkan HPP は Android NDK にデフォルトでは含まれていないため、https://github.com/KhronosGroup/Vulkan-Hpp[Vulkan-Hpp GitHub リポジトリ]から別途ダウンロードするか、Vulkan SDK に含まれるバージョンを使う必要があることを忘れないでください。
+
+link:/attachments/34_android.cpp[C{pp} コード]

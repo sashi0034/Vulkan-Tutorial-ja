@@ -1,0 +1,259 @@
+= glTF アニメーションとトランスフォーム合成
+
+アニメーションは 3D シーンに命を吹き込みます — 回る天井ファン、回転する歯車、歩くキャラクター。このページでは、このエンジンが glTF ファイルからアニメーションを読み込み再生する仕組みを説明します。特に *トランスフォーム合成*（オブジェクトが「漂い去らず」その場で動くための要点）に重点を置きます。
+
+== glTF アニメーションとは？
+
+glTF（GL Transmission Format）は、スケルタルおよびノードベースのアニメーションを含む 3D アセットの標準です。glTF のアニメーションは次から成ります:
+
+* **チャンネル**: どのノードプロパティを動かすか（translation、rotation、または scale）を定義
+* **サンプラー**: キーフレームデータと補間方法（step、linear、または cubic spline）を提供
+* **タイムライン**: 滑らかな再生のため、時間値を出力値へ対応付ける
+
+Blender、Maya、その他の 3D ツールからアニメート済みモデルをエクスポートすると、アニメーションデータはノードが時間とともにどう動くかを *初期トランスフォームに対して相対的に* キャプチャします。これが重要です: アニメーションは *デルタ*（変化）を記述し、絶対的なワールド位置ではありません。
+
+== トランスフォーム合成を理解する
+
+トランスフォーム合成は、3D エンジンでアニメーションが動く基礎です。この概念の理解は、あらゆるアニメーション系の実装に不可欠です。
+
+**核心の原則**: GLTF のアニメーションデータは *変化*（デルタ）を記述し、絶対位置ではありません。アーティストが Blender で天井ファンの回転をアニメートするとき、定義しているのは時間とともにどれだけ回るかであり、ワールド空間のどこにあるべきかではありません。
+
+位置 (10, 5, 8) の天井ファンと、それを回すアニメーションを考えてください。アニメーションのキーフレームは例えば次のように指定するかもしれません:
+* Translation: (0, 0, 0) — 移動なし
+* Rotation: Y 軸まわり 0° → 360° — 回転
+* Scale: (1, 1, 1) — スケールなし
+
+正しく表示するには、アニメーションデルタをオブジェクトのベーストランスフォームと **合成** しなければなりません:
+
+* **ベーストランスフォーム**: シーン階層からのオブジェクトの初期位置／回転／スケール
+* **アニメーショントランスフォーム**: キーフレームからの時間変動デルタ
+* **最終トランスフォーム**: Base を Animation と合成したもの
+
+合成の規則は:
+* Translation: `final = base + animDelta`（加算）
+* Rotation: `final = base * animDelta`（クォータニオン乗算）
+* Scale: `final = base * animDelta`（成分ごとの乗算）
+
+正しい合成があれば、天井ファンは (10, 5, 8) に留まり、その場で回ります。
+
+== エンジンでの仕組み
+
+アニメーション系には 3 つの主要コンポーネントがあります:
+
+=== 1. ロード: ベーストランスフォームとアニメーションデータを抽出
+
+glTF ファイルをロードするとき（`model_loader.cpp`）、次を抽出します:
+
+* **ノードトランスフォーム**: 各 GLTF ノードのローカルトランスフォーム行列を `animatedNodeTransforms` マップに格納
+* **アニメーションデータ**: チャンネル、サンプラー、キーフレームを `Animation` オブジェクトに格納
+* **ノード→メッシュ対応**: エンティティ照合のためノードインデックスをメッシュインデックスへリンク
+
+[source,cpp]
+----
+// In model_loader.cpp (conceptual)
+std::unordered_map<int, glm::mat4> animatedNodeTransforms;  // nodeIndex -> base transform
+std::unordered_map<int, int> animatedNodeMeshes;            // nodeIndex -> meshIndex
+std::vector<Animation> animations;                          // animation clips
+----
+
+=== 2. シーンセットアップ: エンティティ作成とベーストランスフォーム適用
+
+`scene_loading.cpp` で、各アニメートノードについて:
+
+* **別エンティティを作成**: 複数ノードが同じメッシュを共有するなら（天井ファンが 2 つなど）、それぞれ独立にアニメートできるよう個別エンティティを作る
+* **ベーストランスフォームを適用**: ノードのトランスフォーム行列を位置／回転／スケールに分解し、エンティティの TransformComponent を設定
+* **nodeToEntity マップを構築**: アニメーション対象のため GLTF ノードインデックスをエンティティポインタへリンク
+
+[source,cpp]
+----
+// For each animated node
+glm::mat4 nodeTransform = animatedNodeTransforms[nodeIndex];
+glm::vec3 position, scale;
+glm::quat rotation;
+glm::decompose(nodeTransform, scale, rotation, position, ...);
+
+transform->SetPosition(position);      // Base position (e.g., ceiling)
+transform->SetRotation(eulerAngles(rotation));
+transform->SetScale(scale);
+----
+
+**重要な洞察**: ジオメトリを共有するアニメートノードは別エンティティが必要です。GPU インスタンシング（1 エンティティ、複数トランスフォーム）は個々のアニメーション制御には使えません。
+
+== コードの参照先
+
+データを端から端まで追いたい場合:
+
+* glTF パース（ノード、アニメーション、サンプラー）:
+** `model_loader.cpp`
+** `model_loader.h`
+* シーン／エンティティ作成とノード→エンティティ対応:
+** `scene_loading.cpp`
+* アニメーション再生とトランスフォーム合成:
+** `animation_component.cpp`
+** `animation_component.h`
+* トランスフォーム格納と合成ヘルパー:
+** `transform_component.cpp`
+** `transform_component.h`
+
+== 今後のアイデア
+
+アニメーション系を育てたい場合:
+
+* アニメーションブレンディング（クリップ間のクロスフェード）をサポートする。
+* キャラクターアニメーションが欲しければスケルタルスキニング（頂点ブレンド）を追加する。
+* エンティティごとのアクティブクリップ／時間を示すアニメーションデバッグ UI（開発専用）を追加する。
+* 「トランスフォームをベイク」オプションを追加する（単一のアニメート済みポーズだけが必要な静的メッシュに便利）。
+
+== 次に読むもの
+
+* `Synchronization_and_Streaming.adoc`（大きなシーンではアニメーションとストリーミングが相互作用し得る）
+* `Rendering_Pipeline_Overview.adoc`
+* `Push_Constants_Per_Object.adoc`
+
+=== 3. 再生: アニメーションをベーストランスフォームと合成
+
+`AnimationComponent::Update()` で:
+
+1. **最初のフレームでベーストランスフォームをキャプチャ**: アニメーション開始時に各エンティティの初期位置／回転／スケールを保存
+2. **キーフレームをサンプル**: 現在時刻でアニメーションデータを補間
+3. **トランスフォームを合成**: アニメーションデルタをベーストランスフォームに加算／乗算
+4. **エンティティへ適用**: 合成結果で TransformComponent を更新
+
+[source,cpp]
+----
+// Animation update logic
+glm::vec3 basePos = basePositions[nodeIndex];           // e.g., (10, 5, 8)
+glm::vec3 animTranslation = SampleVec3(sampler, time);  // e.g., (0, 0, 0)
+transform->SetPosition(basePos + animTranslation);      // Result: (10, 5, 8)
+
+glm::quat baseRot = baseRotations[nodeIndex];           // e.g., identity quaternion
+glm::quat animRotation = SampleQuat(sampler, time);     // e.g., 45° around Y
+glm::quat finalRotation = baseRot * animRotation;       // Compose using quaternion multiplication
+transform->SetRotation(glm::eulerAngles(finalRotation)); // Convert to Euler for transform
+----
+
+== トランスフォーム合成の規則
+
+トランスフォームのプロパティごとに合成の仕方が違います:
+
+**Translation**: 加算
+
+[source]
+----
+finalPosition = basePosition + animationTranslation
+----
+加算は 3D 空間の位置に自然に働きます。
+
+**Rotation**: クォータニオン乗算
+
+[source]
+----
+finalRotation = baseRotation * animationRotation  // quaternion math
+finalEuler = eulerAngles(finalRotation)            // convert for display
+----
+回転はジンバルロックを避け回転順を正しく保つため、クォータニオン乗算で合成しなければなりません。合成中は常にクォータニオン空間で作業し、トランスフォーム設定時だけオイラー角へ変換します。
+
+**Scale**: 乗算
+
+[source]
+----
+finalScale = baseScale * animationScale  // component-wise
+----
+アニメーションスケール (1, 1, 1) は「変化なし」、(2, 1, 1) は「X 軸を倍」を意味します。
+
+== 複数インスタンスの扱い
+
+2 つの GLTF ノードが同じメッシュを参照するとき（例: 同一の天井ファンが 2 つ）、独立アニメーションのために別エンティティが必要です。
+
+**なぜ別エンティティか？**
+* GPU インスタンシングは、多くの同一で非アニメートのオブジェクト（木、岩、草）向けに設計されている
+* インスタンストランスフォームはフレームごとに一度設定される; 各インスタンスを独立にアニメートできない
+* アニメーションには、毎フレーム更新されるエンティティごとの TransformComponent が必要
+
+**実装方針**: 別エンティティを作成する
+
+[source,cpp]
+----
+// First node reuses existing entity
+nodeEntity = geometryEntities[meshIndex];
+
+// Second node creates new entity with cloned geometry
+nodeEntity = engine->CreateEntity("AnimNode_5");
+mesh->SetVertices(sourceMesh->vertices);  // Clone mesh data
+mesh->SetIndices(sourceMesh->indices);
+----
+
+各エンティティは自分の TransformComponent を持ち、独立にアニメートできます。
+
+== キーフレーム補間
+
+GLTF は 3 つの補間モードをサポートします:
+
+**Step**: 次のキーフレームへ瞬時にジャンプ（スムージングなし）
+
+[source,cpp]
+----
+return keyframe0.value;  // Robotic, retro feel
+----
+
+**Linear**: キーフレーム間の滑らかな線形ブレンド
+
+[source,cpp]
+----
+return glm::mix(v0, v1, t);  // Most common, looks natural
+----
+
+**Cubic Spline**: 接線を使った滑らかな曲線
+
+[source,cpp]
+----
+// Hermite spline using in-tangent, value, out-tangent
+// For production: implement full cubic interpolation for smoother motion
+----
+
+回転では mix の代わりに球面線形補間（slerp）を使います:
+
+[source,cpp]
+----
+return glm::slerp(q0, q1, t);  // Avoids gimbal lock
+----
+
+== パフォーマンス上の考慮
+
+**アニメーション更新コスト**: O(チャンネル × エンティティ)
+* チャンネル 3 つずつ（translation、rotation、scale）のアニメートオブジェクト 10 個なら: フレームあたり約 30 のトランスフォーム更新
+* これは安い; トランスフォーム計算は速い
+
+**メモリ**: 各アニメートエンティティに必要:
+* クローンしたメッシュデータ（頂点、インデックス）: 天井ファンで約 100KB
+* トランスフォーム格納: ノードあたり 3×vec3 = 36 バイト
+
+**最適化のヒント**: 同一のアニメートオブジェクトが数百あるなら（例: 草の葉）、エンティティごとの CPU 更新の代わりにコンピュートシェーダーによる GPU 側アニメーションを検討してください。
+
+== 代替と拡張
+
+**スケルタルアニメーション（スキニング）**::
+* ボーン／ジョイント付きキャラクター向け
+* 頂点スキニングが必要（頂点ごとに複数ボーンのトランスフォームをブレンド）
+* ノードアニメーションより複雑だが、現実的な変形が可能
+
+**モーフターゲット（ブレンドシェイプ）**::
+* 顔アニメーションや滑らかな形状遷移向け
+* GLTF はモーフターゲット用の weights チャンネルをサポート
+* ノードトランスフォームを超え、メッシュ頂点を変形する
+
+**プロシージャルアニメーション**::
+* 実行時にアニメーションデータを生成する（例: 風の揺れ、ノイズベースの動き）
+* より柔軟だがカスタムオーサリングが必要
+
+== 次に読むもの
+
+さらに深く知りたい場合:
+
+* **Transform Component**: モデル行列の格納と計算は `transform_component.h` を参照
+* **GLTF 仕様**: link:https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#animations[アニメーションに関する GLTF 仕様]
+* **同期**: アニメーション更新がレンダーフレームタイミングとどう相互作用するか
+
+要点: **常にアニメーショントランスフォームをベーストランスフォームと合成する**。この基本原理により、アニメーションデータ自体は相対的な変化を記述しつつ、オブジェクトは正しいワールド位置で動きます。この合成の理解は、あらゆるアニメーション系に不可欠です。
+
+これで自分のプロジェクトに GLTF アニメーションを実装する土台が整いました。楽しいアニメーションを！ 🚁

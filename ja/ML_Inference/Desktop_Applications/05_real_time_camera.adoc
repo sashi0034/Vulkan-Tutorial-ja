@@ -1,0 +1,301 @@
+= リアルタイムカメラ統合
+:pp: {plus}{plus}
+:stem: latexmath
+
+これまで ML を遅く慎重なプロセスとして扱ってきました: ディスクから画像を読み込み、GPU が処理するのを待ち、やがて結果を表示。フォトブースアプリには機能しますが、拡張現実ゲームやリアルタイムロボットコントローラーなら「やがて」では不十分です。
+
+本章では静的推論とライブ映像のギャップを埋めます。UI が重い泥の中を進むように感じることなく、30 FPS 以上でウェブカムストリームを処理したい。
+
+単に推論を速くするだけではありません。**オーケストレーション**が重要です。3 つの異なる世界を調整する必要があります:
+1.  **カメラ**: 独自ペースでフレーム生成（例: 30 FPS なら正確に 33.3ms ごと）。
+2.  **推論エンジン**: 1 フレーム処理に相当時間（例: 40ms から 80ms）。
+3.  **レンダラー**: UI を滑らか・応答的に保つため 60 FPS（16.6ms ごと）で描画継続。
+
+== 「ストップ・アンド・ゴー」問題
+
+素朴なアプローチだとコードはこう:
+*   フレーム取得。
+*   推論完了を待つ。
+*   結果レンダリング。
+*   繰り返し。
+
+問題？ GPU が推論中、CPU はアイドル状態です。カメラが次リクエスト待ちの間、GPU はアイドルです。推論 30ms + レンダリング 5ms で 28 FPS——*他に何も起きていない*と仮定。さらに悪いことに、メインスレッドが GPU 待ちでブロックされ UI が「ジッター」感になります。
+
+これを直すには**パイプライン**と**並行性**で考える必要があります。フレーム N をレンダリングし、フレーム N-1 で推論し、フレーム N+2 をカメラから取得——すべて同時に。
+
+.非同期カメラ推論パイプライン
+image::images/ML_Inference/Desktop_Applications/camera_pipeline_diagram.svg[Diagram showing the Producer-Consumer pipeline between camera capture, inference, and rendering,800]
+
+=== レイテンシ vs スループットの理解
+
+リアルタイムグラフィックスでは 2 指標が重要:
+1.  **スループット（FPS）**: 秒あたり処理フレーム数。高いほど「滑らかさ」に有利。
+2.  **レイテンシ（ラグ）**: カメラ前の物理的動きから、その動きがラベル付きで画面に現れるまでの時間。低いほど「応答性」に有利。
+
+パイプラインで**スループット**を最大化（30–60 FPS）するが、**レイテンシ**はわずかに増加（画面ラベルが現実より 2–3 フレーム「遅れ」）。分類には完璧なトレードオフ。
+
+== ステップ 1: OpenCV でフレーム取得
+
+映像を処理する前にアプリに取り込む必要があります。プラットフォーム固有 API（Windows の MediaFoundation、Linux の V4L2）も使えますが、**OpenCV** を使います。業界標準の理由: クロスプラットフォームでカメラドライバの messy 詳細を代行。
+
+[source,cpp]
+----
+#include <opencv2/opencv.hpp>
+
+class Camera {
+public:
+    Camera(int id = 0) {
+        cap.open(id);
+        if(!cap.isOpened()) throw std::runtime_error("Camera not found!");
+
+        // Let's request a standard HD stream
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+    }
+
+    bool nextFrame(cv::Mat& frame) {
+        return cap.read(frame);
+    }
+
+private:
+    cv::VideoCapture cap;
+};
+----
+
+== 応答性の高いパイプライン設計
+
+UI を滑らかに保つため**Producer-Consumer**パターンを使います。
+*   **Producer**: カメラ専用スレッド。フレーム準備次第キューへ push。
+*   **Consumer**: 別スレッドがキューから pull し ML モデル実行。
+
+フレーム処理が通常より長くても、カメラの次フレーム取得をブロックせず、Vulkan レンダラーの UI 描画も止めません。
+
+[source,cpp]
+----
+class MLPipeline {
+public:
+    void start() {
+        // Separate threads for capture and inference to keep the UI at 60 FPS
+        captureThread_ = std::thread(&MLPipeline::captureLoop, this);
+        inferenceThread_ = std::thread(&MLPipeline::inferenceLoop, this);
+    }
+
+private:
+    void captureLoop() {
+        while (running_) {
+            auto frame = camera_.grabFrame();
+
+            // Push to queue, dropping old frames if we're falling behind
+            // This ensures we always process the freshest data
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (inferenceQueue_.size() < MAX_QUEUE_SIZE) {
+                inferenceQueue_.push(frame);
+                queueCV_.notify_one();
+            }
+        }
+    }
+
+    void inferenceLoop() {
+        while (running_) {
+            // Wait for a new frame from the capture thread
+            auto frame = waitForFrame();
+
+            // Perform the heavy lifting (Vulkan/ONNX inference)
+            auto results = classifier_.classifyMat(frame);
+
+            // Update the UI with the latest results
+            updateLatestResult(results);
+        }
+    }
+};
+----
+
+このアーキテクチャ:
+
+- **キャプチャスレッド**: 可能な限り速くカメラからフレーム取得、キューへ push
+- **推論スレッド**: フレーム pop、前処理 + 推論、結果 publish
+- **レンダースレッド**（メイン）: ブロックせず最新結果を読み UI レンダリング
+
+推論が追いつけなければフレーム drop——レイテンシ蓄積よりマシ。
+
+== GPU 加速前処理
+
+前処理（リサイズ、正規化、転置）は CPU で高コスト。CPU 実装では 30ms 以上かかることも。Vulkan コンピュートシェーダへ移すと **2ms 未満**に。
+
+=== シェーダでの双線形リサイズ
+
+複雑な補間ループを書く代わりに、GPU 組み込み**テクスチャサンプリング**ハードウェアを活用。正規化座標 `(u, v)` でテクスチャサンプルすると、GPU ハードウェアが双線形補間を無料で実行！
+
+[source,glsl]
+----
+// Inside the Preprocessing Shader
+// Sample from input texture (hardware bilinear filtering handles resize)
+vec2 uv = (vec2(outPos) + 0.5) / vec2(params.outputWidth, params.outputHeight);
+vec3 rgb = texture(inputImage, uv).rgb;
+----
+
+=== 数学的正規化
+
+前と同じ ImageNet 正規化式を、すべてのピクセルで並列適用。
+
+[latexmath]
+++++
+\text{vec3 normalized} = (\text{rgb} - \text{vec3}(0.485, 0.456, 0.406)) / \text{vec3}(0.229, 0.224, 0.225);
+++++
+
+=== 並列 NCHW 転置
+
+シェーダで最も tricky な部分は **Planar（NCHW）** 順での書き込み。バッファを 3 枚の別々「シート」（プレーン）として扱い出力インデックスを計算。
+
+[source,glsl]
+----
+// Write in NCHW order (separate channels)
+uint pixelIdx = outPos.y * params.outputWidth + outPos.x;
+uint planeSize = params.outputWidth * params.outputHeight;
+
+// Plane 0: All Red values
+output.data[0 * planeSize + pixelIdx] = normalized.r;
+// Plane 1: All Green values
+output.data[1 * planeSize + pixelIdx] = normalized.g;
+// Plane 2: All Blue values
+output.data[2 * planeSize + pixelIdx] = normalized.b;
+----
+
+`gl_GlobalInvocationID.xy` で 224×224 出力の各ピクセルに「スレッド」を起動。各スレッドが独自にサンプル、正規化、3 書き込み。CPU より GPU が速い理由。
+
+=== 前処理シェーダコード
+
+[source,glsl]
+----
+#version 450
+
+// Preprocessing shader: resize + normalize + HWC→NCHW transpose
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D inputImage;  // Camera frame
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float data[];
+} output;
+
+layout(push_constant) uniform Params {
+    vec3 mean;     // ImageNet mean: [0.485, 0.456, 0.406]
+    vec3 stddev;   // ImageNet std:  [0.229, 0.224, 0.225]
+    uint outputWidth;   // 224
+    uint outputHeight;  // 224
+} params;
+
+void main() {
+    ivec2 outPos = ivec2(gl_GlobalInvocationID.xy);
+
+    if (outPos.x >= params.outputWidth || outPos.y >= params.outputHeight) {
+        return;
+    }
+
+    // Hardware-accelerated sample
+    vec2 uv = (vec2(outPos) + 0.5) / vec2(params.outputWidth, params.outputHeight);
+    vec3 rgb = texture(inputImage, uv).rgb;
+
+    // Normalization
+    vec3 normalized = (rgb - params.mean) / params.stddev;
+
+    // Planar Transpose
+    uint pixelIdx = outPos.y * params.outputWidth + outPos.x;
+    uint planeSize = params.outputWidth * params.outputHeight;
+
+    output.data[0 * planeSize + pixelIdx] = normalized.r;
+    output.data[1 * planeSize + pixelIdx] = normalized.g;
+    output.data[2 * planeSize + pixelIdx] = normalized.b;
+}
+----
+
+カメラフレームを Vulkan イメージとしてアップロード、コンピュートシェーダ dispatch、推論用結果バッファ read。
+
+== 非同期コンピュート: 高性能の秘訣
+
+実世界 Vulkan アプリでは前処理のたびに `device.waitIdle()` を呼びたくありません。ギア変更のたびに車を止めるようなもの。代わりに**非同期コンピュート**と**タイムラインセマフォ**で Preprocessor と推論エンジン間の非ブロッキング「ハンドシェイク」を作ります。
+
+=== タイムラインセマフォによるハンドシェイク
+
+タイムラインセマフォは GPU 上のカウンタです。GPU に「前処理ジョブ完了時にこのカウンタを 5 に increment」と指示します。バックグラウンド C{pp} スレッドは、データ読み取り前にカウンタが 5 に達するのを正確に待てます。
+
+[source,cpp]
+----
+// 1. Submit GPU preprocessing
+uint64_t waitValue = lastProcessedFrameValue;
+uint64_t signalValue = waitValue + 1;
+
+vk::TimelineSemaphoreSubmitInfo timelineInfo;
+timelineInfo.setWaitSemaphoreValues(waitValue);
+timelineInfo.setSignalSemaphoreValues(signalValue);
+
+// Preprocessing is submitted to the COMPUTE queue
+computeQueue.submit(submitInfo);
+
+// 2. Inference thread waits for the GPU counter to reach signalValue
+vk::SemaphoreWaitInfo waitInfo;
+waitInfo.setSemaphores(*timelineSemaphore);
+waitInfo.setValues(signalValue);
+
+// This blocks the BACKGROUND thread, not the UI!
+device.waitSemaphores(waitInfo, UINT64_MAX);
+
+// 3. GPU data is ready! Now run ONNX inference.
+runInference(preprocessedBuffer);
+----
+
+このアーキテクチャで GPU は**グラフィックスキュー**でメイン UI レンダリングと同時に**コンピュートキュー**で前処理を実行可能。絶対必要なときだけ同期。
+
+== 結果レンダリング: UI 応答性の維持
+
+メインスレッド（UI）は推論スレッドを待ってはいけません。推論が 100ms かかっても UI は 60 FPS でレンダリング継続、「最後に分かった正しい」結果を表示するだけ。
+
+=== 非ブロッキング結果取得
+
+`std::atomic` または `std::mutex` で最新結果を保護。UI スレッドは毎フレーム結果を「peek」。
+
+[source,cpp]
+----
+void renderFrame() {
+    // 1. Peek at the latest result (Thread-safe)
+    ClassificationResult latest;
+    {
+        std::lock_guard<std::mutex> lock(resultMutex);
+        latest = sharedLatestResult;
+    }
+
+    // 2. Always render the live camera feed
+    renderCameraTexture();
+
+    // 3. Overlay results if they are fresh
+    if (latest.confidence > 0.5f) {
+        drawBoundingBox(latest.rect);
+        drawTextOverlay(latest.label, latest.confidence);
+    }
+}
+----
+
+「思考」（推論）を「見る」（キャプチャ）と「見せる」（レンダー）から切り離し、重い ML モデル実行中でもプロフェッショナルで応答的なアプリを作れます。
+
+== 実世界性能の測定
+
+リアルタイム ML アプリのチューニングでは 3 つの独立した数値を追跡します:
+
+1.  **キャプチャ FPS**: ウェブカム制限（通常 30 または 60）。
+2.  **推論 FPS**: AI の秒あたり「思考」数。
+3.  **レンダー FPS**: 画面再描画回数（目標 60+）。
+
+**「ラグ」指標**: `camera.read()` から `UI.render()` までの時間も測定。**エンドツーエンドレイテンシ**。最適化 Vulkan パイプライン + MobileNetV2 では **60ms から 120ms** が目安。
+
+== まとめ
+
+リアルタイムカメラ分類には多段オーケストレーション戦略が必要:
+
+*   **スレッド化パイプライン**: キャプチャ、推論、レンダリングは別スレッドで互いを stall させない。
+*   **Producer-Consumer**: キューベースでカメラは常にフレーム置き場、AI は常に仕事あり。
+*   **GPU 前処理**: Vulkan コンピュートシェーダとテクスチャサンプリングハードウェアでリサイズ・正規化を並列処理。
+*   **タイムラインセマフォ**: UI をブロックせず GPU コンピュートと CPU 推論を同期する高性能ハンドシェイク。
+*   **非ブロッキング UI**: レンダーループを切り離し AI が懸命に働いてもアプリは対話的。
+
+グラフィックス世界と AI 世界の橋——応答性の高いリアルタイム ML アプリケーションが得られました。
+
+xref:ML_Inference/Desktop_Applications/04_ci_render_validation.adoc[前へ: CI/CD レンダー検証] | xref:ML_Inference/Desktop_Applications/06_rl_automated_exploration.adoc[次へ: RL ベース自動探索]

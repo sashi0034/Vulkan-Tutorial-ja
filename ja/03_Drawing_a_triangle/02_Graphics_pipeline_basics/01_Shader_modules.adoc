@@ -1,0 +1,363 @@
+:pp: {plus}{plus}
+
+= シェーダモジュール
+
+以前のAPIとは異なり、Vulkanではシェーダコードを、https://en.wikipedia.org/wiki/OpenGL_Shading_Language[GLSL]、https://shader-slang.org/slang/user-guide/[Slang]、https://en.wikipedia.org/wiki/High-Level_Shading_Language[HLSL]のような人間が読める構文ではなく、バイトコード形式で指定する必要があります。このバイトコード形式はhttps://www.khronos.org/spir[SPIR-V]と呼ばれ、Vulkan（KhronosのAPI）向けに設計されています。グラフィックスおよびコンピュートシェーダの記述に使える形式ですが、本チュートリアルではVulkanのグラフィックスパイプラインで使うシェーダに焦点を当てます。
+
+バイトコード形式を使う利点は、シェーダコードをネイティブコードに変換するGPUベンダー製コンパイラが大幅に単純になることです。過去には、GLSLのような人間が読める構文では、一部のGPUベンダーが標準の解釈をかなり柔軟にしていたことがありました。そうしたベンダーのGPUで非自明なシェーダを書くと、別ベンダーのドライバが構文エラーでコードを拒否したり、さらに悪いことにコンパイラのバグでシェーダの挙動が異なったりするリスクがありました。SPIR-Vのような素直なバイトコード形式なら、そうした問題は避けられることが期待されます。
+
+とはいえ、このバイトコードを手で書く必要はありません。Khronosは、SlangをSPIR-Vにコンパイルするベンダー非依存のコンパイラを公開しています。このコンパイラは、シェーダコードが標準に完全準拠していることを検証し、プログラムと一緒に配布できる1つのSPIR-Vバイナリを生成するように設計されています。このコンパイラをライブラリとして組み込み、実行時にSPIR-Vを生成することもできますが、本チュートリアルでは、将来の章でリフレクションを扱うまではそれは行いません。`slangc`を直接使うこともできますが、代わりにcmakeのビルドプロセスで`slangc`を使います。
+
+SlangはC風の構文を持つシェーディング言語です。そのプログラムには、オブジェクトごとに呼び出されるmainエントリポイントがあります。HLSLと同様、Slangは入出力にパラメータと戻り値を使い、それらの変数が何に関係するかを注釈で記述します。言語には、組み込みのベクトル・行列プリミティブなど、グラフィックスプログラミングを助ける多くの機能が含まれます。外積、行列とベクトルの積、AI向けの自動微分、ベクトルまわりの反射といった演算用の関数も含まれます。ベクトル型は要素数を示す数字付きの`float`です。たとえば3D位置は`float3`に格納します。
+
+スウィズル演算子と呼ばれる`.x`のようなメンバで単一成分にアクセスできますが、複数の成分から同時に新しいベクトルを作ることもできます。たとえば式`float3(1.0,2.0, 3.0).xy`は`float2`になります。ベクトルのコンストラクタは、ベクトルオブジェクトとスカラー値の組み合わせも受け取れます。たとえば`float3`は`float3(float2(1.0, 2.0), 3.0)`で構築できます。
+
+前の章で述べたように、画面に三角形を出すには頂点シェーダとフラグメントシェーダを書く必要があります。次の2節でそれらのSlangコードを扱い、その後、1つのSPIR-Vバイナリを生成してプログラムに読み込む方法を示します。
+
+== 頂点シェーダ
+
+頂点シェーダは各入力頂点を処理します。ワールド位置、色、法線、テクスチャ座標などの属性を入力として受け取ります。出力はクリップ座標での最終位置と、色やテクスチャ座標などフラグメントシェーダへ渡す必要がある属性です。これらの値はラスタライザによってフラグメント間で補間され、滑らかなグラデーションが得られます。
+
+*クリップ座標*は頂点シェーダからの4次元ベクトルで、その後、ベクトル全体を最後の成分で割ることで*正規化デバイス座標*に変換されます。これらの正規化デバイス座標はhttps://en.wikipedia.org/wiki/Homogeneous_coordinates[同次座標]であり、フレームバッファを次のような[-1, 1]×[-1, 1]の座標系に対応づけます。
+
+image::/images/normalized_device_coordinates.svg[]
+
+コンピュータグラフィックスに触れたことがあるなら、すでにおなじみのはずです。OpenGLを使ったことがあるなら、Y座標の符号が反転していることに気づくでしょう。Z座標はDirect3Dと同じく、0から1の範囲を使います。
+
+最初の三角形では変換を適用せず、次の形状を作るために3頂点の位置を正規化デバイス座標として直接指定します。
+
+image::/images/triangle_coordinates.svg[]
+
+頂点シェーダから最後の成分を`1`にしたクリップ座標として出力すれば、正規化デバイス座標を直接出力できます。こうすると、クリップ座標から正規化デバイス座標への除算は何も変えません。
+
+通常これらの座標は頂点バッファに格納しますが、Vulkanで頂点バッファを作成してデータを埋めるのは簡単ではありません。そのため、画面に三角形が現れる満足感を得るまではそれを後回しにします。その間、少し異例なことをします。頂点シェーダの中に座標を直接含めます。コードは次のとおりです。
+
+[,slang]
+----
+static float2 positions[3] = float2[](
+    float2(0.0, -0.5),
+    float2(0.5, 0.5),
+    float2(-0.5, 0.5)
+);
+
+struct VertexOutput {
+    float4 sv_position : SV_Position;
+};
+
+[shader("vertex")]
+VertexOutput vertMain(uint vid : SV_VertexID) {
+    VertexOutput output;
+    output.sv_position = float4(positions[vid], 0.0, 1.0);
+    return output;
+}
+----
+
+`vertMain`関数は各頂点に対して呼び出されます。パラメータ内の組み込みの`SV_VertexID`注釈付き変数には、現在の頂点のインデックスが含まれます。通常これは頂点バッファへのインデックスですが、ここではハードコードした頂点データの配列へのインデックスになります。各頂点の位置はシェーダ内の定数配列からアクセスし、ダミーの`z`と`w`成分と組み合わせてクリップ座標の位置を作ります。組み込み注釈`SV_Position`が、VertexOutput構造体の出力を示します。GLSLやHLSLなど他のシェーディング言語に慣れているなら言及しておく価値がありますが、バインディングのための指示はありません。これはSlangの機能です。Slangは宣言の順序からバインディングを自動推論するように設計されています。位置用の構造体はstaticであり、シェーダにバインディングが不要であることをコンパイラに伝えています。よく観察する人は、メイン関数をmainではなくvertMainと呼んでいることに気づくでしょう。これはSlangとSPIR-Vの両方が1ファイルに複数のエントリポイントをサポートするためです。頂点／フラグメントの単一ペア以上のシェーダを持つパイプラインを扱うときに重要です。たとえばレイトレーシングでは、単純なデモでも4つ以上のシェーダがあり、それぞれ小さくても自分用のファイルが必要になり煩雑になり得ます。Slangのもう一つの大きな機能は、シェーダライブラリやモジュールを作れることです。この機能豊かなシェーディング言語についてさらに調べるのは読者への演習とします。
+
+本チュートリアルでは、シェーダを単一ファイルに保つベストプラクティスを示します。GLSLを知っているなら、attachmentsフォルダに直接翻訳したGLSL版のシェーダがあります。
+
+== フラグメントシェーダ
+
+頂点シェーダからの位置で形成される三角形は、画面上のある領域をフラグメントで埋めます。フラグメントシェーダはこれらのフラグメントに対して呼び出され、フレームバッファ（または複数のフレームバッファ）用の色と深度を生成します。三角形全体に赤を出力する単純なフラグメントシェーダは次のとおりです。
+
+[,slang]
+----
+[shader("fragment")]
+float4 fragMain() : SV_Target
+{
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+----
+
+`fragMain`エントリポイント関数は、頂点シェーダの`vertMain`が各頂点に対して呼ばれるのと同様に、各フラグメントに対して呼ばれます。Slangでの色は、R、G、B、アルファチャネルが[0, 1]範囲内にある4成分ベクトルです。頂点シェーダの`SV_Position`とは異なり、現在のフラグメントの色を出力する組み込み変数はありません。各フレームバッファ用に独自の出力変数を指定する必要があり、`SV_TARGET`注釈がそのフレームバッファのインデックスを指定します。赤色は、インデックス`0`の最初の（そして唯一の）フレームバッファにリンクされたこの`outColor`変数に書き込まれます。
+
+== 頂点ごとの色
+
+三角形全体を赤くするのはあまり面白くありません。次のような見た目の方がずっと良くないでしょうか。
+
+image::/images/triangle_coordinates_colors.png[]
+
+これを実現するには、両方のシェーダにいくつかの変更が必要です。まず、3頂点それぞれに異なる色を指定する必要があります。頂点シェーダには、位置と同様に色の配列を含めるようにします。
+
+[,slang]
+----
+static float3 colors[3] = float3[](
+    float3(1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 0.0, 1.0)
+);
+----
+
+次に、これらの頂点ごとの色をフラグメントシェーダに渡し、補間された値をフレームバッファへ出力できるようにするだけです。頂点シェーダに色用の出力を追加し、`vertMain`関数内で書き込みます。
+
+[,glsl]
+----
+struct VertexOutput {
+    float3 color;
+    float4 sv_position : SV_Position;
+};
+
+[shader("vertex")]
+VertexOutput vertMain(uint vid : SV_VertexID) {
+    VertexOutput output;
+    output.sv_position = float4(positions[vid], 0.0, 1.0);
+    output.color = colors[vid];
+    return output;
+}
+----
+
+次に、フラグメントシェーダに対応するパラメータを追加します。
+
+[,glsl]
+----
+[shader("fragment")]
+float4 fragMain(VertexOutput inVert) : SV_Target
+{
+    float3 color = inVert.color;
+    return float4(color, 1.0);
+}
+----
+
+入力変数は必ずしも同じ名前である必要はありませんが、同じファイル内なら繰り返さない方が便利です。いずれにせよ、`location`ディレクティブで指定されたインデックスを使ってリンクされます。`fragMain`関数は、色とアルファ値を出力するように変更されました。上の画像に示すように、`fragColor`の値は3頂点の間のフラグメントに対して自動的に補間され、滑らかなグラデーションになります。
+
+== シェーダのコンパイル
+
+プロジェクトのルートディレクトリに`shaders`というディレクトリを作り、シェーダを`shader.slang`というファイルに保存してください。
+
+`shader.slang`の内容は次のとおりです。
+
+[,slang]
+----
+static float2 positions[3] = float2[](
+    float2(0.0, -0.5),
+    float2(0.5, 0.5),
+    float2(-0.5, 0.5)
+);
+
+static float3 colors[3] = float3[](
+    float3(1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 0.0, 1.0)
+);
+
+struct VertexOutput {
+    float3 color;
+    float4 sv_position : SV_Position;
+};
+
+[shader("vertex")]
+VertexOutput vertMain(uint vid : SV_VertexID) {
+    VertexOutput output;
+    output.sv_position = float4(positions[vid], 0.0, 1.0);
+    output.color = colors[vid];
+    return output;
+}
+
+[shader("fragment")]
+float4 fragMain(VertexOutput inVert) : SV_Target
+{
+    float3 color = inVert.color;
+    return float4(color, 1.0);
+}
+----
+
+これらを`slangc`プログラムでSPIR-Vバイトコードにコンパイルします。
+
+*Windows*
+
+次の内容の`compile.bat`ファイルを作成します。
+
+[,bash]
+----
+C:/VulkanSDK/x.x.x.x/bin/slangc.exe shader.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o slang.spv
+----
+
+`slangc.exe`へのパスを、Vulkan SDKをインストールした場所のパスに置き換えてください。ファイルをダブルクリックして実行します。
+
+*Linux*
+
+次の内容の`compile.sh`ファイルを作成します。
+
+[,bash]
+----
+/home/user/VulkanSDK/x.x.x.x/x86_64/bin/slangc shader.slang -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name -entry vertMain -entry fragMain -o slang.spv
+----
+
+`slangc`へのパスを、Vulkan SDKをインストールした場所のパスに置き換えてください。`chmod +x compile.sh`でスクリプトを実行可能にし、実行します。
+
+*プラットフォーム固有の手順ここまで*
+
+これらの2つのコマンドは、コンパイラにSlangソースファイルを読み込み、`-o`（出力）フラグを使ってSPIR-V 1.4バイトコードファイルを直接出力するよう指示します。
+
+注: 執筆時点では、SlangCはGLSLを経由してSPIR-Vに到達する必要なく、SPIR-V 1.3以上をネイティブにサポートします。本チュートリアルの内容はすべてSPIR-V 1.0でも動作し得ますが、そのためにはSlangシェーダを複数ファイルに分割する必要があり、それでは何の意味があるのかという疑問が残ります。加えて、SPIR-V 1.4から始めることで、古いバージョンから始めるのではなく、標準の最新を知ることになります。
+
+シェーダに構文エラーがあれば、期待どおりコンパイラが行番号と問題を教えてくれます。たとえばセミコロンを抜かして、コンパイラスクリプトを再度実行してみてください。また、引数なしでコンパイラを実行し、どのようなフラグをサポートしているかも試してみてください。たとえば、バイトコードを人間が読める形式で出力することもでき、シェーダが何をしているか、この段階でどのような最適化が適用されたかを正確に確認できます。
+
+コマンドラインでのシェーダコンパイルは最も単純な選択肢の一つですが、本チュートリアルで使う最善の道は、CMake関数を作ることです。
+
+[,cmake]
+----
+function (add_slang_shader_target TARGET)
+  cmake_parse_arguments ("SHADER" "" "" "SOURCES" ${ARGN})
+  set (SHADERS_DIR ${CMAKE_CURRENT_LIST_DIR}/shaders)
+  set (ENTRY_POINTS -entry vertMain -entry fragMain)
+  add_custom_command (
+          OUTPUT ${SHADERS_DIR}
+          COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
+  )
+  add_custom_command (
+          OUTPUT  ${SHADERS_DIR}/slang.spv
+          COMMAND ${SLANGC_EXECUTABLE} ${SHADER_SOURCES} -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name ${ENTRY_POINTS} -o slang.spv
+          WORKING_DIRECTORY ${SHADERS_DIR}
+          DEPENDS ${SHADERS_DIR} ${SHADER_SOURCES}
+          COMMENT "Compiling Slang Shaders"
+          VERBATIM
+  )
+  add_custom_target (${TARGET} DEPENDS ${SHADERS_DIR}/slang.spv)
+endfunction()
+----
+
+その後、ターゲットにSlangのビルドステップを次のように追加できます。
+
+[,cmake]
+----
+add_slang_shader_target( foo SOURCES ${SHADER_SLANG_SOURCES})
+add_dependencies(bar foo)
+----
+
+== シェーダの読み込み
+
+SPIR-Vシェーダを生成する方法ができたので、いずれグラフィックスパイプラインに差し込むためにプログラムへ読み込む番です。まず、ファイルからバイナリデータを読み込む単純なヘルパー関数を書きます。
+
+[,c++]
+----
+#include <fstream>
+
+...
+
+static std::vector<char> readFile(const std::string& filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("failed to open file!");
+    }
+}
+----
+
+`readFile`関数は、指定したファイルのすべてのバイトを読み、`std::vector`が管理するバイト配列として返します。次の2つのフラグでファイルを開くところから始めます。
+
+* `ate`: ファイルの末尾から読み始めます
+* `binary`: バイナリファイルとして読みます（テキスト変換を避けます）
+
+ファイル末尾から読み始める利点は、読み取り位置を使ってファイルサイズを求め、バッファを確保できることです。
+
+[,c++]
+----
+std::vector<char> buffer(file.tellg());
+----
+
+その後、ファイル先頭にシークし直し、一度にすべてのバイトを読みます。
+
+[,c++]
+----
+file.seekg(0, std::ios::beg);
+file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+----
+
+最後にファイルを閉じてバイトを返します。
+
+[,c++]
+----
+file.close();
+
+return buffer;
+----
+
+この関数を`createGraphicsPipeline`から呼び出し、2つのシェーダのバイトコードを読み込みます。
+
+[,c++]
+----
+void createGraphicsPipeline() {
+    auto shaderCode = readFile("shaders/slang.spv");
+}
+----
+
+バッファのサイズを表示し、実際のファイルサイズ（バイト）と一致するか確認して、シェーダが正しく読み込まれたことを確かめてください。バイナリコードなのでnull終端は不要で、後でサイズを明示的に指定します。
+
+== シェーダモジュールの作成
+
+コードをパイプラインに渡す前に、`vk::raii::ShaderModule`オブジェクトでラップする必要があります。そのためのヘルパー関数`createShaderModule`を作成しましょう。
+
+[,c++]
+----
+[[nodiscard]] vk::raii::ShaderModule createShaderModule(const std::vector<char>& code) const
+{
+}
+----
+
+この関数はバイトコードを含むバッファをパラメータとして受け取り、そこから`vk::raii::ShaderModule`を作成します。
+
+シェーダモジュールの作成は単純です。バイトコードへのポインタとその長さを指定するだけで済みます。この情報は`vk::ShaderModuleCreateInfo`構造体で指定します。注意点は、バイトコードのサイズはバイト単位で指定するのに対し、バイトコードポインタは`char`ポインタではなく`uint32_t`ポインタであることです。そのため、以下に示すように`reinterpret_cast`でポインタをキャストする必要があります。このようなキャストを行うときは、データが`uint32_t`のアラインメント要件を満たすことも保証する必要があります。幸い、データは`std::vector`に格納されており、デフォルトのアロケータが最悪ケースのアラインメント要件をすでに満たすようにしています。
+
+[,c++]
+----
+vk::ShaderModuleCreateInfo createInfo{ .codeSize = code.size() * sizeof(char), .pCode = reinterpret_cast<const uint32_t*>(code.data()) };
+----
+
+その後、コンストラクタで`vk::raii::ShaderModule`を作成できます。
+
+[,c++]
+----
+vk::raii::ShaderModule shaderModule{ device, createInfo };
+----
+
+パラメータはこれまでのオブジェクト作成関数と同じで、論理デバイスとcreate info構造体への参照です。コードを含むバッファは、シェーダモジュール作成直後に解放できます。作成したシェーダモジュールを返すことを忘れないでください。
+
+[,c++]
+----
+return shaderModule;
+----
+
+シェーダモジュールは、以前ファイルから読み込んだシェーダバイトコードと、そこに定義された関数の薄いラッパーにすぎません。GPUが実行するマシンコードへのSPIR-Vバイトコードのコンパイルとリンクは、グラフィックスパイプラインが作成されるまで行われません。つまり、パイプライン作成が終わったらすぐにシェーダモジュールを破棄してよいので、クラスメンバではなく`createGraphicsPipeline`関数内のローカル変数にします。
+
+[,c++]
+----
+void createGraphicsPipeline() {
+    vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/slang.spv"));
+----
+
+== シェーダステージの作成
+
+シェーダを実際に使うには、実際のパイプライン作成プロセスの一部として、`vk::PipelineShaderStageCreateInfo`構造体を通じて特定のパイプラインステージに割り当てる必要があります。
+
+まず頂点シェーダ用の構造体を埋めます。再び`createGraphicsPipeline`関数内です。
+
+[,c++]
+----
+vk::PipelineShaderStageCreateInfo vertShaderStageInfo{ .stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule,  .pName = "vertMain" };
+----
+
+最初のパラメータは操作しているステージです。次の2つのパラメータは、コードを含むシェーダモジュールと、呼び出す関数（_エントリポイント_）を指定します。つまり、複数のフラグメントシェーダを単一のシェーダモジュールにまとめ、異なるエントリポイントで挙動を区別することが可能です。
+
+もう1つ（省略可能な）メンバ`pSpecializationInfo`があります。ここでは使いませんが、議論する価値があります。シェーダ定数の値を指定できます。単一のシェーダモジュールを使い、パイプライン作成時にその中で使う定数に異なる値を指定して挙動を構成できます。描画時に変数でシェーダを構成するより効率的です。コンパイラがこれらの値に依存する`if`文の除去などの最適化を行えるからです。そのような定数がなければ、メンバを`nullptr`に設定でき、構造体の初期化では自動的にそうなります。
+
+フラグメントシェーダ向けに構造体を変更するのは簡単です。
+
+[,c++]
+----
+vk::PipelineShaderStageCreateInfo fragShaderStageInfo{ .stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain" };
+----
+
+最後に、これら2つの構造体を含む配列を定義します。後で実際のパイプライン作成ステップで参照します。
+
+[,c++]
+----
+vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+----
+
+パイプラインのプログラム可能な段階の記述は以上です。xref:./02_Fixed_functions.adoc[次の章]では、固定機能の段階を見ていきます。
+
+link:/attachments/09_shader_modules.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

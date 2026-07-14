@@ -1,0 +1,206 @@
+:pp: {plus}{plus}
+= ラグドールハンドオフ
+
+== 単純なモード切り替えの問題
+
+キャラクターが死亡・気絶・物理インパルスを受ける時点で、アニメーションシステムが駆動するスケルトンがあります。毎フレーム、アニメーションシステムはキーフレームを参照し、ブレンドし、結果をシーングラフのジョイントトランスフォームに書き込みます。コンピュートシェーダーはそれらのジョイントトランスフォームでメッシュをスキニングします。すべて決定論的でクリーン、アニメーター制御です。
+
+そして何かが起きます—死亡イベント、体力ゼロ、衝突インパルス—スケルトンの制御を物理エンジンに渡す必要があります。物理エンジンはジョイント位置を受け取り、各身体区画に開始速度を与え、物理法則だけから落下をシミュレートします。
+
+素朴なアプローチは、すべてのボーンボディをキネマティックからダイナミックに切り替えて物理エンジンを走らせることです。理論上は動くはずです。実際には、しばしば不快な視覚アーティファクトを生みます。キャラクターがわずかに異なるポーズにスナップしたり、四肢が拘束位置から外にポップしたり、ラグドールがアニメーション位置から爆発するように見えたりします。これが **ラグドールハンドオフ問題** で、明示的に対処すべき三つの密接に関連した問題が原因です。
+
+第一の問題は **ポーズ初期化** です。物理ボディがキネマティックに動かされていたなら、前の節で議論したようにボディをテレポートせず `move_kinematic` を正しく使っていれば、すでに正しいワールド空間位置にあるはずです。しかしモードスイッチを切り替える前に、物理エンジンの内部状態がシーングラフの現在状態と実際に一致していることを確認する必要があります。
+
+第二の問題は **速度初期化** です。走行アニメーション中のキャラクターは静止していません。腕は振れ、身体は回転し、重心は前進しています。ラグドール物理に切り替え、各身体区画の開始速度がすべてゼロなら、ラグドールは即座に誤った結果を生みます。キャラクターは前進を続けず、腕は脇に垂れた状態にスナップし、シミュレーションはアニメーションが終わった位置と合わない状態にキャラクターを「テレポート」します。
+
+第三の問題は **拘束解決** です。キネマティックからダイナミックに切り替えると、ボディ間の拘束がソルバで有効になります。ボディが拘束をほぼ満たす位置にないと、ソルバの最初のフレームで大きな補正力が生じ、ボディを有効な位置に引き寄せます—爆発のように見えます。
+
+== ステートマシン
+
+ハンドオフを管理する最もきれいな方法は、各キャラクターのラグドール用の明示的ステートマシンです。必要な状態は次のとおりです。
+
+**ANIMATED**: アニメーションシステムが完全に制御。すべてのボーンボディはキネマティック。物理エンジンはボディの位置を知っているがシミュレートしない。
+
+**BLENDED**: アニメーションからラグドールへ即座に切り替えるのではなく、数フレームかけてブレンドする遷移状態。アニメーションシステムはまだ動作しているが、アニメーションポーズの影響を段階的に減らしている。任意だが、見た目がはるかに良くなる。
+
+**RAGDOLL**: 物理エンジンが完全に制御。すべてのボーンボディはダイナミック。アニメーションシステムのロジックはまだ動作（後でブレンドアウトする必要があれば）するが、出力はアニメーションシステムではなく物理エンジンから読む。
+
+[source,cpp]
+----
+enum class RagdollState {
+    ANIMATED,
+    BLENDED,   // Transitional - animation blending out, physics blending in
+    RAGDOLL
+};
+
+struct RagdollController {
+    RagdollState state          = RagdollState::ANIMATED;
+    float        blend_weight   = 0.0f;   // 0 = full animation, 1 = full ragdoll
+    float        blend_duration = 0.15f;  // How many seconds the transition takes
+    float        blend_elapsed  = 0.0f;   // Time spent in BLENDED state
+};
+----
+
+`blend_weight` は第3章のクロスフェードブレンドの節でアニメーションシステムに渡したものです—最終スケルトンポーズのうちアニメーションと物理のどちらから来るかを制御します。`blend_duration` 秒かけて 0 から 1 に線形増加させれば、硬いスナップではなく滑らかな視覚遷移が得られます。
+
+== ハンドオフのトリガー
+
+ラグドール遷移を開始するとき、遷移状態を初期化し、アニメーションシステムからキャラクターの現在速度を取得する関数を呼びます。
+
+[source,cpp]
+----
+void begin_ragdoll_transition(
+    RagdollController& controller,
+    std::vector<BoneBody>& bodies,
+    const glm::vec3& character_root_velocity,
+    PhysicsWorld& physics_world)
+{
+    if (controller.state != RagdollState::ANIMATED) return;
+
+    controller.state        = RagdollState::BLENDED;
+    controller.blend_elapsed = 0.0f;
+    controller.blend_weight  = 0.0f;
+
+    // Critical step: set the initial linear velocity of the root body
+    // to match the character's current movement velocity. This prevents
+    // the ragdoll from starting from a dead stop.
+    for (auto& bone_body : bodies) {
+        // For now, give every body the root's velocity.
+        // A more sophisticated system would compute per-bone velocities
+        // from the animation's joint velocities.
+        physics_world.set_linear_velocity(bone_body.physics_body, character_root_velocity);
+
+        // Activate the body: tell the physics engine it will be simulated next frame.
+        // We do NOT switch to dynamic yet — we wait until blend_weight reaches 1.
+        physics_world.activate_body(bone_body.physics_body);
+    }
+}
+----
+
+ここで最も重要なのは速度初期化です。`character_root_velocity` はキャラクターコントローラーから得るべきです—ラグドールトリガーが発火したときキャラクターが動いていた速度ベクトルです。典型的なゲームでは、毎フレームキャラクターカプセルに適用していた速度です。これを初期ラグドール速度として与えれば、ハンドオフ後もキャラクターは同じ方向に動き続け、その場で崩れ落ちません。
+
+より正確（かつ複雑）なアプローチは、アニメーションのジョイント速度データからボーンごとの速度を計算することです。多くのアニメーションシステムは各ジョイントの変化率を追跡し、それで各ボーンボディの角速度を独立に初期化できます—根の均一な速度ではなく、腕に独自の振りの運動量を与えます。特に激しいアニメーション中のキャラクターでより現実的なラグドールになりますが、正しく実装するにはより多くの作業が必要です。
+
+== 遷移フレーム
+
+BLENDED 状態の間、毎フレームブレンド重みを進め、1 に達したらモード切り替えを完了する必要があります。
+
+[source,cpp]
+----
+void update_ragdoll_controller(
+    RagdollController& controller,
+    std::vector<BoneBody>& bodies,
+    std::vector<Node>& nodes,
+    PhysicsWorld& physics_world,
+    float delta_time)
+{
+    if (controller.state == RagdollState::ANIMATED) {
+        // Sync animation transforms to kinematic physics bodies every frame
+        sync_animation_to_physics(nodes, bodies, physics_world);
+        return;
+    }
+
+    if (controller.state == RagdollState::BLENDED) {
+        controller.blend_elapsed += delta_time;
+        controller.blend_weight   = std::min(controller.blend_elapsed / controller.blend_duration, 1.0f);
+
+        // While blending, keep syncing kinematic bodies so the physics engine
+        // has up-to-date positions if/when it needs to read them
+        sync_animation_to_physics(nodes, bodies, physics_world);
+
+        if (controller.blend_weight >= 1.0f) {
+            // Transition complete: switch all bodies from kinematic to dynamic
+            for (auto& bone_body : bodies) {
+                physics_world.set_motion_type(bone_body.physics_body, JPH::EMotionType::Dynamic);
+            }
+            controller.state = RagdollState::RAGDOLL;
+        }
+        return;
+    }
+
+    if (controller.state == RagdollState::RAGDOLL) {
+        // Read back physics positions into the scene graph
+        sync_physics_to_animation(nodes, bodies, physics_world);
+    }
+}
+----
+
+BLENDED フェーズ中もキネマティックボディの同期を続ける点に注目してください。遷移中、物理エンジンは遷移開始時のポーズからの拘束違反をまだ解決している可能性があります。ボディを同期し続けることで、遷移中に拘束が互いに戦うのを防ぎます。
+
+== 物理結果のシーングラフへの読み戻し
+
+RAGDOLL 状態になると、物理エンジンがスケルトンを所有します。毎フレーム、シミュレートされたボディ位置をシーングラフに読み戻し、ジョイントのワールド行列—したがってコンピュートスキニングパイプライン—が物理出力を反映するようにします。
+
+[source,cpp]
+----
+void sync_physics_to_animation(
+    std::vector<Node>& nodes,
+    const std::vector<BoneBody>& bodies,
+    PhysicsWorld& physics_world)
+{
+    for (const auto& bone_body : bodies) {
+        Node& node = nodes[bone_body.node_index];
+
+        // Get the physics-simulated world position and orientation
+        PhysicsPose pose = physics_world.get_body_pose(bone_body.physics_body);
+
+        // Reconstruct a world matrix from position + quaternion
+        node.world_matrix = pose.to_matrix();
+
+        // Mark the node as Clean — we just set its world matrix directly,
+        // so the scene graph should not recalculate it from local transforms
+        // this frame.
+        node.status = TransformStatus::Clean;
+    }
+
+    // Nodes that are NOT physics-driven (scene props, non-ragdoll characters)
+    // must still be updated through the normal dirty-flag propagation.
+    // The scene graph's update pass should skip nodes where status is Clean.
+}
+----
+
+ここには注意が必要な微妙な問題があります。第2章のシーングラフは、ローカルトランスフォームと親行列からトポロジカル順でワールド行列を計算します。ラグドール中はワールド行列を直接書き込み—その計算全体をバイパスします。シーングラフ更新ループがローカルトランスフォームから再計算して、物理由来のワールド行列を上書きしないようにする必要があります。
+
+`TransformStatus::Clean` ステータスは、シーングラフ更新コードがクリーンノードを完全にスキップするように書かれていればこれを処理します。シーングラフが常に再計算するなら、ワールド行列を計算する前に更新ループがチェックする明示的な `is_physics_driven` フラグを追加する必要があります。
+
+== 視覚ブレンド
+
+コントローラーで追跡してきた `blend_weight` は、キャラクターのアニメーションブレンドシステムに渡すものです。0 のときポーズは完全にアニメーションから、1 のとき完全にラグドールから来ます。その間は線形補間で二つをブレンドします。
+
+[source,cpp]
+----
+// During the BLENDED phase, capture the animation world matrices BEFORE
+// sync_physics_to_animation overwrites them, then blend:
+if (controller.state == RagdollState::BLENDED) {
+    // 1. Snapshot current (animation-driven) world matrices.
+    std::vector<glm::mat4> anim_matrices;
+    anim_matrices.reserve(bodies.size());
+    for (const auto& bone_body : bodies) {
+        anim_matrices.push_back(nodes[bone_body.node_index].world_matrix);
+    }
+
+    // 2. Read physics poses into the nodes.
+    sync_physics_to_animation(nodes, bodies, physics_world);
+
+    // 3. Blend animation and physics results.
+    float w = controller.blend_weight;
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        Node& node = nodes[bodies[i].node_index];
+
+        glm::vec3 anim_pos = glm::vec3(anim_matrices[i][3]);
+        glm::quat anim_rot = glm::quat_cast(glm::mat3(anim_matrices[i]));
+
+        PhysicsPose pose = physics_world.get_body_pose(bodies[i].physics_body);
+
+        glm::vec3 blended_pos = glm::mix(anim_pos,      pose.position,    w);
+        glm::quat blended_rot = glm::slerp(anim_rot,    pose.orientation, w);
+
+        node.world_matrix = glm::translate(glm::mat4(1.0f), blended_pos)
+                          * glm::mat4_cast(blended_rot);
+    }
+}
+----
+
+クォータニオンブレンドに `glm::slerp`（Spherical Linear intERPolation）を使うことはここで不可欠です。クォータニオンの直接線形補間は単位長を保たず、ブレンド中間で回転が遅くなります。SLERP は幾何学的に正しい、滑らかで一定速度の回転遷移を生みます。
+
+xref:Advanced_glTF/Physics_Integration/03_constraints_and_joint_limits.adoc[前へ: 拘束とジョイント制限] | xref:Advanced_glTF/Physics_Integration/05_self_collision_filtering.adoc[次へ: 自己衝突フィルタリング]

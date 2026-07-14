@@ -1,0 +1,65 @@
+:pp: {plus}{plus}
+= Cooperative Matrices によるオン GPU 推論
+
+ニューラルネットは重い行列乗算に依存します。空間周波数でセンサデータを処理するため、**Cooperative Matrices**（Advanced Compute シリーズで詳述）を使い、GPU の専用 ML ハードウェアを活用します。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+標準の OpenXR ランタイムはセンサ取り込みを行いますが、そのデータの処理方法は規定しません。Vulkan の Cooperative Matrix 拡張を使い、オン GPU で高速 ML 推論を実装し、標準 OpenXR フレームループがネイティブに協調しない予測フィルタリングと物体認識を可能にします。
+
+== 概念: 専用 ML ハードウェア
+
+ニューラルネットは重い行列乗算に依存します。標準コンピュートシェーダーは汎用タスクに優れていますが、ML では **Cooperative Matrices**（Advanced Compute シリーズで詳述）を使います。これにより **Subgroup**（32 または 64 スレッド）全体が単一ユニットとして働き、大きな行列タイルを一操作で掛け、最大スループットのため従来のキャッシュ階層を迂回します。
+
+[source,cpp]
+----
+// Enabling cooperative matrix features using designated initializers
+vk::PhysicalDeviceCooperativeMatrixFeaturesKHR coopMatrixFeatures{
+    .cooperativeMatrix = VK_TRUE
+};
+
+vk::DeviceCreateInfo deviceCreateInfo{
+    .pNext = &coMatrixFeatures
+};
+----
+
+Slang では、`cooperative_matrix` 型を使い専用ハードウェアを活用します。
+
+[source,slang]
+----
+// Using Slang's Matrix fragments for cooperative ML inference
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void performHandRefinement() {
+    cooperative_matrix<float16_t, id_Subgroup, 16, 16> input;
+    cooperative_matrix<float16_t, id_Subgroup, 16, 16> weights;
+
+    input.load(rawJointBuffer, jointOffset);
+    weights.load(weightBuffer, weightOffset);
+
+    // High-speed Matrix-Multiply-Accumulate (MMA)
+    auto result = mul(input, weights);
+
+    result.store(refinedPoseBuffer, poseOffset);
+}
+----
+
+== 発展: 予測視線とマルチ GPU 推論
+
+Vulkan により、標準取り込みを超えて ML 性能を押し上げられます。
+
+*   **予測視線スムージング**: **Cooperative Matrix** と **Subgroup Operations** を使い、最近の OpenXR テレメトリに基づきユーザーの将来の視線点を予測する小さなニューラルネットをフレームループ内で直接走らせ、拡張が報告するより速くできる。
+*   **マルチ GPU 推論**: Vulkan の **Device Groups** を使い、ML 推論ワークロード（物体認識など）を複数 GPU に分散し、OpenXR 合成パス前に結果を集約できる。
+
+== なぜオン GPU か？ レイテンシと電力
+
+空間コンピューティングでは、GPU 上で ML 推論を行うことが不可欠です。
+
+1.  **レイテンシ**: ML 処理のためセンサデータを CPU へ送ると可視ラグが生まれ、**プレゼンス** の感覚が壊れる。
+2.  **電力効率**: 行列アクセラレータは汎用 ALU より大幅にエネルギー効率が良い。モバイルヘッドセットでは熱スロットリングを減らす。
+
+TIP: Cooperative Matrices と ML 推論の詳細については、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#VK_KHR_cooperative_matrix[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/17_ML_Inference_Spatial/01_introduction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/17_ML_Inference_Spatial/03_refining_spatial_data.adoc[Next]

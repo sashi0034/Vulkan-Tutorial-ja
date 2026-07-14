@@ -1,0 +1,72 @@
+:pp: {plus}{plus}
+= ステレオビューポートとシザー管理
+
+XR 向けに描画するとき、単一スクリーンへ描いているのではありません。それぞれ独自の視点と投影を持つ複数の **ビュー** へ描いています。ダイナミックレンダリングの文脈でこれを管理するには、**ビューポート** と **シザー** を習得しなければなりません。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+複数ビューポートの管理は空間ビューの標準要件です。各眼についてランタイムが提供する特定の光学パラメータにレンダリングを揃えるため、Vulkan のダイナミック状態を使わなければなりません。
+
+== 眼のアーキテクチャ: 非対称投影
+
+XR でビューポートとシザー管理が極めて重要な理由を理解するには、レンズ光学を見る必要があります。標準ディスプレイと異なり、XR レンズはしばしばオフセットされ、**非対称投影** につながります。
+
+*   **レンズ歪み補正**: ランタイムはレンズの物理的曲率を知っています。「バレル歪み」ワープ過程で失われるディテールを補うため、通常は物理ディスプレイパネル解像度より *大きい*（しばしば 1.4 倍）ビューポートを提供します。
+*   **最適ピクセル密度**: ランタイムはレンズの「スイートスポット」（光学中心）がレンダー済みピクセルの最高濃度を受け取ることを保証します。
+*   **フラスタム整合**: 非対称 FOV 値はヘッドセット筐体の物理的限界と完全に揃うよう設計されており、デバイスに物理的に隠れたピクセルを描画して GPU サイクルを浪費しないようにします。
+
+[source,cpp]
+----
+// Configure the viewport for a specific eye view using designated initializers
+vk::Viewport eyeViewport{
+    .x = 0.0f,
+    .y = 0.0f,
+    .width = static_cast<float>(viewWidth),
+    .height = static_cast<float>(viewHeight),
+    .minDepth = 0.0f,
+    .maxDepth = 1.0f
+};
+
+// Configure the scissor to match
+vk::Rect2D eyeScissor{
+    .offset = {0, 0},
+    .extent = {viewWidth, viewHeight}
+};
+
+// Dynamic state update in our command buffer
+commandBuffer.setViewport(0, eyeViewport);
+commandBuffer.setScissor(0, eyeScissor);
+----
+
+== シングルテクスチャ vs. 配列テクスチャスワップチェーン
+
+XR ランタイムによっては、両眼を含む 1 枚の大きな「アトラス」テクスチャ、または各眼が独自レイヤーを持つ **配列テクスチャ** を受け取る場合があります。
+
+*   **アトラス**: `vk::Viewport` と `vk::Rect2D` の `x`／`y` オフセットを使い、眼を横並びに描画します。
+*   **配列テクスチャ**: ビューポートは `(0,0)` のまま、`vk::RenderingAttachmentInfo` の `imageView` レイヤーを変えます。
+
+ダイナミックレンダリングでは、アタッチメントとビューポートパラメータを調整するだけで両ケースを容易に扱えます。この柔軟性により、レンダーループを書き直さずに異なるヘッドセットアーキテクチャ（広 FOV ヘッドセット vs. モバイル VR など）をサポートできます。
+
+== 発展: Variable Rate Shading とステンシルマスキング
+
+Vulkan では、OpenXR が提供する標準の矩形ビューポートを超えて進めます。
+
+*   **Variable Rate Shading（VRS）**: Vulkan の VRS を使い、シェーディングレートをビューポート解像度から切り離せます。レンズ歪み要件を満たす高解像度ビューポートを使いながら、周辺の GPU 負荷を減らすシェーディングレートイメージを使えます。
+*   **非矩形クリッピング**: OpenXR のシザーは厳密に矩形です。Vulkan の **ステンシルバッファ** を使うと、レンズの可視開口に一致する「隠れ領域マスク」を定義し、ヘッドセット筐体に隠れるピクセルを 1 つも描画しないよう保証できます。
+
+== 最適なビュー管理: ペーシングパターン
+
+状態遷移を最小化し性能を最適化するため、エンジンは各眼ビューについて次のパターンに従います。
+
+1.  **インデックス取得**: 現在フレームのスワップチェーンインデックスを OpenXR から取得する。
+2.  **ビューのバインド**: `vk::RenderingAttachmentInfo` を正しい眼レイヤーまたはアトラス領域へ向ける。
+3.  **ビューポート／シザー適用**: 現在の眼のフラスタムの正確な境界を GPU に伝える。
+4.  **ドローコール発行**: 予測されたビューと投影行列を使いシーンを描画する。
+
+ビューポートとシザーをダイナミック状態として扱うことで、眼の間でパイプラインオブジェクト全体を切り替える場合に起きる重い「パイプラインストール」を避けます。
+
+TIP: ビューポートとシザー状態の詳細は、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#pipelines-dynamic-state[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/04_Dynamic_Rendering/02_rendering_to_spatial_swapchains.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/04_Dynamic_Rendering/04_incorporating_into_the_engine.adoc[次へ]

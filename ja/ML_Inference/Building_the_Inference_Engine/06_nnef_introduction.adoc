@@ -1,0 +1,133 @@
+:pp: {plus}{plus}
+
+= NNEF 入門
+
+NNEF（Neural Network Exchange Format）は Khronos 標準で、学習済みニューラルネットワークを人間が読めるグラフと外部バイナリテンソルデータとしてパッケージ化します。設計目標は演算子定義の精密さと安定性、読み・レビュー・diff 可能なテキスト表現の組み合わせです。エンジン作者とコンパイラパイプラインにとって快適なディスク上の契約になります。
+
+本ページでは C{pp} で NNEF を効果的に使う方法を示します。パッケージの中身と ONNX との実務上の違いから始め、Vulkan 実行パスを変えずに NNEF‑Tools の公式 Khronos C{pp} API で取り込む手順を説明します。
+
+== NNEF とは（でないもの）
+
+NNEF パッケージはテキストの `graph.nnef` でモデルを記述し、テンソルデータを付随バイナリに保存します。演算子セットは急速な変更より精密な意味論を意図して標準化されています。形式はツール、コンパイラ、ランタイムの間に位置し、ブラックボックスではなく自前 IR への透明なインポートを望むときにうまく機能します。
+
+対照的に ONNX は進化する演算子セット（opset）を持つ Protocol Buffers ベースのバイナリシリアライゼーションです。幅広さとエコシステムがデスクトップ・サーバーでの「drop-in」利用を魅力的にしますが、定義は外部論文に追従しやすく、より速く動くことがあります。本チュートリアルでは両方をサポートします: 利便性のため ONNX、公式パーサ経由のネイティブパスとして NNEF です。
+
+== NNEF モデルの構造
+
+ディスク上、NNEF モデルは通常ディレクトリです。`graph.nnef` にグラフ本体——演算子、テンソル、形状とデータ型、属性——があります。グラフで参照されるパラメータはテキストファイルの隣の 1 つ以上の生バイナリファイルに保存されます。小さな MLP 風ブロックの短縮例です。
+
+[source]
+----
+version 1.0;
+
+graph (input: tensor<scalar, 1, 784>) -> (prob: tensor<scalar, 1, 10>)
+{
+    # Parameters declared in the package reference external binary files
+    param W1: tensor<scalar, 784, 128>;
+    param b1: tensor<scalar, 128>;
+    param W2: tensor<scalar, 128, 10>;
+    param b2: tensor<scalar, 10>;
+
+    h = add( matmul(input, W1), b1 );
+    h_relu = relu(h);
+    prob = add( matmul(h_relu, W2), b2 );
+}
+----
+
+例の要点は特定の数学ではなく構造です: パラメータが宣言され名前で参照され、演算はプレーンテキスト、形状とデータ型が明示的です。実際のテンソルバイトはパッケージが参照する外部ファイルにあり、グラフ自体を小さく読みやすく保ちます。
+
+== 本チュートリアルでの推奨用法
+
+ソースモデルが ONNX でチームが NNEF に標準化したい場合、ONNX→NNEF 変換を取得ステップとして行います。本チュートリアル内の実行では、NNEF‑Tools の公式 Khronos C{pp} パーサで NNEF を直接読み込みます。実行のために ONNX に戻す必要はありません。
+
+== 公式 C{pp} API による NNEF 読み込み（アダプタパターン）
+
+パースと実行を分離します。NNEF パーサが軽量なメモリ内表現を埋め、アダプタで `ComputationGraph` を構築します。Vulkan 実行パス——バッファ、パイプライン、ディスパッチ——は ONNX、TFLite、NNEF で同一です。
+
+[source,cpp]
+----
+// High‑level ingestion outline; see NNEF‑Tools cpp_api.md for exact classes/functions.
+// Repo: https://github.com/KhronosGroup/NNEF-Tools/tree/main/nnef-pyproject#nnef-parser---repository
+// C++ API notes: https://github.com/KhronosGroup/NNEF-Tools/blob/main/nnef-pyproject/cpp_api.md
+
+#include <nnef.h>    // From Khronos NNEF‑Tools (C++ API)
+
+struct ImportStats {
+    size_t parameterBytes = 0;
+    std::map<std::string, size_t> opHistogram;
+};
+
+bool loadNNEFIntoEngine(const std::string& modelDir,
+                        ComputationGraph& graph,
+                        ImportStats* statsOut = nullptr)
+{
+    // 1) Parse package (text graph + external tensor binaries) using the official API.
+    //    The API provides access to tensors (incl. constants) and nodes (ops + attributes).
+    //    Refer to cpp_api.md for the exact parser and graph types.
+    //    Example pseudo‑code:
+    //
+    //    nnef::Parser parser;
+    //    nnef::Graph  nnefGraph = parser.parseDirectory(modelDir);
+
+    // 2) Import tensors (I/O + constants) into our engine’s IR.
+    //    For graph inputs/outputs: create logical tensors with element type and shape.
+    //    For constants: map the external binary buffers and upload to device memory.
+    //    Accumulate total parameter bytes for quick sanity checks.
+
+    // 3) Import operations.
+    //    For each NNEF node:
+    //      Read op type (e.g., "conv", "relu", "matmul", ...)
+    //      Read attributes (kernel_shape, strides, pads, dilation, transpose, etc.)
+    //      Connect inputs/outputs by tensor name
+    //      Create the corresponding Operation in our IR
+    //      Update an op histogram for a concise import summary
+
+    // 4) Handle common shims in the adapter:
+    //    Layout: map between NCHW/NHWC as required by your shaders
+    //    DType: normalize (e.g., float32 vs float16) and set quantization params if used
+    //    Defaults: fill in missing optional attributes with spec defaults
+
+    // 5) Emit a short import summary to logs (helps students validate quickly).
+    //    Example: inputs/outputs, total parameters in MB, and the op histogram.
+
+    return true;
+}
+----
+
+生 API を超える実務的ガイダンス: アダプタは薄く保ち、パース中に GPU リソースを割り当てない。IR オブジェクトとメタデータに集中します。演算子が未サポートなら、演算名、見えた形状とデータ型、不足実装を追加する場所を含む有用なメッセージで速やかに失敗します。短いインポート概要——入出力形状、MiB 単位の総パラメータサイズ、演算子ヒストグラム——を常に出力し、早期に驚きを検出します。
+
+== ビルド統合（C{pp}）
+
+NNEF‑Tools リポジトリからパーサを直接ベンダーするか、環境が提供するならプリビルトパッケージに依存できます。ベンダーは単純: リポジトリ（または浅いコピー）を `third_party/nnef-tools/` 下に置き、`nnef-pyproject/nnef/cpp/include` からヘッダを include し、`nnef-pyproject/nnef/cpp` の最小 C{pp} ソースから小さな静的ライブラリを作りターゲットにリンクします。システムパッケージがあれば CMake で include パスとライブラリを指し、他の依存と同様にリンクします。
+
+CMake スニペット（例示）:
+
+[source,cmake]
+----
+# Assume the NNEF‑Tools repo is placed at third_party/nnef-tools
+set(NNEF_TOOLS_DIR ${CMAKE_SOURCE_DIR}/third_party/nnef-tools/nnef-pyproject)
+include_directories(${NNEF_TOOLS_DIR}/nnef/cpp/include)
+
+# If you create a static lib target "nnef_parser" from the C++ sources in the repo:
+target_link_libraries(your_engine_target PRIVATE nnef_parser)
+----
+
+権威ある最新のビルドガイダンスと API シグネチャは常に上流の `cpp_api.md` を参照してください。
+
+== 重要なマッピング詳細（Vulkan コンピュート向け）
+
+正規の内部レイアウト——画像系演算では NHWC が一般的——を選び、必要ならインポート時に変換します。変換は明示的かつ集中管理します。まず `float32` をサポートし、必要に応じて `float16` と affine INT8 を計画します。量子化スケールと zero-point を IR 内のテンソル横に保持し、シェーダが一貫して読めるようにします。インポート時にランクとブロードキャスト規則を検証し、役立つ場合は正確な形状をプッシュ定数で渡し、コンピュートカーネル内の分岐を避けます。インポート時に十分なサイズ情報を集め、バッファ寿命と再利用を計画します——モデルが大きくなるほど必須です。
+
+== 中立的な位置づけ（ONNX vs NNEF）
+
+ONNX は進化する演算子セットと広いエコシステムを持つ Protocol Buffers ベースのバイナリ形式で、「drop-in」シナリオと多くのツール間の交換に優れています。NNEF は精密で安定した演算子定義と容易な検査可能性を強調するテキスト交換形式で、エンジン作者とコンパイラフローに適しています。両方とも有用です。本チュートリアルでは NNEF を公式パーサ経由の第一級ネイティブ入力とし、ONNX は多くのデスクトップワークフロー向けの便利な選択肢のままです。
+
+== 検証チェックリスト
+
+インポート後、エンジンが報告する内容を短時間で sanity check してください。入出力形状が期待と一致するか、総パラメータサイズ（MiB）が選んだモデルに妥当か、演算子構成が合理的か——CNN なら `conv` と `relu` が多い、など——を確認します。小さな推論を実行し参照フレームワークと比較します。浮動小数許容範囲内で一致すれば、経路が正しく配線されたと言えます。
+
+== 権威あるリソース
+
+詳細は Khronos NNEF 概要 https://www.khronos.org/nnef/ から始め、リポジトリ https://github.com/KhronosGroup/NNEF-Tools/tree/main/nnef-pyproject#nnef-parser---repository の公式ツールと C{pp} API を参照し、簡潔な C{pp} API メモ https://github.com/KhronosGroup/NNEF-Tools/blob/main/nnef-pyproject/cpp_api.md を手元に置いてください。
+
+xref:ML_Inference/Building_the_Inference_Engine/05_model_formats_as_input.adoc[前へ: 入力としてのモデル形式] | xref:ML_Inference/Building_the_Inference_Engine/07_putting_it_together.adoc[次へ: まとめ]

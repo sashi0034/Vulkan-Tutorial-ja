@@ -1,0 +1,150 @@
+= 物理同期: アニメーションと物理のリンク
+
+== 二つの世界をつなぐ: アニメーションと物理の対立
+
+モダンなゲームエンジンでは、キャラクターの動きはほぼ常に、根本的に異なる二つのシステムの綱引きです。**アニメーションシステム** と **物理エンジン** です。これらのシステムを「同期」する必要がある理由を理解するには、まず両者が世界をまったく異なる視点で見ていることを認識する必要があります。
+
+**アニメーションシステム** は本質的に再生装置です。事前録画または計算された「ポーズ」（ボーンの位置と回転）を取り、視覚メッシュに適用します。腕が石壁を貫通しても、足が地面から 6 インチ浮いていても気にしません。目的は、歩行、剣の振り、被弾リアクションなど、特定の動作をしている *ように見せる* ことだけです。
+
+一方 **物理エンジン** は、世界の物理法則の数学的シミュレーションです。重力、摩擦、衝突などの力に基づいてオブジェクトの動きを計算します。「アニメーション」や「スケルトン」は知りません。**リジッドボディ**—質量と運動量を持つボックス、球、カプセルなどの数学的形状—だけを知っています。目的は、オブジェクトが互いに貫通しないこと、衝突時に現実的に反応することです。
+
+課題は、二つのシステムがキャラクターの位置についてしばしば意見が食い違うことです。アニメーションが手を壁の中に置くべきだと言えば、物理エンジンは「いや、表面で止まらなければならない」と言います。物理エンジンが落下すべきだと言えば、アニメーションシステムはまだ「立ち待機」クリップを再生しているかもしれません。
+
+これを解くには **双方向リンク** が必要です。視覚シーングラフと物理シミュレーションの間でトランスフォームデータを行き来させる橋です。
+
+== 登場人物の理解: Kinematic と Dynamic
+
+この橋を実装するには、物理ボディが動作しうる二つの主要モードを理解する必要があります。これらのモードは、どちらのシステムが現在「マスター」でどちらが「スレーブ」かを定義します。
+
+=== 1. Kinematic: アニメーションが主導
+**Kinematic** ボディは、物理シミュレーションの法則に「免疫」がある特殊なリジッドボディです。無限の質量を持ち、重力の影響を受けず、他オブジェクトに押されません。代わりに、位置と回転は CPU によって直接設定されます（本チュートリアルではアニメーションシステムが行います）。
+
+Kinematic ボディを「ゴッドモード」オブジェクトと考えてください。アニメーションが指示する場所へ正確に動き、ボックスや他キャラクターなどの Dynamic オブジェクトを止められない力で押しのけます。通常のゲームプレイ中のキャラクター四肢はこのように表現します。腕はアニメーションがそう言うから動き、物理エンジンは Kinematic コライダーを使って、その腕が世界の他の何かに当たったかを判定します。
+
+=== 2. Dynamic: 物理が主導
+**Dynamic** ボディ（キャラクター文脈ではしばしば「ラグドール」ボディと呼ばれる）は、物理エンジンによって完全にシミュレートされる標準的なリジッドボディです。重力に反応し、他オブジェクトに押され、運動量と摩擦の法則に従います。
+
+このモードでは、その特定のボーンに対するアニメーションシステムは事実上オフになります。物理エンジンが「真実の源（Source of Truth）」となり、結果のトランスフォームデータをシーングラフへ引き戻し、視覚メッシュが物理シミュレーションに追従します。これが、キャラクターが気絶または死亡したときに見る古典的な「ラグドール」効果です。
+
+== 同期パイプライン
+
+シーングラフと物理エンジンの同期は、毎フレーム行われる慎重に編成されたループです。間違ったタイミングで同期すると、**1 フレーム遅延** のリスクがあります。視覚キャラクターが常に物理表現の一歩遅れ、本来衝突すべきオブジェクトを貫通して見える「ゴースト」やクリッピングのアーティファクトが生じます。
+
+標準的なエンジン更新ループは次の順序に従います。
+
+1.  **アニメーション更新**: エンジンは時間、ブレンド、アニメーションクリップに基づき、すべてのボーンの新しいローカルポーズを計算します。
+2.  **シーングラフ更新**: これらのローカルポーズを階層下へ伝播し、すべてのノードの `world_matrix` を計算します（**Dirty Flag** システムを使用）。
+3.  **Kinematic 同期（アニメーション → 物理）**: 「Kinematic」モードのすべてのノードについて、新しく計算した `world_matrix` を物理エンジンへプッシュします。これにより、次のシミュレーションステップ用のコライダーが配置されます。
+4.  **物理ステップ**: 物理エンジンは 1 ティック分（例: 1/60 秒）をシミュレートします。すべての Dynamic ボディの衝突と力を解決します。
+5.  **Dynamic 同期（物理 → アニメーション）**: 「Dynamic」モードのすべてのノードについて、物理エンジンから新しいワールド位置を取得し、シーングラフのローカル空間座標へ戻します。
+6.  **最終クリーンアップ**: 変更されたノードを「Dirty」とマークし、レンダラーおよび他システム（レイトレーシング加速構造の更新など）が正しい物理駆動の位置を使うようにします。
+
+== 実装: Kinematic 同期（アニメーションが物理を駆動）
+
+キャラクターが標準アニメーションを実行しているとき、シーングラフが主要な真実の源です。物理エンジンのボーンプロキシ（コライダー）を視覚ノードに合わせて「テレポート」する必要があります。
+
+物理エンジンは通常、生の 4x4 行列ではなく分離した位置と回転データを期待するため、ノードの `world_matrix` を分解する必要があります。
+
+[source,cpp]
+----
+void sync_kinematic_to_physics(const Node& node, JPH::BodyID body_id,
+                                PhysicsWorld& physics_world) {
+    // Optimization: Only update physics if the visual node has actually moved
+    if (node.status & TransformStatus::WorldDirty) {
+
+        // 1. Extract the Translation
+        // The 4th column of a standard 4x4 matrix contains the world-space position.
+        PhysicsPose pose;
+        pose.position = glm::vec3(node.world_matrix[3]);
+
+        // 2. Extract the Rotation
+        // This gives us the world-space orientation without any scaling factors.
+        pose.orientation = node.get_world_rotation();
+
+        // 3. Update the Physics Representation
+        // move_kinematic teleports the kinematic body to the new pose.
+        physics_world.move_kinematic(body_id, pose);
+    }
+}
+----
+
+**スケーリングに関する注意**: ほとんどの物理エンジンは、リジッドボディのスケールが 1.0 であると仮定します。アーティストが Blender でボーンをスケールした場合、`world_matrix` にそのスケールが含まれます。行列を位置とクォータニオンに分解することで、意図的にスケールを除去し、安定したシミュレーションに必要なものだけを物理エンジンへ提供します。
+
+== 実装: Dynamic 同期（ラグドールの引き渡し）
+
+双方向リンクの最も複雑な部分は、物理が制御を取る **Dynamic 同期** です。ラグドールを視覚化するには、物理ボディのワールド空間トランスフォームを階層的シーングラフノードへマッピング戻す必要があります。
+
+ここでの数学はよくある落とし穴です。シーングラフは階層的なため、`world_matrix` を単純に上書きできません。そうすると、次に `update_transforms()` が呼ばれたとき、親子計算（`ParentWorld * LocalMatrix`）が物理位置を（今は不正確な）アニメーション位置で上書きしてしまいます。
+
+代わりに、物理エンジンが提供する特定のワールド空間位置になるために、親に対する **ローカルトランスフォーム** が何である必要があるかを計算しなければなりません。
+
+[source,cpp]
+----
+void sync_physics_to_dynamic(Node& node, JPH::BodyID body_id,
+                              const PhysicsWorld& physics_world,
+                              std::vector<Node>& nodes) {
+    // 1. Get the new world transform from the physics simulation
+    PhysicsPose pose = physics_world.get_body_pose(body_id);
+    glm::mat4 new_world_matrix = pose.to_matrix();
+
+    // 2. Convert world matrix to local transform relative to parent
+    // The fundamental formula for our hierarchy is: World = ParentWorld * Local
+    // To solve for Local, we multiply both sides by the inverse of ParentWorld:
+    // Local = Inverse(ParentWorld) * World
+    glm::mat4 local;
+    if (node.parent_index != INVALID_NODE_INDEX) {
+        const Node& parent = nodes[node.parent_index];
+        local = glm::inverse(parent.world_matrix) * new_world_matrix;
+    } else {
+        // Root nodes have no parent, so world space is identical to local space
+        local = new_world_matrix;
+    }
+
+    // Decompose the local matrix into the SRT components stored on the node
+    node.translation    = glm::vec3(local[3]);
+    node.scale          = glm::vec3(glm::length(glm::vec3(local[0])),
+                                    glm::length(glm::vec3(local[1])),
+                                    glm::length(glm::vec3(local[2])));
+    glm::mat3 rot_only;
+    rot_only[0] = glm::normalize(glm::vec3(local[0]));
+    rot_only[1] = glm::normalize(glm::vec3(local[1]));
+    rot_only[2] = glm::normalize(glm::vec3(local[2]));
+    node.local_rotation = glm::quat_cast(rot_only);
+
+    // 3. Mark the node dirty so its children and the renderer update correctly
+    node.mark_dirty();
+}
+----
+
+物理のワールド空間座標をローカル空間座標へ変換することで、階層的シーングラフの整合性を保ちます。これにより、キャラクターが移動するプラットフォーム（エレベーターなど）の上でラグドール化しても、物理シミュレーションされながら親プラットフォームの動きに正しく追従します。
+
+== シミュレーションの管理: 衝突フィルタリング
+
+キャラクター物理の最後の重要な側面が **自己衝突** です。ラグドールでは、各肢が別々のリジッドボディです。腕のカプセルコライダーが胴体のコライダーと衝突できると、関節で肢が空間を奪い合い、ラグドールが「爆発」したり激しくジッターします。
+
+これを防ぐために、Jolt Physics は **オブジェクトレイヤー** を使います。グローバルに定義されたレイヤーペアテーブルが、どのレイヤーが相互作用できるかを指定します。`set_object_layer()` を使って各ボディをレイヤーに割り当てます。
+
+[source,cpp]
+----
+// Object layer constants — defined once at physics initialization.
+constexpr uint16_t LAYER_ENVIRONMENT = 0; // Ground, walls, buildings
+constexpr uint16_t LAYER_CHARACTER   = 1; // The character's own limbs
+constexpr uint16_t LAYER_PLAYER      = 2; // Other players or NPCs
+
+// Example: Assign a bone collider to the character layer.
+// The layer-pair table (set up during PhysicsWorld::global_init()) prevents
+// LAYER_CHARACTER bodies from colliding with each other, avoiding self-collision.
+void setup_bone_physics(JPH::BodyID body_id, PhysicsWorld& physics_world) {
+    physics_world.set_object_layer(body_id, LAYER_CHARACTER);
+}
+----
+
+コライダーに対するこの「ソーシャルディスタンシング」により、キャラクターの腕は自身の胸を貫通しても幻影の力を生まず、地面への衝突やプレイヤーの武器による打撃には反応できます。
+
+== まとめ
+
+双方向同期を実装することで、アニメーションの美的世界と物理の数学的世界のギャップを埋めました。シーングラフノードは、どちらのシステムからも駆動可能な統一インターフェースとして機能し、スクリプト化されたアニメーションと創発的な物理シミュレーションの間の複雑な遷移—モダンなキャラクターアクションを定義するもの—を可能にします。
+
+次の節では、これらのコライダーのセットアップを自動化する方法を見ます。コードですべてのボーンのカプセルを手動設定する代わりに、glTF の "extras" とカスタムメタデータを活用し、アーティストのソースファイルから直接物理プロキシを構築します。
+
+xref:Advanced_glTF/Scene_Graph_Hierarchy/02_engine_expansion.adoc[前へ: エンジン拡張] | xref:Advanced_glTF/Scene_Graph_Hierarchy/04_metadata_and_physics_extras.adoc[次へ: メタデータと物理 extras]

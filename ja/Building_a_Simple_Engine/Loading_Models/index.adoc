@@ -1,0 +1,23 @@
+:pp: {plus}{plus}
+
+= モデルの読み込み: アニメーションと PBR を備えた glTF ローダーの統合
+
+== 章の概要
+
+「シンプルなエンジンの構築」シリーズの第 3 章へようこそ。前章でエンジンアーキテクチャとカメラシステムを探ったあと、ここでは glTF 形式を使ってモダンな 3D アセットを扱える堅牢なモデル読み込みシステムを作ります。シーングラフ、アニメーションシステム、PBR レンダリングを実装し、エンジンの基盤を完成させます。
+
+この章は、追いやすくするためにいくつかの節に分かれています。
+
+1. xref:Building_a_Simple_Engine/Loading_Models/01_introduction.adoc[はじめに] - 何を構築するかと前提条件の概要
+2. xref:Building_a_Simple_Engine/Loading_Models/02_project_setup.adoc[プロジェクトのセットアップ] - エンジンプロジェクトの構成方法
+3. xref:Building_a_Simple_Engine/Loading_Models/03_model_system.adoc[モデル読み込みシステムの実装] - 中核となるデータ構造の作成
+4. xref:Building_a_Simple_Engine/Loading_Models/04_loading_gltf.adoc[glTF モデルの読み込み] - glTF ファイルのパースと処理
+5. xref:Building_a_Simple_Engine/Loading_Models/05_pbr_rendering.adoc[PBR レンダリングの実装] - Physically Based Rendering の設定
+6. xref:Building_a_Simple_Engine/Loading_Models/06_multiple_objects.adoc[複数オブジェクトのレンダリング] - 複数のモデルインスタンスの管理
+7. xref:Building_a_Simple_Engine/Loading_Models/07_scene_rendering.adoc[シーンのレンダリング] - シーングラフの描画
+8. xref:Building_a_Simple_Engine/Loading_Models/08_animations.adoc[アニメーションの更新] - モデルのアニメーション
+9. xref:Building_a_Simple_Engine/Loading_Models/09_conclusion.adoc[まとめ] - 要約と今後の方向性
+
+各節は前の節の上に積み上げられるため、順番に進めることを推奨します。この章はエンジンアーキテクチャとカメラと変換の章で紹介した概念の上にも築かれます。この章を終えると、よく構造化されたアーキテクチャ、カメラシステム、モデル読み込み機能を持つ Vulkan ベースの 3D エンジンの包括的な基盤が得られます。
+
+xref:../index.adoc[シンプルなエンジンの構築へ戻る]

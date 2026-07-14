@@ -1,0 +1,10 @@
+:pp: {plus}{plus}
+= プラットフォーム分岐: デスクトップ DirectMode 対 モバイル Tiled/ASW
+
+空間コンピューティングは、二つの根本的に異なるハードウェア宇宙にまたがる点で独特です。一端には、400 ワットの GPU と高速 PCIe バスで駆動されるハイエンド **デスクトップ VR** PC があります。もう一端には、10 ワット未満の厳しい電力予算でモバイルプロセッサ上で動く **モバイルスタンドアロン** ヘッドセットがあります。
+
+エンジン開発者として、これらのプラットフォームを同じに扱うことはできません。デスクトップで 200 FPS で走る「標準」レンダリングループは、モバイル電池を数分で消耗させるか、空間的快適さに必要な安定した 72Hz を維持できない可能性が高いです。
+
+この章では、両方のプラットフォームを習得するのに必要な手法を探ります。**Direct Mode** と **HDR10** を使いハイエンド GPU を飽和させる方法、そして **Tile-Based Rendering（TBR）** と **Application SpaceWarp（ASW）** を使いモバイルシリコンから最後の一滴まで性能を引き出す方法を学びます。この章の終わりまでに、検出された空間ハードウェアに基づき忠実度と効率を自動スケールするよう、エンジンのバックエンドをどう設計するかを知るでしょう。
+
+xref:OpenXR_Vulkan_Spatial_Computing/18_Semantic_Occlusion/04_incorporating_into_the_engine.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/19_Platform_Divergence/02_desktop_high_end.adoc[Next]

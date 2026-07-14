@@ -1,0 +1,195 @@
+= 高度なメモリ管理: メモリウォールを破る
+:pp: ++
+:stem: latexmath
+
+カーネルを最適化し、重みを量子化しました。MobileNetV2 は 14MB に快適に収まります。しかし要件が変わり、7 billion パラメータ（latexmath:[\approx 14 \text{ GB}）の **大規模言語モデル（LLM）** を 8GB GPU のラップトップで動かすよう求められます。
+
+これが **メモリウォール** です。現代 AI モデルは GPU VRAM より速く成長。すべてを単純割り当てしようとすると `VK_ERROR_OUT_OF_DEVICE_MEMORY` でクラッシュ。
+
+本章では GPU メモリをプロのように管理する方法を学びます。**実用経路**（ONNX Runtime メモリフットプリント最適化）と **学習経路**（カスタムリソースエイリアシングサブアロケータ構築）の両方を探ります。
+
+== 実用経路: ライブラリメモリの最適化
+
+ONNX Runtime 使用時、すぐに `vkBindBufferMemory` を心配する必要はありませんが、**メモリアリーナ** は管理が必要。
+
+=== 1. メモリアリーナ設定
+ONNX Runtime は内部で Arena と呼ぶ「Buddy Allocator」を使用。デフォルトではシステムコール最小化のため大チャンク割り当て。組み込みでは aggressive すぎることがある。
+
+[source,cpp]
+----
+Ort::SessionOptions options;
+
+// Configure the CPU Arena
+// '1' enables the arena, '0' disables it (for absolute minimal footprint)
+options.AddConfigEntry("session.use_ort_model_bytes_for_initializers", "1");
+
+// Configure the GPU Arena (WebGPU/DirectML)
+// You can limit the total memory ONNX is allowed to touch
+options.AddConfigEntry("session.gpu_mem_limit", "2147483648"); // 2GB
+----
+
+=== 2. メモリマッピング（External Initializers）
+Llama-3 や Stable Diffusion のようなモデルでは、全体を RAM の `std::vector<uint8_t>` にロードできません。GPU に触れる前に CPU メモリ不足。
+
+*   **プロの手**: **メモリマッピング**（`mmap` または `CreateFileMapping`）。OS がディスク上のモデルファイルを仮想配列として扱う。
+*   **ONNX 統合**: これらのマップポインタを「External Initializers」として ONNX Runtime に使わせ、標準「Load -> Copy」サイクルをバイパス。
+
+== ウォールの数学: スループット vs レイテンシ
+
+モデルが VRAM に大きすぎる場合、重みをシステム RAM に置き需要に応じ GPU へ「ストリーミング」。ボトルネックは **PCIe バス**。
+
+[latexmath]
+++++
+\text{Stream Latency} = \frac{\text{Model Size}}{\text{Bus Bandwidth}}
+++++
+
+PCIe 4.0 x16 スロット（latexmath:[31.5 \text{ GB/s}]）上の 14GB モデル:
+[latexmath]
+++++
+\frac{14 \text{ GB}}{31.5 \text{ GB/s}} \approx 444 \text{ milliseconds}
+++++
+
+GPU 数学が **ゼロ** 時間でも、モデルは latexmath:[2 \text{ FPS}] より速くならない。レイヤ latexmath:[N] の「計算」時間の裏でレイヤ latexmath:[N+1] の「ロード」時間を隠す **非同期転送** が必要。
+
+== 戦略 1: リソースエイリアシング（バッファプール）
+
+ML で最も無駄なパターンは、各レイヤ出力に固有バッファを割り当てること。レイヤ 1 はバッファ A へ出力、レイヤ 2 は A を読み B へ書き込み。レイヤ 50 まで 50 バッファ——任意時点で 48 はアイドル。
+
+**リソースエイリアシング** で複数「仮想」バッファが同一物理メモリを共有。
+
+=== 生存期間解析アルゴリズム
+
+エイリアスにはグラフ内各テンソルの **生存期間（Liveness）** を計算。
+
+.Tensor Liveness and Memory Aliasing
+image::images/ML_Inference/Advanced_Topics/tensor_liveness.svg[Diagram showing non-overlapping tensor intervals sharing the same memory offset, 600]
+
+1.  **トレース**: 実行グラフを走査。各テンソルについて書き込む最初のレイヤと読む最後のレイヤのインデックスをマーク。
+2.  **オーバーラップ**: 2 テンソルの `[First, Last]` 区間が重ならなければ同一メモリを共有可能。
+3.  **ヒープパッキング**: GPU メモリを 1D ヒープとして扱い **First-Fit Decreasing** で区間を可能な限り密にパック。
+
+=== 実装: ライフサイクル（C++）
+
+テンソルの時間（レイヤインデックス）と空間（バイト）での residency を表す構造。
+
+[source,cpp]
+----
+struct TensorInterval {
+    std::string name;
+    uint32_t firstLayer; // Index of the layer that creates it
+    uint32_t lastLayer;  // Index of the layer that last reads it
+    VkDeviceSize size;
+    VkDeviceSize offset = 0; // To be calculated
+};
+----
+
+=== Vulkan でのエイリアス適用
+
+オフセット計算後、複数 `VkBuffer` を作成するが **同一** `VkDeviceMemory` ブロックにバインド。
+
+[source,cpp]
+----
+// 1. Calculate total required memory pool size
+VkDeviceSize totalPoolSize = calculateRequiredHeap(tensors);
+
+// 2. Allocate one big block of DEVICE_LOCAL memory
+vk::MemoryAllocateInfo allocInfo{ .allocationSize = totalPoolSize, ... };
+auto sharedMemory = device.allocateMemory(allocInfo);
+
+// 3. Bind virtual buffers to the pool with calculated offsets
+for (const auto& t : tensors) {
+    // This is the core trick: multiple buffers, one memory object
+    device.bindBufferMemory(t.vkBuffer, sharedMemory, t.offset);
+}
+----
+
+**重要な安全注意**: エイリアシング使用時、同一メモリを共有するレイヤ間では **パイプラインバリア** 必須。レイヤ 5 がレイヤ 2 が使い終わったオフセットに書き込む場合、バリアでレイヤ 2 の読み取りが本当に完了してからレイヤ 5 がメモリを破壊しないことを保証。
+
+== 戦略 2: Ping-Pong バッファによる重みストリーミング
+
+重み自体が大きすぎる（LLM）場合、レイヤごとに「ストリーミング」必要。GPU をストールさせずに **Ping-Pong バッファリング**。
+
+*   **バッファ A**: GPU が現在計算中のレイヤの重み。
+*   **バッファ B**: DMA エンジンが *次* レイヤの重みで充填中。
+
+=== 非同期ハンドシェイク
+CPU、DMA エンジン（Transfer Queue）、Compute エンジン（Compute Queue）を **タイムラインセマフォ** で協調。
+
+[source,cpp]
+----
+// CPU Orchestration Loop
+for (int i = 0; i < numLayers; ++i) {
+    // 1. Wait for the pre-fetch of Layer i to finish
+    vk::SemaphoreWaitInfo wait{ .semaphore = weightReady[i], .value = 1 };
+    device.waitSemaphores(wait, UINT64_MAX);
+
+    // 2. Dispatch Compute for Layer i
+    cmd.dispatch(...);
+
+    // 3. Start the pre-fetch for Layer i+1 immediately (Non-blocking)
+    if (i + 1 < numLayers) {
+        submitAsyncTransfer(weights[i+1], bufferPingPong[(i+1)%2]);
+    }
+}
+----
+
+=== ゼロコピー同期: 「フェンス vs セマフォ」選択
+重みストリーミング時、同期に 2 選択:
+1.  **フェンス（粗い）**: CPU が GPU 完了を待つ。コーディング容易だが OS コンテキストスイッチ中 GPU が数マイクロ秒アイドル。
+2.  **タイムラインセマフォ（細かい）**: GPU が *DMA エンジン* 完了を待つ。CPU はループに入らない。高性能ストリーミングの **ゴールドスタンダード**。
+
+[source,cpp]
+----
+// GPU-to-GPU Synchronization (No CPU intervention)
+vk::TimelineSemaphoreSubmitInfo timelineInfo;
+timelineInfo.setWaitSemaphoreValues(transferCompleteValue);
+timelineInfo.setSignalSemaphoreValues(computeCompleteValue);
+
+submitInfo.setPNext(&timelineInfo);
+computeQueue.submit(submitInfo);
+----
+
+== 戦略 3: 統合メモリでのゼロコピー（SoC）
+
+**Apple Silicon（M1/M2/M3）**、**Intel Xe**、**ARM Mali（Android）** をターゲットにする場合、巨大な利点: **物理統合メモリ**。CPU と GPU が同一シリコンと同一物理 RAM を共有。
+
+*   **間違い**: 「Staging」バッファから「Device Local」バッファへの `vkCmdCopyBuffer`。これらのチップでは冗長コピーでメモリ帯域 50% 浪費、バッテリ消耗。
+*   **プロの方法**: `VK_EXT_external_memory_host` を使用。`malloc` や `std::vector` からの標準 CPU ポインタを Vulkan バッファに直接マップ。
+
+[source,cpp]
+----
+// Map an existing CPU buffer directly to Vulkan
+vk::ImportMemoryHostPointerInfoEXT importInfo{
+    .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostPointerEXT,
+    .pHostPointer = my_large_weight_array.data()
+};
+
+vk::MemoryAllocateInfo allocInfo{
+    .pNext = &importInfo,
+    .allocationSize = my_large_weight_array.size(),
+    .memoryTypeIndex = findHostPointerMemoryType()
+};
+
+device.allocateMemory(&allocInfo, nullptr, &sharedMemory);
+----
+GPU は **システム RAM から直接** フル速度で重みを読み取り。転送コマンドなし、レイテンシなし、メモリ重複ゼロ。
+
+== 本番セーフガード: 予算と優先度
+
+実 OS では他アプリが VRAM を争う。プロエンジンは「良き市民」である必要。
+
+1.  **VK_EXT_memory_budget**: 推論開始前に常に `VkPhysicalDeviceMemoryBudgetPropertiesEXT` をクエリ。限界近ければ自動「重み退避」ポリシー（古い重みをシステム RAM へ）。
+2.  **VK_EXT_memory_priority**: 重み優先度を `1.0`（高）、一時活性化バッファを `0.5`（中）に。OS がディスクへスワップ必要時、重みを VRAM に留め temp を先にスワップ。
+
+== まとめ: メモリ管理チェックリスト
+
+1.  **トポロジ検出**: 統合（Unified）なら `VK_EXT_external_memory_host` 経由 **ゼロコピー** ポインタ。
+2.  **活性化プール**: 生存期間 aware サブアロケータで非重複テンソルをエイリアス。
+3.  **重みストリーム**: LLM 向けタイムラインセマフォ使用 **Ping-Pong** 非同期転送パイプライン。
+4.  **Pinned Memory**: デスクトップではすべてホスト側バッファを **Host-Coherent** かつ **Host-Visible** にし latexmath:[31 \text{ GB/s}] で DMA 可能に。
+
+メモリ管理は **ロジスティクス**。プログラマーであるだけでなく、狭いパイプを通じてギガバイトを動かす交通整理役。
+
+本セクション最終章では **モデル最適化**——ネットワーク自体をより効率的に書き換える方法。
+
+xref:ML_Inference/Advanced_Topics/03_vendor_optimizations.adoc[前へ: ベンダー固有最適化] | xref:ML_Inference/Advanced_Topics/05_model_optimization.adoc[次へ: モデル最適化技法]

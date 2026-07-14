@@ -1,0 +1,58 @@
+:pp: {plus}{plus}
+= 環境取り込み: デジタルツインのスキャン
+
+仮想物体を物理世界と相互作用させるには、エンジンがまずその世界の幾何を捉えなければなりません。この過程は **環境取り込み（Environmental Ingestion）** または **シーン理解** として知られます。`XR_MSFT_scene_understanding` のような OpenXR 拡張や、ベンダー横断の **Scene Mesh** 機能を使い、光子と三角形の間のギャップを埋められます。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan の併用**。
+
+OpenXR 拡張経由で環境幾何を取り込むことは、Mixed Reality 相互作用を可能にする標準的な方法です。物理と仮想の整列を保証するため、センサ生成メッシュを Vulkan マップ済みバッファへストリームするには、これらの拡張を使う必要があります。
+
+== 概念: デジタルツイン
+
+シーン理解は、乱雑な物理世界を構造化された **デジタルツイン** に変えます。XR ランタイムはヘッドセットのカメラと深度センサ（**LiDAR** など）を使い、このツインをリアルタイムで構築します。これは静的モデルではなく、ユーザー環境の動的で進化する表現です。
+
+1.  **空間メッシュ**: ランタイムは部屋内のすべての可視面の 3D 三角形メッシュを生成する。ユーザーが動き見回すにつれメッシュは更新される。
+2.  **セマンティックラベル**: ランタイムはそのメッシュの部分を分類する。「三角形」だけではなく、エンジンは知る: 「これは床」「これはテーブル」「これは人間」。
+3.  **平面検出**: より単純なロジック向けに、ランタイムは大きな平面を識別する。仮想ランプの配置などでは、フル 3D メッシュより処理がはるかに安い。
+
+== Vulkan でのメッシュアクセス
+
+OpenXR からシーンメッシュを要求するとき、一度きりのデータ塊を得るのではありません。更新のストリームに購読しています。エンジンでは、ランタイムが環境変化を合図するたびに更新する動的な `vk::raii::Buffer` オブジェクトを作成してこれを扱います。
+
+[source,cpp]
+----
+// Querying the scene mesh into Vulkan-mapped buffers using designated initializers
+XrSceneMeshBuffersMSFT meshBuffers{
+    .type = XR_TYPE_SCENE_MESH_BUFFERS_MSFT,
+    .vertexCapacityInput = maxVertices,
+    .vertices = reinterpret_cast<XrVector3f*>(*vertexBufferMemory),
+    .indexCapacityInput = maxIndices,
+    .indices = reinterpret_cast<uint32_t*>(*indexBufferMemory)
+};
+
+// The call that populates our Vulkan-mapped memory from the sensors
+xrGetSceneMeshBuffersMSFT(sceneHandle, meshId, &meshBuffers);
+----
+
+重要なのは、このデータが動的であるため、XR ランタイムがまだ頂点を更新している間に GPU が空間メッシュを描こうとしないよう、**タイムラインセマフォ** を使う必要があることです。
+
+== セマンティックラベル: 意味のある相互作用
+
+セマンティックラベルはシーン理解の「知性レイヤ」です。幾何を見るだけでなく、エンジンは問えます: 「**FLOOR** とラベルされたすべての面をくれ」。これにより高レベルの空間ロジックを実装できます。
+
+*   **物理相互作用**: 仮想物体はテーブルではね返り、「空気」はすり抜けるべき。
+*   **AI ナビゲーション**: キャラクターは「床」とラベルされた面だけを歩くべき。
+*   **文脈的オクルージョン**: メッシュが「壁」とラベルされていれば、オクルージョンテストで優先し、仮想窓が物理壁の「内側」に描かれないようにできる。
+
+== 発展: リアルタイムテクスチャマッピングと間引き
+
+Vulkan により、標準メッシュを超えて環境取り込みを洗練できます。
+
+*   **リアルタイムテクスチャマッピング**: Vulkan の **Video Capture** と **Sampling** 拡張を使い、生カメラフィードでスキャン幾何に物理部屋の色を投影し、フォトリアルな「デジタルツイン」をコンピュートシェーダーで作成できる。
+*   **物理プリミティブ間引き**: ランタイムは通常ハイポリメッシュを提供する。Vulkan **コンピュートシェーダー** でリアルタイムメッシュ間引きを行い、OpenXR スキャンをクリーンな物理プリミティブ（平面／箱）へ単純化し、より効率的な衝突検出を可能にできる。
+
+TIP: 詳細については、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#scene_understanding[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/01_introduction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/03_zero_copy_hand_off.adoc[Next]

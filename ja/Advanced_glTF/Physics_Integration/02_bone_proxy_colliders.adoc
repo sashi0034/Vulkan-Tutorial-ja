@@ -1,0 +1,208 @@
+:pp: {plus}{plus}
+= ボーンプロキシコライダー
+
+== 実メッシュを使わない理由
+
+キャラクター物理の衝突に最も直感的なアプローチは、実際のメッシュ表面を衝突形状として使うことです。コンピュートシェーダーはすでにアニメーション済み頂点バッファを生成しているのだから—それをそのまま物理エンジンに渡し、実形状で処理させればよいのではないか、と思うかもしれません。
+
+答えはパフォーマンスと安定性です。物理エンジンの衝突検出は、単純な凸形状で最もうまく機能します。凹メッシュ—ほぼすべてのキャラクター身体部位がそうである—を渡した瞬間、エンジンは凹性を正しく扱うため、はるかに高価な分解アルゴリズムに切り替えなければなりません。典型的なヒューマノイドキャラクターメッシュは数万頂点を持ちます。少数のキャラクター群に対してでもフルメッシュ対メッシュ衝突検出を走らせれば、フレーム予算は一瞬で消えます。
+
+より微妙な問題として、複雑な衝突形状はフレームごとにより多くの接触点を生み、拘束ソルバへの負荷が大きくなります。物理拘束ソルバは、シーン内のすべての接触力とジョイント拘束を反復的に解き、いずれも違反しない構成を見つけるまで動作します。接触が多いほど反復も増え、時間も増えます—複雑形状の余分な精度がゲームプレイで目に見える改善をもたらすことは稀なので、しばしば収穫逓減に陥ります。
+
+業界が何十年も前に落ち着いた解は **プロキシコライダー** です。ボーンの体積に「十分近い」単純形状で、説得力のある衝突を生みつつ、リアルタイムシミュレーションに必要な速度で処理できるほど単純です。「プロキシ」という語は意図的です—これらの形状は実形状の代役であり、表現ではありません。
+
+== 適切な形状の選び方
+
+ヒューマノイドキャラクターでは、二つの形状が大多数のケースをカバーします。**カプセル** と **ボックス** です。
+
+カプセルは半球状のキャップを持つ円柱です。回転対称で滑らか（ジョイントでのトンネリングアーティファクトを防ぐ）であり、定義に半高さと半径の二パラメータだけで済むため、四肢に最適な形状です。物理エンジンはカプセル対カプセル衝突検出を極めて効率的に実行できます。上腕骨（上腕）、尺骨/橈骨（前腕）、大腿骨（太もも）、脛骨（すね）といった長い骨はすべてカプセルでよく近似できます。
+
+ボックスは胴体と骨盤に向いています。おおよそ直方体で、幅・高さ・奥行きの独立した寸法が有益です。頭蓋骨の表現にも妥当です。カプセルよりやや高価ですが、凸メッシュコライダーよりはるかに安価です。
+
+手と足には選択肢があります。手一本にカプセル一つ（手のひらと指を一体の塊として表現）が最も安価で、多くのゲームでは十分です。キャラクターが物体を掴むような、より精密な手の相互作用が必要なら、手のひらに小さなボックス、各指に個別の小さなカプセルを使えますが、慎重にプロファイルすべきです。
+
+== glTF Extras でのコライダープロパティ定義
+
+第2章で glTF の「extras」—任意の glTF ノードに付けられる任意の JSON メタデータ—の概念を紹介しました。コライダー定義を格納するのに適した場所です。コライダーパラメータを glTF アセットに埋め込むことで、物理セットアップをスケルトンデータと同所に保ち、アーティストがエンジンコードに触れず Blender で直接形状を調整できるようにします。
+
+前腕ボーンの典型的なコライダー extra は、Blender のカスタムプロパティでは次のようになります。
+
+[source,json]
+----
+{
+  "physics": {
+    "collider": "capsule",
+    "radius": 0.045,
+    "half_height": 0.13,
+    "mass": 1.2,
+    "collision_group": "arm",
+    "collision_mask": "world,props"
+  }
+}
+----
+
+`collider` フィールドは形状タイプを指定します。`radius` と `half_height` はボーンのローカル座標空間でのカプセル寸法を定義します。`mass` はこの身体区画の重量を物理エンジンに伝えます（現実的なラグドール挙動に重要—前腕は胴体よりかなり軽いべきです）。`collision_group` と `collision_mask` フィールドは、後の節で自己衝突フィルタリングに使います。
+
+C{pp} 側では、第2章のノード解析コードを拡張して物理メタデータも抽出します。
+
+[source,cpp]
+----
+struct ColliderDef {
+    enum class Shape { CAPSULE, BOX, NONE };
+    Shape shape     = Shape::NONE;
+    float radius    = 0.0f;
+    float half_height = 0.0f;
+    glm::vec3 box_half_extents = {};
+    float mass      = 1.0f;
+    std::string collision_group;
+    std::string collision_mask;
+};
+
+ColliderDef parse_collider_extras(const tinygltf::Value& extras)
+{
+    ColliderDef def;
+    if (!extras.Has("physics")) return def;
+
+    const auto& phys = extras.Get("physics");
+    if (!phys.Has("collider")) return def;
+
+    const std::string shape_str = phys.Get("collider").Get<std::string>();
+    if      (shape_str == "capsule") def.shape = ColliderDef::Shape::CAPSULE;
+    else if (shape_str == "box")     def.shape = ColliderDef::Shape::BOX;
+    else                             return def; // unknown shape, skip
+
+    if (phys.Has("radius"))       def.radius       = static_cast<float>(phys.Get("radius").GetNumberAsDouble());
+    if (phys.Has("half_height"))  def.half_height  = static_cast<float>(phys.Get("half_height").GetNumberAsDouble());
+    if (phys.Has("mass"))         def.mass         = static_cast<float>(phys.Get("mass").GetNumberAsDouble());
+
+    if (phys.Has("box_half_extents")) {
+        const auto& ext = phys.Get("box_half_extents");
+        def.box_half_extents = {
+            static_cast<float>(ext.Get(0).GetNumberAsDouble()),
+            static_cast<float>(ext.Get(1).GetNumberAsDouble()),
+            static_cast<float>(ext.Get(2).GetNumberAsDouble())
+        };
+    }
+
+    if (phys.Has("collision_group")) def.collision_group = phys.Get("collision_group").Get<std::string>();
+    if (phys.Has("collision_mask"))  def.collision_mask  = phys.Get("collision_mask").Get<std::string>();
+
+    return def;
+}
+----
+
+extras に期待するデータが含まれない場合、デフォルトの `NONE` 形状で早期リターンしている点に注目してください。このグレースフルな劣化は重要です。物理メタデータのないボーンは単にコライダーを持たず、ローダーをクラッシュさせるべきではありません。
+
+== 物理ボディの作成
+
+コライダー定義を解析したら、実際の物理ボディを作成できます。コライダー定義を持つ各ボーンには **剛体** が必要です。位置・向き・質量・衝突形状を持ち、物理シミュレーションに参加する物理オブジェクトです。
+
+アニメーション段階では、シーングラフからこれらの剛体を駆動します（**キネマティック** にする—シミュレートされるのではなく、トランスフォームに追従します）。ラグドール段階では **ダイナミック** に切り替え—シミュレートされるオブジェクトとなり、読み戻すトランスフォームを生成します。その状態切り替えはラグドールハンドオフの節で扱います。今はすべてキネマティックとして作成します。
+
+[source,cpp]
+----
+struct BoneBody {
+    uint32_t    node_index;      // Index into our scene graph Node array
+    JPH::BodyID physics_body;    // Jolt Physics body ID
+    ColliderDef collider_def;    // The parameters we parsed from extras
+};
+
+std::vector<BoneBody> create_bone_bodies(
+    const std::vector<Node>& nodes,
+    const Skin& skin,
+    PhysicsWorld& physics_world)
+{
+    std::vector<BoneBody> bodies;
+
+    for (uint32_t joint_idx = 0; joint_idx < skin.joints.size(); ++joint_idx) {
+        uint32_t node_index = skin.joints[joint_idx];
+        const Node& node    = nodes[node_index];
+
+        if (node.collider_def.shape == ColliderDef::Shape::NONE) continue;
+
+        // Create the collision shape from the parsed definition using Jolt
+        JPH::Ref<JPH::Shape> shape;
+        if (node.collider_def.shape == ColliderDef::Shape::CAPSULE) {
+            shape = new JPH::CapsuleShape(
+                node.collider_def.half_height,
+                node.collider_def.radius);
+        } else if (node.collider_def.shape == ColliderDef::Shape::BOX) {
+            shape = new JPH::BoxShape(JPH::Vec3(
+                node.collider_def.box_half_extents.x,
+                node.collider_def.box_half_extents.y,
+                node.collider_def.box_half_extents.z));
+        }
+
+        if (!shape) continue;
+
+        // Create the rigid body at the bone's current world position.
+        // We start it as KINEMATIC - it will be driven by the animation system.
+        JPH::BodyCreationSettings settings;
+        settings.SetShape(shape);
+        settings.mMassPropertiesOverride.mMass = node.collider_def.mass;
+        settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
+
+        PhysicsPose pose = decompose_to_pose(node.world_matrix);
+        settings.mPosition = JPH::Vec3(pose.position.x, pose.position.y, pose.position.z);
+        settings.mRotation = JPH::Quat(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+        settings.mMotionType = JPH::EMotionType::Kinematic;
+
+        JPH::BodyID body = physics_world.create_body(settings);
+
+        bodies.push_back({ node_index, body, node.collider_def });
+    }
+
+    return bodies;
+}
+----
+
+`decompose_to_pose` 関数は簡潔に見る価値があります。物理エンジンは通常、ボディの状態を 4x4 行列ではなく位置とクォータニオンで表現します。シーングラフの行列表現をこれらの成分に分解する必要があります。
+
+[source,cpp]
+----
+PhysicsPose decompose_to_pose(const glm::mat4& world_matrix)
+{
+    PhysicsPose pose;
+    // Extract translation directly from the last column
+    pose.position = glm::vec3(world_matrix[3]);
+
+    // Extract rotation by normalizing the 3x3 basis vectors to remove scale,
+    // then constructing a quaternion from the pure rotation matrix.
+    glm::mat3 rot_scale = glm::mat3(world_matrix);
+    glm::mat3 rotation;
+    rotation[0] = glm::normalize(rot_scale[0]);
+    rotation[1] = glm::normalize(rot_scale[1]);
+    rotation[2] = glm::normalize(rot_scale[2]);
+    pose.orientation = glm::quat_cast(rotation);
+
+    return pose;
+}
+----
+
+== 毎フレームのキネマティックボディ更新
+
+キャラクターがアニメーション中（ラグドール中でない）の間、毎フレーム各ボーンの物理ボディをシーングラフの現在のワールド行列に合わせて更新する必要があります。これは第2章で議論した双方向リンクの「アニメーションから物理へ」の方向です。
+
+[source,cpp]
+----
+void sync_animation_to_physics(
+    const std::vector<Node>& nodes,
+    std::vector<BoneBody>& bodies,
+    PhysicsWorld& physics_world)
+{
+    for (auto& bone_body : bodies) {
+        const Node& node = nodes[bone_body.node_index];
+        PhysicsPose pose = decompose_to_pose(node.world_matrix);
+
+        // Move the kinematic body to the animated position.
+        // The physics engine will compute the velocity automatically,
+        // based on how far it moved since last frame. This velocity
+        // becomes critical during the ragdoll handoff.
+        physics_world.move_kinematic(bone_body.physics_body, pose);
+    }
+}
+----
+
+単にボディを新しい位置にテレポートするのではなく `move_kinematic` を使う理由は、微妙ですが重要です。多くの物理エンジンは前フレームと現フレームの差分からボディの速度を推定します。後でラグドールのためにボディをダイナミックモードに切り替えるとき、物理エンジンには現実的な初期速度が必要です。そうでなければラグドールは静止状態から始まります。ボディを連続的に動かすのではなくテレポートしていたら、その速度推定は誤り、ラグドールハンドオフがおかしく見えます。
+
+xref:Advanced_glTF/Physics_Integration/01_introduction.adoc[前へ: はじめに] | xref:Advanced_glTF/Physics_Integration/03_constraints_and_joint_limits.adoc[次へ: 拘束とジョイント制限]

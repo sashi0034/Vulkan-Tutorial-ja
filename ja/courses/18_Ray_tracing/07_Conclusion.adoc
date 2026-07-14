@@ -1,0 +1,31 @@
+= まとめ
+
+本コースでは、ダイナミックレンダリングとレイクエリを使い、Vulkan ラスタライゼーションパイプラインにレイトレース効果を実装しました。要点をまとめます。
+
+- *ダイナミックレンダリング*: レンダーパスのセットアップを単純化し、現在 Vulkan でレンダリングを開始する推奨方法です。RenderDoc で使用を検証しました。特にモバイルでは、ローカルアタッチメント読み取り用の拡張と組み合わせると大きな利点です。
+
+- *アクセラレーション構造*: 読み込んだモデルから BLAS と TLAS を作成しました。Nsight Graphics で構造が正しくビルドされたことを確認しました。
+
+- *シャドウ用レイクエリ*: フラグメントシェーダーでシャドウレイを飛ばしました。最初は不透明ジオメトリのみを考慮し、次に交差のテクスチャアルファを手動で確認してアルファテスト透明度に対応するよう洗練しました。
+
+- *反射用レイクエリ*: ボーナスとして反射レイを飛ばし、ヒット結果で反射マテリアルのフラグメント色を変調しました。同じアクセラレーション構造を活用し、同様の `Proceed()` ループロジックを使いました。屈折、アンビエントオクルージョンレイなどへの拡張も想像できるでしょう。
+
+本ラボが Vulkan の最新機能を使ったハイブリッドレンダリングの実践的な体験になったことを願っています。Vulkan での楽しいレンダリングを、そしてアプリケーションでより高度なレイトレース効果を作成することを楽しんでください！
+
+== 参考文献
+
+- 完全な Vulkan Tutorial: https://github.com/KhronosGroup/Vulkan-Tutorial
+- さらなる Vulkan ドキュメントとリソース: https://www.khronos.org/vulkan
+- Arm の Vulkan Best Practice ガイド: https://developer.arm.com/mobile-graphics-and-gaming/vulkan-api-best-practices-on-arm-gpus
+- RenderDoc のダウンロード: https://github.com/baldurk/renderdoc
+- NVIDIA Nsight Graphics のダウンロード: https://developer.nvidia.com/nsight-graphics
+- Slang シェーディング言語について: https://shader-slang.org
+
+3D アセットは Poly Haven により提供され、Blender で組み合わせました。
+
+- https://polyhaven.com/a/nettle_plant
+- https://polyhaven.com/a/potted_plant_02
+- https://polyhaven.com/a/wooden_picnic_table
+
+== ナビゲーション
+- 前へ: xref:./06_Reflections.adoc[反射]

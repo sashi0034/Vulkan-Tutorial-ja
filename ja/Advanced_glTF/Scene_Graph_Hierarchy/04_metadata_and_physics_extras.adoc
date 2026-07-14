@@ -1,0 +1,88 @@
+= メタデータと物理 extras: パイプラインの自動化
+
+== 幾何を超えて
+
+モダンなキャラクターパイプラインは、メッシュとテクスチャだけでは語れません。**意図** についてです。アーティストが Blender でキャラクターをリギングするとき、単にボーンを配置しているのではなく、そのキャラクターが世界とどう相互作用すべきかを定義しています。「シンプルなエンジン」では、エンティティを手動で配置し、プロパティを手動で定義しました。高度なキャラクターエンジンでは、この手動アプローチはエラーと遅いイテレーションにつながるボトルネックです。
+
+glTF 形式は、これを解く強力だがしばしば見落とされる機能を提供します。**`extras`** フィールドです。このフィールドは、glTF 階層内の任意のオブジェクト—ノード、メッシュ、マテリアル、さらにはアニメーション—にアタッチできるカスタム JSON メタデータの汎用コンテナです。これらの extras を活用することで、3D ツールでのアーティストの作業がエンジンの挙動を自動設定する、データ駆動パイプラインを作れます。
+
+== "Extras" の力
+
+プロの制作では、アーティストがキャラクターの衝突形状の配置を定義するためにコードを書く必要はありません。代わりに Blender のカスタムプロパティとして定義します。glTF がエクスポートされると、これらのプロパティは対応するノードの `extras` フィールドに埋め込まれます。
+
+=== Blender でカスタムプロパティを追加する
+
+ノードに物理メタデータをアタッチするには、Blender でオブジェクトまたはボーンを選択し、**Properties パネル → Object Properties → Custom Properties**（アーマチュアボーンなら **Bone Properties → Custom Properties**）へ進みます。**New** をクリックしてプロパティを追加し、名前を `physics` にします。値は Blender のプロパティエディタ、またはスクリプティングワークスペースの小さな Python スクリプトで、JSON 互換の辞書に設定します。
+
+[source,python]
+----
+import bpy
+
+obj = bpy.context.active_object
+obj["physics"] = {"type": "capsule", "radius": 0.1, "height": 0.4}
+----
+
+**File → Export → glTF 2.0** でエクスポートするとき、エクスポートダイアログで **Include → Custom Properties** を有効にします。Blender はそれらのプロパティを、出力 `.glb` / `.gltf` ファイル内の対応ノードの `extras` フィールドへシリアライズします。
+
+image::images/blender_custom_properties.png[Blender Custom Properties panel showing a physics capsule property on a forearm bone,600]
+
+NOTE: 上のスクリーンショットは Blender 4.x の Custom Properties パネルを示します。パネル位置は Blender 3.x でも同じです。
+
+キャラクターの前腕ボーンを考えてください。Blender で、カプセルコライダーを定義する値を持つ `physics` というカスタムプロパティを追加できます。エンジンが glTF をパースすると、単なるボーンノードではなく、物理プロキシをアタッチする要求が見えます。
+
+[source,cpp]
+----
+// Example of extracting "extras" during node loading
+void processNodeExtras(const tinygltf::Node& gltfNode, Node& engineNode) {
+    if (!gltfNode.extras.IsNull() && gltfNode.extras.IsObject()) {
+        if (gltfNode.extras.Has("physics")) {
+            const auto& physicsData = gltfNode.extras.Get("physics");
+
+            std::string type = physicsData.Get("type").Get<std::string>();
+
+            if (type == "capsule") {
+                float radius = static_cast<float>(physicsData.Get("radius").Get<double>());
+                float height = static_cast<float>(physicsData.Get("height").Get<double>());
+
+                // Populate the ColliderDef embedded in the Node.
+                // ColliderDef::half_height stores the capsule's *half*-height,
+                // so we halve the artist-facing "height" value from the extras.
+                engineNode.collider_def.shape       = ColliderDef::Shape::CAPSULE;
+                engineNode.collider_def.radius      = radius;
+                engineNode.collider_def.half_height = height * 0.5f;
+            }
+        }
+    }
+}
+----
+
+このアプローチは視覚と物理のギャップを橋渡しします。アーティストがキャラクターをスケールしたり肢の長さを調整したりすると、物理プロキシ—したがってキャラクターの衝突挙動—が自動で更新されます。
+
+== スケルトンと物理のリンクの自動化
+
+このメタデータの最も重要な応用が **Kinematic-to-Dynamic リンク** です。キャラクターが物理に反応する（ラグドールなど）には、物理エンジンがどのリジッドボディがシーングラフ内のどのボーンに対応するかを知る必要があります。
+
+glTF 内のノードを「physics-enabled」としてタグ付けすることで、ラグドール階層全体の作成を自動化できます。シーン読み込み処理中、エンジンは次ができます。
+
+1.  物理メタデータを持つノードを識別する。
+2.  物理ワールド（PhysX、Jolt、または Bullet）に対応するリジッドボディを作成する。
+3.  前節で議論した双方向同期リンクを確立する。
+4.  追加の "joint_limit" メタデータに基づき、物理拘束（ヒンジやボールアンドソケットジョイントなど）を生成する。
+
+この自動化により、エンジンコアにハードコードされたボーン名やマジックナンバーを一行も必要とせず、視覚スケルトンと物理スケルトンが常に完璧に同期することが保証されます。
+
+== 制作上の利点: イテレーション速度
+
+手動セットアップからメタデータ駆動の自動化への移行は、エンジン成熟度の大きな飛躍です。エンジンを静的レンダラから、アーティスト向けの柔軟なプラットフォームへ変えます。
+
+*   **ゼロコードコライダー**: アーティストはプログラマ介入なしに衝突形状を追加・削除・洗練できます。
+*   **アセット固有ロジック**: メタデータは表面タイプ（例: 足音用の "metal" 対 "flesh"）、相互作用点（剣の "grab_here"）、AI ヒント（"cover_node"）を定義できます。
+*   **検証**: メタデータはアセットの一部であるため、**Khronos glTF-Validator** でチェックでき、ゲーム内のすべてのキャラクターがエンジンに届く前に有効な物理セットアップを持つことを保証できます。
+
+== まとめ
+
+glTF の "extras" を活用することで、シーン設定の責任をプログラマからソースアセットへ移しました。シーングラフはもはや行列の集合ではなく、レンダラから物理ソルバまでエンジン内のすべてのシステムに情報を与える、豊かな注釈付き階層です。
+
+シーングラフが統一されアセットパイプラインが自動化された今、キャラクター動作の核心に取り組む準備が整いました。**高度なスケルタル＆コンピュートスキニング** です。次章では、頂点変形の重い処理を Vulkan コンピュートシェーダーへ移し、表現豊かであると同時に高性能なキャラクターを可能にします。
+
+xref:Advanced_glTF/Scene_Graph_Hierarchy/03_physics_syncing.adoc[前へ: 物理同期] | xref:Advanced_glTF/Scene_Graph_Hierarchy/05_conclusion.adoc[次へ: まとめ]

@@ -1,0 +1,72 @@
+:pp: {plus}{plus}
+= 非同期ポストプロセス: フレーム末とフレーム始の並列化
+
+== 実世界のユースケース
+
+非同期コンピュートを使う最も効果的な方法の一つは、ポストプロセスパス（通常はコンピュート束縛）を、グラフィックスユニットが *次* のフレームのシャドウやジオメトリパスで忙しい間に走らせることです。ポストプロセスは通常、グラフィックスユニットが作業を終えたフレームの非常に終わりに起きるため、強力なパターンです。次のフレームにポストプロセス完了を待たせる代わりに、専用のコンピュートキューへ移します。
+
+== オーバーラップの実装
+
+実装には二つの異なるキューが関わります。ジオメトリとシャドウ作業用の **グラフィックスキュー** と、ポストプロセス作業（例: ブルーム、トーンマッピング、時間的アンチエイリアス）用の **非同期コンピュートキュー** です。
+
+1.  **メインレンダーパス（グラフィックスキュー）**: メインレンダリングが完了したら、グラフィックスタイムライン上で「グラフィックス完了」の値をシグナルします。
+2.  **ポストプロセスパス（コンピュートキュー）**: コンピュートキューは「グラフィックス完了」の値を待ちます。その後ポストプロセス作業を行い、自身のコンピュートタイムライン上で「ポストプロセス完了」の値をシグナルします。
+3.  **フレームサブミッション（CPU）**: CPU は、前フレームのジオメトリがサブミットされ次第、*次* のフレームの記録とグラフィックスキューへのサブミットを開始できます。ポストプロセスの完了を待つ必要はありません。
+
+== Synchronization 2 の例
+
+`vk::DependencyInfo` と `vk::SubmitInfo2` を使うと、この協調は明確で精密です。
+
+[,cpp]
+----
+// Compute Submit: wait for frame N graphics to finish, then run post-processing
+auto computeWaitInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *graphicsTimeline,
+    .value = frameN_graphics_finished,
+    .stageMask = vk::PipelineStageFlagBits2::eComputeShader
+};
+
+auto computeSignalInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *computeTimeline,
+    .value = frameN_postprocessing_finished,
+    .stageMask = vk::PipelineStageFlagBits2::eComputeShader
+};
+
+auto computeSubmit = vk::SubmitInfo2{
+    .waitSemaphoreInfoCount = 1,
+    .pWaitSemaphoreInfos = &computeWaitInfo,
+    .signalSemaphoreInfoCount = 1,
+    .pSignalSemaphoreInfos = &computeSignalInfo,
+    .commandBufferInfoCount = 1,
+    .pCommandBufferInfos = &postProcessCmdInfo
+};
+
+computeQueue.submit2(computeSubmit);
+----
+
+== プレゼントの扱い
+
+最後のステップが **プレゼント** 操作です。CPU 側では、そのフレームのグラフィックスとコンピュート作業の両方が完了するまで最終イメージをプレゼントしないことを保証しなければなりません。
+
+特に、プレゼンテーションユニット（WSI）はまだタイムラインセマフォをサポートしていないため、最終ハンドシェイクには **バイナリセマフォ** を使わなければなりません。コンピュートキューはポストプロセスパス完了時にバイナリセマフォをシグナルします。`vk::PresentInfoKHR` は、イメージを画面に表示する前にこのバイナリセマフォを待ちます。
+
+この三者ハンドシェイク——グラフィックスがコンピュートをシグナルし、コンピュートがプレゼントをシグナルする——により、グラフィックスユニットは常に新しい作業（*次* のフレームから）で満たされ、コンピュートユニットは *現在* のフレームの最終的な見た目を扱います。エンジンのフレームレートを最大化し、GPU 占有率をできるだけ高く保つための重要な戦略です。
+
+== Simple Engine での実装
+
+`Simple Engine` では、この非同期ポストプロセスパターンを **PBR トーンマッピング** パスに適用します。現在、トーンマッピングはグラフィックスキュー上の `Renderer::Render` の末尾で行われています。この論理を、`computeQueue` 上で走る専用の `postProcessComputePipeline` へ移します。
+
+実装の手順:
+
+1.  **コンピュートパスの追加**: `Renderer` を更新し、トーンマッピングコンピュートシェーダ（`shaders/tonemap.slang`）を別のコンピュートコマンドバッファに記録します。
+2.  **グラフィックス待ち**: このコンピュートコマンドバッファは、メインレンダリングタイムラインが `GeometryFinished` 値に到達するのを待ちます。
+3.  **プレゼント用シグナル**: トーンマッピングが完了したら、`PostProcessFinished` 値をシグナルします。
+4.  **サブミットの更新**: フレームの最終 `vk::SubmitInfo2` を更新し、プレゼント操作がコンピュートタイムライン上のこの `PostProcessFinished` 値を待つようにします。
+
+トーンマッピングをコンピュートキューへ移すことで、現在のフレームがまだトーンマッピングされている間に、グラフィックスキューで **次フレームのシャドウパス** を開始できます。ラスタ負荷の高いシャドウパスとコンピュート負荷の高いトーンマッピングパスがオーバーラップし、全体のフレームスループットが大きく向上します。
+
+この章の最後の節では、同期が過度に保守的な場合に起き得る「バブル」をどう特定し排除するかを見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Async_Compute_Overlap/02_maximizing_throughput.adoc[スループットの最大化] | 次へ: xref:Synchronization/Async_Compute_Overlap/04_bubble_problem.adoc[バブル問題]

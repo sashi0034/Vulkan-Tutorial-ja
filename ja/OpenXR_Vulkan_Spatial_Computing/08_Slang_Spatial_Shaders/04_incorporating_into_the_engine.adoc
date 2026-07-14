@@ -1,0 +1,76 @@
+:pp: {plus}{plus}
+= エンジンへの組み込み
+
+`simple_game_engine` でマルチビューを採用すると、両眼をシングルパスで描画でき、CPU ドローコールオーバーヘッドを大幅に削減できます。実装例は link:../../../attachments/openxr_engine/shaders/pbr.slang[pbr.slang] と link:../../../attachments/openxr_engine/renderer_pipelines.cpp[renderer_pipelines.cpp] にあります。
+
+== シェーダー読み込みの更新
+
+`renderer_resources.cpp` では、マルチビューを有効にするようパイプライン作成を更新する必要があります。`viewMask` を設定した `vk::PipelineRenderingCreateInfo` を追加して行います。
+
+[source,cpp]
+----
+// renderer_resources.cpp
+bool Renderer::createGraphicsPipeline() {
+    // ...
+    vk::PipelineRenderingCreateInfo renderingInfo{
+        .viewMask = xrMode ? 0x3 : 0x0, // 0x3 enables views 0 and 1
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &swapChainImageFormat
+    };
+
+    pipelineInfo.pNext = &renderingInfo;
+    // ...
+}
+----
+
+== Slang シェーダーの適応
+
+Slang シェーダー（`pbr.slang` など）は、`SV_ViewID` セマンティックを扱うよう更新しなければなりません。これによりシェーダーが左眼と右眼を区別できます。
+
+まず、`common_types.slang` を更新し、`UniformBufferObject` に行列配列を含めます。
+
+[source,slang]
+----
+// common_types.slang
+struct UniformBufferObject {
+    // NEW: Replace the single viewProjection matrix with an array
+    // This supports Stereo (N=2), Quad-Views (N=4), and beyond
+    float4x4 viewProjections[4];
+    float4x4 model;
+};
+----
+
+次に `pbr.slang` で:
+
+[source,slang]
+----
+// pbr.slang
+struct VS_Input {
+    float3 position : POSITION;
+    // ...
+};
+
+struct VS_Output {
+    float4 position : SV_Position;
+    uint viewID : SV_ViewID; // NEW: The hardware-provided view index
+    // ...
+};
+
+[shader("vertex")]
+VS_Output vertexMain(VS_Input input, uint viewID : SV_ViewID) {
+    VS_Output output;
+
+    // Select the correct ViewProjection matrix based on the eye index (0 to 3)
+    float4x4 vp = ubo.viewProjections[viewID];
+    output.position = mul(vp, mul(pushConstants.model, float4(input.position, 1.0)));
+    output.viewID = viewID;
+
+    return output;
+}
+----
+
+== なぜこれらの変更か？
+
+`viewMask` を有効にし `SV_ViewID` を使うことで、ステレオレンダリングの負担を CPU から GPU へ移します。エンジンが二度ループして二組のコマンドを投入する代わりに、一組を投入し、ハードウェアの **Instance Data Step** または **Geometry Replication** が 2 ビューへの展開を処理します。これが Vulkan 1.3 で高性能な空間レンダリングを達成する最も効率的な方法です。
+
+xref:OpenXR_Vulkan_Spatial_Computing/08_Slang_Spatial_Shaders/03_slang_architecture.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/09_Quad_Views_Foveated/01_introduction.adoc[次へ]

@@ -1,0 +1,383 @@
+:pp: {plus}{plus}
+
+= スワップチェーン
+
+Vulkan には「デフォルトフレームバッファ」という概念がないため、画面に可視化する前にレンダリング先となるバッファを所有するインフラが必要です。このインフラは *スワップチェーン* として知られ、Vulkan では明示的に作成しなければなりません。スワップチェーンは本質的に、画面への提示を待っているイメージのキューです。アプリケーションはそのようなイメージを取得して描画し、キューに戻します。キューが正確にどう動作するか、またキューからイメージを提示する条件は、スワップチェーンの設定方法に依存します。ただしスワップチェーンの一般的な目的は、イメージの提示を画面のリフレッシュレートと同期することです。
+
+== スワップチェーンサポートの確認
+
+さまざまな理由で、すべてのグラフィックスカードがイメージを画面に直接提示できるわけではありません。たとえばサーバ向けでディスプレイ出力を持たない場合です。次に、イメージ提示はウィンドウシステムとウィンドウに関連するサーフェスに強く結びついているため、Vulkan コアの一部ではありません。サポートを問い合わせた後、`VK_KHR_swapchain` デバイス拡張を有効にする必要があります。
+
+そのためにまず、この拡張がサポートされているかを確認するよう `createLogicalDevice` 関数を拡張します。`vk::raii::PhysicalDevice` がサポートする拡張の一覧は以前見たので、比較的素直にできるはずです。Vulkan ヘッダファイルは `VK_KHR_swapchain` として定義された便利なマクロ `vk::KHRSwapchainExtensionName` を提供していることに注意してください。このマクロを使う利点は、コンパイラがスペルミスを捕捉することです。
+
+まず、有効化するバリデーションレイヤのリストと同様に、必要なデバイス拡張のリストを宣言します。
+
+[,c++]
+----
+std::vector<const char*> requiredDeviceExtension = {
+    vk::KHRSwapchainExtensionName};
+----
+
+前の章で確認したプレゼンテーションキューが利用可能であることは、スワップチェーン拡張がサポートされていることを意味する、と記しておきます。ただし拡張は明示的に有効化する必要があります。
+
+== デバイス拡張の有効化
+
+スワップチェーンを使うには、まず `VK_KHR_swapchain` 拡張を有効にする必要があります。
+拡張の有効化には、論理デバイス作成構造体への小さな変更だけで足ります。
+
+[,c++]
+----
+deviceCreateInfo.enabledExtensionCount = requiredDeviceExtension.size();
+deviceCreateInfo.ppEnabledExtensionNames = requiredDeviceExtension.data();
+----
+
+あるいは構築時に行い、非常に簡潔に保てます。
+
+[,c++]
+----
+std::vector requiredDeviceExtension = { vk::KHRSwapchainExtensionName };
+
+float                     queuePriority = 0.5f;
+vk::DeviceQueueCreateInfo deviceQueueCreateInfo{.queueFamilyIndex = queueIndex, .queueCount = 1, .pQueuePriorities = &queuePriority};
+vk::DeviceCreateInfo      deviceCreateInfo{.pNext                   = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
+                                           .queueCreateInfoCount    = 1,
+                                           .pQueueCreateInfos       = &deviceQueueCreateInfo,
+                                           .enabledExtensionCount   = static_cast<uint32_t>(requiredDeviceExtension.size()),
+                                           .ppEnabledExtensionNames = requiredDeviceExtension.data()};
+----
+
+== スワップチェーンサポート詳細の問い合わせ
+
+スワップチェーンが利用可能かを確認するだけでは不十分です。ウィンドウサーフェスと互換でない場合があるからです。スワップチェーンの作成はインスタンスやデバイス作成より多くの設定も含むため、進む前にもう少し詳細を問い合わせる必要があります。
+
+基本的に確認すべきプロパティは 3 種類あります。
+
+* 基本的なサーフェス能力（スワップチェーン内のイメージの最小/最大数、イメージの最小/最大の幅と高さ）
+* サーフェスフォーマット（ピクセルフォーマット、色空間）
+* 利用可能なプレゼンテーションモード
+
+この節では、この情報を含む構造体の問い合わせ方を扱います。これらの構造体の意味と含まれるデータの正確な内容は次の節で議論します。
+
+まず基本的なサーフェス能力から始めます。これらのプロパティは問い合わせが素直で、単一の `vk::SurfaceCapabilitiesKHR` 構造体に返されます。
+
+[,c++]
+----
+auto surfaceCapabilities = physicalDevice.getSurfaceCapabilitiesKHR( *surface );
+----
+
+この関数は、サポートされる能力を決定する際に指定した `vk::SurfaceKHR` ウィンドウサーフェスを考慮します。サポート問い合わせ関数はすべて、それがスワップチェーンの中核コンポーネントであるため、最初のパラメータとしてそれを取ります。
+
+次のステップは、サポートされるサーフェスフォーマットの問い合わせです。
+
+[,c++]
+----
+std::vector<vk::SurfaceFormatKHR> availableFormats = physicalDevice.getSurfaceFormatsKHR( *surface );
+----
+
+最後に、サポートされるプレゼンテーションモードの問い合わせも `vk::raii::PhysicalDevice::getSurfacePresentModesKHR` でまったく同様です。
+
+[,c++]
+----
+std::vector<vk::PresentModeKHR> availablePresentModes = physicalDevice.getSurfacePresentModesKHR( *surface );
+----
+
+詳細はすべて揃いました。持っているウィンドウサーフェスについて、サポートされるイメージフォーマットが少なくとも 1 つ、サポートされるプレゼンテーションモードが少なくとも 1 つあれば、本チュートリアルにはスワップチェーンサポートで十分です。
+拡張が利用可能であることを確認した*後*にのみ、スワップチェーンサポートを問い合わせることが重要です。
+
+== スワップチェーンの適切な設定の選択
+
+スワップチェーンには、最適性が異なる多くのモードがまだあり得ます。最良のスワップチェーンのための適切な設定を見つける関数をいくつか書きます。決定すべき設定は 3 種類です。
+
+* サーフェスフォーマット（色深度）
+* プレゼンテーションモード（イメージを画面に「スワップ」する条件）
+* スワップエクステント（スワップチェーン内イメージの解像度）
+
+これらの各設定について、利用可能なら選ぶ理想値を念頭に置き、そうでなければ次善を見つけるロジックを作ります。
+
+=== サーフェスフォーマット
+
+この設定用の関数は次のように始まります。後で `SwapChainSupportDetails` 構造体の `formats` メンバを引数として渡します。
+
+[,c++]
+----
+vk::SurfaceFormatKHR chooseSwapSurfaceFormat(std::vector<vk::SurfaceFormatKHR> const &availableFormats)
+{
+    assert(!availableFormats.empty());
+    return availableFormats[0];
+}
+----
+
+各 `vk::SurfaceFormatKHR` エントリには `format` と `colorSpace` メンバが含まれます。`format` メンバは色チャネルと型を指定します。たとえば `vk::Format::eB8G8R8A8Srgb` は、B、G、R、アルファチャネルをその順で、各 8 ビット符号なし整数として格納し、ピクセルあたり合計 32 ビットであることを意味します。`colorSpace` メンバは、`vk::ColorSpaceKHR::eSrgbNonlinear` フラグを使って SRGB 色空間がサポートされるかどうかを示します。
+
+色空間については、利用可能なら SRGB を使います。link:http://stackoverflow.com/questions/12524623/[知覚される色がより正確になる] からです。後で使うテクスチャのようなイメージの標準的な色空間でもほぼあります。そのため SRGB 色フォーマットも使うべきで、最も一般的なものの 1 つが `vk::Format::eB8G8R8A8Srgb` です。
+
+リストを走査し、望ましい組み合わせが利用可能かを見ます。
+
+[,c++]
+----
+const auto formatIt = std::ranges::find_if(
+    availableFormats,
+    [](const auto &format) { return format.format == vk::Format::eB8G8R8A8Srgb && format.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear; });
+}
+----
+
+それが失敗した場合、「良さ」にもとづいて利用可能なフォーマットをランク付けし始めることもできますが、多くの場合、指定された最初のフォーマットで十分です。
+
+[,c++]
+----
+vk::SurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<vk::SurfaceFormatKHR>& availableFormats) {
+    const auto formatIt = std::ranges::find_if(
+        availableFormats,
+        [](const auto &format) { return format.format == vk::Format::eB8G8R8A8Srgb && format.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear; });
+    return formatIt != availableFormats.end() ? *formatIt : availableFormats[0];
+}
+----
+
+=== プレゼンテーションモード
+
+プレゼンテーションモードは、おそらくスワップチェーンで最も重要な設定です。イメージを画面に表示する実際の条件を表すからです。Vulkan で利用可能なモードは 4 つあります。
+
+* `vk::PresentModeKHR::eImmediate`: アプリケーションが投入したイメージはすぐに画面へ転送され、ティアリングが起きることがあります。
+* `vk::PresentModeKHR::eFifo`: スワップチェーンはキューで、ディスプレイがリフレッシュされるときにキュー先頭からイメージを取り、プログラムはレンダリングしたイメージをキュー末尾に挿入します。キューが満杯ならプログラムは待つ必要があります。現代のゲームにある垂直同期に最も似ています。ディスプレイがリフレッシュされる瞬間は「垂直ブランク」として知られます。
+* `vk::PresentModeKHR::eFifoRelaxed`: このモードが前のものと異なるのは、アプリケーションが遅れ、前回の垂直ブランク時にキューが空だった場合だけです。次の垂直ブランクを待つのではなく、イメージがようやく到着したときにすぐに転送します。可視のティアリングが起きることがあります。
+* `vk::PresentModeKHR::eMailbox`: 2 番目のモードの別の変種です。キューが満杯のときにアプリケーションをブロックする代わりに、すでにキューにあるイメージを新しいものに単に置き換えます。このモードはティアリングを避けつつ可能な限り速くフレームをレンダリングでき、標準の垂直同期よりレイテンシの問題が少なくなります。一般に「トリプルバッファリング」として知られますが、バッファが 3 つあるだけではフレームレートがロック解除されるとは限りません。
+
+保証されているのは `vk::PresentModeKHR::eFifo` モードだけなので、再び利用可能な最良のモードを探す関数を書く必要があります。
+
+[,c++]
+----
+vk::PresentModeKHR chooseSwapPresentMode(std::vector<vk::PresentModeKHR> const &availablePresentModes)
+{
+    return vk::PresentModeKHR::eFifo;
+}
+----
+
+エネルギー消費が気にならないなら、`vk::PresentModeKHR::eMailbox` は非常に良いトレードオフだと思います。垂直ブランク直前までできるだけ最新の新しいイメージをレンダリングすることで、ティアリングを避けつつかなり低いレイテンシを維持できます。エネルギー消費がより重要なモバイルデバイスでは、代わりに `vk::PresentModeKHR::eFifo` を使いたくなるでしょう。ではリストを見て `vk::PresentModeKHR::eMailbox` が利用可能かを確認しましょう。
+
+[,c++]
+----
+vk::PresentModeKHR chooseSwapPresentMode(std::vector<vk::PresentModeKHR> const &availablePresentModes)
+{
+    assert(std::ranges::any_of(availablePresentModes, [](auto presentMode) { return presentMode == vk::PresentModeKHR::eFifo; }));
+    return std::ranges::any_of(availablePresentModes,
+                               [](const vk::PresentModeKHR value) { return vk::PresentModeKHR::eMailbox == value; }) ?
+               vk::PresentModeKHR::eMailbox :
+               vk::PresentModeKHR::eFifo;
+}
+----
+
+=== スワップエクステント
+
+残る主要なプロパティは 1 つだけなので、最後の関数を追加します。
+
+[,c++]
+----
+vk::Extent2D chooseSwapExtent(vk::SurfaceCapabilitiesKHR const &capabilities)
+{}
+----
+
+スワップエクステントはスワップチェーンイメージの解像度で、ほぼ常に描画先ウィンドウの解像度と _ピクセル単位で_ 正確に等しいです（これについてはすぐ後で述べます）。可能な解像度の範囲は `vk::SurfaceCapabilitiesKHR` 構造体で定義されます。Vulkan は `currentExtent` メンバの幅と高さを設定することでウィンドウの解像度に合わせるよう指示します。ただし一部のウィンドウマネージャではここで異なることが許され、それは `currentExtent` の幅と高さを特別な値、つまり `uint32_t` の最大値に設定することで示されます。その場合、`minImageExtent` と `maxImageExtent` の範囲内でウィンドウに最も合う解像度を選びます。ただし解像度は正しい単位で指定しなければなりません。
+
+GLFW はサイズを測るとき 2 つの単位を使います。ピクセルと link:https://www.glfw.org/docs/latest/intro_guide.html#coordinate_systems[スクリーン座標] です。たとえば、ウィンドウ作成時に以前指定した解像度 `{WIDTH, HEIGHT}` はスクリーン座標で測られます。しかし Vulkan はピクセルで動作するので、スワップチェーンのエクステントもピクセルで指定しなければなりません。残念ながら、高 DPI ディスプレイ（Apple の Retina ディスプレイなど）を使っている場合、スクリーン座標はピクセルに対応しません。代わりに、ピクセル密度が高いため、ピクセル単位のウィンドウ解像度はスクリーン座標の解像度より大きくなります。そのため Vulkan がスワップエクステントを固定してくれない場合、元の `{WIDTH, HEIGHT}` をそのまま使えません。代わりに、最小・最大イメージエクステントと照合する前に、`glfwGetFramebufferSize` でピクセル単位のウィンドウ解像度を問い合わせる必要があります。
+
+[,c++]
+----
+#include <cstdint> // Necessary for uint32_t
+#include <limits> // Necessary for std::numeric_limits
+#include <algorithm> // Necessary for std::clamp
+
+...
+
+vk::Extent2D chooseSwapExtent(vk::SurfaceCapabilitiesKHR const &capabilities)
+{
+    if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max())
+    {
+        return capabilities.currentExtent;
+    }
+    int width, height;
+    glfwGetFramebufferSize(window, &width, &height);
+
+    return {
+        std::clamp<uint32_t>(width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+        std::clamp<uint32_t>(height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height)
+    };
+}
+----
+
+ここで `clamp` 関数は、`width` と `height` の値を実装がサポートする許容最小・最大エクステントの間に収めるために使います。
+
+== スワップチェーンの作成
+
+実行時に行う選択を助けるこれらのヘルパー関数がすべて揃ったので、動作するスワップチェーンを作成するために必要な情報はようやくすべて揃いました。
+
+これらの呼び出しの結果から始まる `createSwapChain` 関数を作成し、論理デバイス作成の後に `initVulkan` から呼び出すようにしてください。
+
+[,c++]
+----
+void initVulkan() {
+    createInstance();
+    setupDebugMessenger();
+    createSurface();
+    pickPhysicalDevice();
+    createLogicalDevice();
+    createSwapChain();
+}
+
+void createSwapChain() {
+    vk::SurfaceCapabilitiesKHR surfaceCapabilities = physicalDevice.getSurfaceCapabilitiesKHR( *surface );
+    swapChainExtent                                = chooseSwapExtent(surfaceCapabilities);
+    uint32_t minImageCount                         = chooseSwapMinImageCount(surfaceCapabilities);
+    
+    std::vector<vk::SurfaceFormatKHR> availableFormats = physicalDevice.getSurfaceFormatsKHR(*surface);
+    swapChainSurfaceFormat                             = chooseSwapSurfaceFormat(availableFormats);
+}
+----
+
+これらのプロパティに加え、スワップチェーンに欲しいイメージ数も決める必要があります。実装は動作に必要な最小数を指定します。
+
+[,c++]
+----
+uint32_t imageCount = surfaceCapabilities.minImageCount;
+----
+
+ただし、この最小に留めるだけだと、描画用の別のイメージを取得する前にドライバが内部操作を完了するのを待たされることがあります。そのため、最小より少なくとも 1 つ多く要求することが推奨されます。
+
+[,c++]
+----
+uint32_t imageCount = surfaceCapabilities.minImageCount + 1;
+----
+
+その際にイメージの最大数を超えないことも確認すべきです。`0` は最大がないことを意味する特別な値で、次のヘルパー関数になります。
+
+[,c++]
+----
+uint32_t chooseSwapMinImageCount(vk::SurfaceCapabilitiesKHR const &surfaceCapabilities)
+{
+    auto minImageCount = std::max(3u, surfaceCapabilities.minImageCount);
+    if ((0 < surfaceCapabilities.maxImageCount) && (surfaceCapabilities.maxImageCount < minImageCount))
+    {
+        minImageCount = surfaceCapabilities.maxImageCount;
+    }
+    return minImageCount;
+}
+----
+
+Vulkan オブジェクトの慣例どおり、スワップチェーンオブジェクトの作成には大きな構造体を埋める必要があります。正直なところスワップチェーンはかなり複雑なオブジェクトなので、Vulkan の createInfo 構造体の中でも大きめです。
+
+[,c++]
+----
+vk::SwapchainCreateInfoKHR swapChainCreateInfo{.surface          = *surface,
+                                               .minImageCount    = minImageCount,
+                                               .imageFormat      = swapChainSurfaceFormat.format,
+                                               .imageColorSpace  = swapChainSurfaceFormat.colorSpace,
+                                               .imageExtent      = swapChainExtent,
+                                               .imageArrayLayers = 1,
+                                               .imageUsage       = vk::ImageUsageFlagBits::eColorAttachment,
+                                               .imageSharingMode = vk::SharingMode::eExclusive,
+                                               .preTransform     = surfaceCapabilities.currentTransform,
+                                               .compositeAlpha   = vk::CompositeAlphaFlagBitsKHR::eOpaque,
+                                               .presentMode      = chooseSwapPresentMode(availablePresentModes),
+                                               .clipped          = true};
+};
+----
+
+[,c++]
+----
+    .imageArrayLayers = 1,
+----
+
+`imageArrayLayers` は各イメージが何層からなるかを指定します。ステレオスコピック 3D アプリケーションを開発していない限り、常に `1` です。
+
+[,c++]
+----
+    .imageUsage = vk::ImageUsageFlagBits::eColorAttachment,
+----
+
+`imageUsage` ビットフィールドは、スワップチェーン内のイメージにどのような操作を使うかを指定します。本チュートリアルではそれらに直接レンダリングするので、カラーアタッチメントとして使います。ポスト処理などの操作のために別のイメージにまずレンダリングすることも可能です。その場合は代わりに `vk::ImageUsageFlagBits::eTransferDst` のような値を使い、メモリ操作でレンダリングしたイメージをスワップチェーンイメージへ転送できます。
+
+[,c++]
+----
+    .imageSharingMode = vk::SharingMode::eExclusive,
+----
+
+`imageSharingMode` は、複数のキューファミリーにわたって使われる可能性のあるスワップチェーンイメージの扱い方を指定します。複数キューからアクセスされるイメージの扱い方は 2 つあります。
+
+* `vk::SharingMode::eExclusive`: ある時点でイメージは 1 つのキューファミリーに所有され、別のキューファミリーで使う前に所有権を明示的に転送しなければなりません。このオプションが最高のパフォーマンスを提供します。
+* `vk::SharingMode::eConcurrent`: 明示的な所有権転送なしに、複数のキューファミリーにわたってイメージを使えます。
+
+キューファミリーが異なる場合、所有権の章を避けるために並行モードを使えます。それらは後の時点で説明する方がよい概念を含むからです。並行モードでは、`queueFamilyIndexCount` と `pQueueFamilyIndices` パラメータで、どのキューファミリー間で所有権を共有するかを事前に指定する必要があります。並行モードでは少なくとも 2 つの異なるキューファミリーを指定する必要があります。グラフィックスキューファミリーとプレゼンテーションキューファミリーが同じ場合（ほとんどのハードウェアではそうなります）、排他モードに留めるべきです。
+
+[,c++]
+----
+    .preTransform     = surfaceCapabilities.currentTransform,
+----
+
+サポートされている場合（`capabilities` の `supportedTransforms`）、スワップチェーン内のイメージに特定の変換（時計回り 90 度回転や水平反転など）を適用するよう指定できます。変換を望まない場合は、単に現在の変換を指定します。
+
+[,c++]
+----
+    .compositeAlpha   = vk::CompositeAlphaFlagBitsKHR::eOpaque,
+----
+
+`compositeAlpha` フィールドは、ウィンドウシステム内の他ウィンドウとのブレンディングにアルファチャネルを使うかどうかを指定します。ほぼ常にアルファチャネルを無視したいので、`vk::CompositeAlphaFlagBitsKHR::eOpaque` です。
+
+[,c++]
+----
+    .presentMode      = chooseSwapPresentMode(availablePresentModes),
+    .clipped          = true};
+----
+
+`presentMode` メンバはそのままです。`clipped` メンバが `vk::True` に設定されている場合、たとえば別のウィンドウが前面にあるために隠されたピクセルの色は気にしないことを意味します。これらのピクセルを読み戻して予測可能な結果を得る必要が本当にない限り、クリッピングを有効にすると最良のパフォーマンスが得られます。
+
+[,c++]
+----
+swapChainCreateInfo.oldSwapchain = nullptr;
+----
+
+残る最後のフィールドは `oldSwapChain` です。Vulkan では、たとえばウィンドウがリサイズされたために、アプリケーション実行中にスワップチェーンが無効または非最適になることがあります。その場合、スワップチェーンは実際にゼロから再作成する必要があり、このフィールドに古いものへの参照を指定しなければなりません。これは複雑な話題で、xref:03_Drawing_a_triangle/04_Swap_chain_recreation.adoc[後の章] で詳しく学びます。今のところはスワップチェーンを 1 つだけ作成すると仮定し、このメンバはデフォルトの `nullptr` のままにできます。
+
+次に、`vk::SwapchainKHR` オブジェクトとそのイメージを格納するクラスメンバを追加します。
+
+[,c++]
+----
+vk::raii::SwapchainKHR swapChain;
+std::vector<vk::Image> swapChainImages;
+----
+
+スワップチェーンの作成は、`vk::raii::SwapchainKHR` のコンストラクタを呼ぶだけで済みます。
+
+[,c++]
+----
+swapChain       = vk::raii::SwapchainKHR( device, swapChainCreateInfo );
+swapChainImages = swapChain.getImages();
+----
+
+パラメータは論理デバイスとスワップチェーン作成情報です。
+
+アプリケーションを実行し、スワップチェーンが正常に作成されることを確認してください。この時点で `vkCreateSwapchainKHR` でアクセス違反エラーが出たり、`Failed to find 'vkGetInstanceProcAddress' in layer SteamOverlayVulkanLayer.dll` のようなメッセージが出たりする場合は、Steam オーバーレイレイヤに関する xref:90_FAQ.adoc[FAQ の項目] を参照してください。
+
+バリデーションレイヤを有効にした状態で `swapChainCreateInfo.imageExtent = extent;` の行を削除してみてください。バリデーションレイヤの 1 つがすぐにミスを捕捉し、役立つメッセージが表示されます。
+
+image::/images/swap_chain_validation_layer.png[]
+
+== スワップチェーンイメージの取得
+スワップチェーンは作成できたので、あとはそれが含む `vk::Image` オブジェクトのハンドルを取得するだけです。後の章のレンダリング操作でこれらを参照します。
+
+[,c++]
+----
+std::vector<vk::Image> swapChainImages = swapChain->getImages();
+----
+
+最後に、スワップチェーンイメージに選んだフォーマットとエクステントをメンバ変数に格納します。後の章で必要になります。
+
+[,c++]
+----
+vk::raii::SwapchainKHR swapChain = nullptr;
+std::vector<vk::Image> swapChainImages;
+vk::SurfaceFormatKHR   swapChainSurfaceFormat;
+vk::Extent2D           swapChainExtent;
+----
+
+これで描画でき、ウィンドウに提示できるイメージの集合ができました。xref:./02_Image_views.adoc[次の章] では、イメージをレンダーターゲットとして設定する方法から始め、その後実際のグラフィックスパイプラインと描画コマンドを見ていきます。
+
+link:/attachments/06_swap_chain_creation.cpp[C{pp} code]

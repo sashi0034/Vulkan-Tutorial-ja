@@ -1,0 +1,74 @@
+:pp: {plus}{plus}
+= エンジンへの組み込み
+
+**Warp and Blend** 機能の追加により、`simple_game_engine` は `renderer_rendering.cpp` で幾何歪みとマルチプロジェクタブレンディングを扱えるようになります。*現時点では、実装は読者への演習として残されています。*
+
+== ポストプロセスチェーンの強化
+
+`renderer_rendering.cpp` では、メインシーン描画完了後に走るコンピュートベースの「ワープ」パスを導入します。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+void Renderer::Render(...) {
+    // ... Main Scene Pass (Raster) ...
+
+    // NEW: Post-Process Warp Pass (Compute)
+    // This kernel maps our rectilinear render target to a warped swapchain image
+    auto& cmd = commandBuffers[currentFrame];
+
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *warpPipeline);
+
+    // Bind the Rectilinear Input (Descriptor Set 0)
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *warpPipelineLayout, 0, *rectilinearSets[currentFrame], nullptr);
+
+    // Bind the Warp Map LUT (Descriptor Set 1)
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *warpPipelineLayout, 1, *warpMapSets, nullptr);
+
+    // Dispatch the warp compute kernel
+    uint32_t groupCountX = (swapChainExtent.width + 15) / 16;
+    uint32_t groupCountY = (swapChainExtent.height + 15) / 16;
+    cmd.dispatch(groupCountX, groupCountY, 1);
+}
+----
+
+== Slang ワープシェーダーの統合
+
+`warp.slang` シェーダーでは、ワープマップ LUT を使い歪んだテクスチャ座標を計算します。
+
+[source,slang]
+----
+// warp.slang
+Texture2D<float3> inputTexture : register(t0);
+Texture2D<float2> warpMap : register(t1); // The LUT
+RWTexture2D<float4> outputSwapchain : register(u0);
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void computeMain(uint3 threadID : SV_DispatchThreadID) {
+    // 1. Sample the Warp Map to get the distorted coordinate
+    float2 distortedUV = warpMap.SampleLevel(sampler, float2(threadID.xy) / screenRes, 0);
+
+    // 2. Sample the main scene render target
+    float3 color = inputTexture.SampleLevel(sampler, distortedUV, 0);
+
+    // 3. Apply Edge Blending (alpha ramp) if needed
+    color *= calculateEdgeBlend(threadID.xy);
+
+    outputSwapchain[threadID.xy] = float4(color, 1.0);
+}
+
+// Edge Blending Helper: Multi-projector luminosity matching
+float3 calculateEdgeBlend(uint2 pos) {
+    // Simple 10% overlap ramp for the left-edge of a projector
+    float overlapWidth = screenRes.x * 0.1f;
+    float alpha = clamp(float(pos.x) / overlapWidth, 0.0, 1.0);
+    return float3(alpha, alpha, alpha);
+}
+----
+
+== なぜこれらの変更が必要か？
+
+適切なワーピングとブレンディングこそが、CAVE 部屋を統一された環境に感じさせます。エンジンのコンピュートベースポストプロセスチェーンで歪みを扱うことで、コアのラスタライズロジックを変えずに、曲面スクリーンからカスタムヘッドセットまで幅広いハードウェアをサポートできます。エンジンにはすでにモジュール化された `Renderer` があるため、このコンピュートパスの追加は既存フレームループの自然な拡張です。
+
+xref:OpenXR_Vulkan_Spatial_Computing/13_Warp_and_Blend/03_post_process_warping.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/14_LightField_Theory/01_introduction.adoc[Next]

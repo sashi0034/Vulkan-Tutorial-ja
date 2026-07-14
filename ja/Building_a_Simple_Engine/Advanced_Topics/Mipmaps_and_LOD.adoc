@@ -1,0 +1,39 @@
+= ミップマップと Level of Detail（LOD）
+
+ミップマップは、テクスチャの事前フィルタ版をサンプルすることでエイリアシングと帯域を減らします。LOD は単に「いまどのミップを使うか？」です。
+
+このサンプルの要点は、アセットがストリームインしているあいだも安定して見栄えの良いテクスチャサンプリングを得つつ、テクスチャ管理を巨大なサブシステムにしないことです。
+
+== ここでやっていること
+
+* 利用可能ならミップ付きテクスチャを使う（KTX2 のトランスコードはミップを含められる）。
+* 生の RGBA アップロードでは、大きな VRAM スパイクを避けるため自動生成ミップ数を小さく抑える。
+* サンプラー anisotropy を UI スライダーで有効化し、トレードオフをすぐ見られるようにする。
+
+== コード上の場所
+
+* サンプラー作成と anisotropy スライダー:
+** `renderer_resources.cpp`（サンプラー作成ヘルパー）
+** `renderer_rendering.cpp` の ImGui パネル
+* アップロード経路（staging → デバイスイメージ、その後 `SHADER_READ_ONLY_OPTIMAL` へ遷移）:
+** `renderer_resources.cpp`
+** `resource_manager.cpp`／`scene_loading.cpp`（高レベルのストリーミング／制御フロー）
+
+== ヒント
+
+* 大きなシーンではミップ付きの圧縮フォーマット（BC／ASTC／ETC）を優先する。
+* 最大 anisotropy はデバイスがサポートする値にクランプする。
+
+== 今後のアイデア
+
+さらに進めたい場合:
+
+* マテリアルごとの「mip bias」制御を追加する（スタイライズドな見た目やシマーのデバッグに便利）。
+* ミップレベル単位のテクスチャストリーミングを追加する（低いミップを先にロードし、その後精細化）。
+* 小さな「テクスチャレジデンシ」オーバーレイを追加する（ミップ可用性ごとのテクスチャ数）。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Descriptor_Indexing_UpdateAfterBind.adoc[Descriptor Indexing UpdateAfterBind]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_and_Streaming.adoc[同期とストリーミング]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Ray_Query_Rendering.adoc[Ray Query レンダリング]

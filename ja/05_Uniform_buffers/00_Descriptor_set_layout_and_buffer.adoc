@@ -1,0 +1,359 @@
+:pp: {plus}{plus}
+
+= ディスクリプタレイアウトとバッファ
+
+== はじめに
+
+頂点ごとに任意の属性を頂点シェーダへ渡せるようになりましたが、グローバル変数はどうでしょうか。
+この章から 3D グラフィックスへ進みますが、それにはモデル・ビュー・プロジェクション行列が必要です。
+頂点データとして含めることもできますが、メモリの無駄であり、変換が変わるたびに頂点バッファを更新する必要もあります。
+変換は毎フレーム変わることも容易にあり得ます。
+
+Vulkan でこれに取り組む正しい方法は _リソースディスクリプタ_ を使うことです。
+ディスクリプタは、シェーダがバッファやイメージのようなリソースに自由にアクセスするための手段です。
+変換行列を含むバッファを用意し、頂点シェーダがディスクリプタ経由でそれらにアクセスするようにします。
+ディスクリプタの使用は 3 つの部分からなります。
+
+* パイプライン作成時にディスクリプタセットレイアウトを指定する
+* ディスクリプタプールからディスクリプタセットを割り当てる
+* 描画時にディスクリプタセットをバインドする
+
+_ディスクリプタセットレイアウト_ は、レンダーパスがアクセスするアタッチメントの種類を指定するのと同様に、パイプラインがアクセスするリソースの種類を指定します。
+_ディスクリプタセット_ は、フレームバッファがレンダーパスアタッチメントにバインドする実際のイメージビューを指定するのと同様に、ディスクリプタにバインドする実際のバッファやイメージリソースを指定します。
+ディスクリプタセットは、頂点バッファやフレームバッファと同様に、描画コマンドのためにバインドされます。
+
+ディスクリプタには多くの種類がありますが、この章ではユニフォームバッファオブジェクト（UBO）を扱います。
+他の種類のディスクリプタは今後の章で見ていきますが、基本的な手順は同じです。
+頂点シェーダに持たせたいデータが、次のような C 構造体にあるとしましょう。
+
+[,c++]
+----
+struct UniformBufferObject
+{
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+----
+
+== 頂点シェーダ
+
+そのデータを `vk::raii::Buffer` にコピーし、頂点シェーダからユニフォームバッファオブジェクトディスクリプタ経由で次のようにアクセスできます。
+
+[,slang]
+----
+struct VSInput {
+    float2 inPosition;
+    float3 inColor;
+};
+
+struct UniformBuffer {
+    float4x4 model;
+    float4x4 view;
+    float4x4 proj;
+};
+ConstantBuffer<UniformBuffer> ubo;
+
+struct VSOutput
+{
+    float4 pos : SV_Position;
+    float3 color;
+};
+
+[shader("vertex")]
+VSOutput vertMain(VSInput input) {
+    VSOutput output;
+    output.pos = mul(ubo.proj, mul(ubo.view, mul(ubo.model, float4(input.inPosition, 0.0, 1.0))));
+    output.color = input.inColor;
+    return output;
+}
+----
+
+前章の長方形を 3D で回転させるため、モデル、ビュー、プロジェクション行列を毎フレーム更新します。
+MVP 変換に慣れていることを前提とします。
+慣れていない場合は、最初の章で言及した https://www.opengl-tutorial.org/beginners-tutorials/tutorial-3-matrices/[資料] を参照してください。
+
+上記のとおりユニフォームバッファオブジェクトを含むよう頂点シェーダを変更します。
+`SV_Position` の行は、変換を使ってクリップ座標での最終位置を計算するよう変更されます。
+2D の三角形とは異なり、クリップ座標の最後の成分は `1` ではない場合があり、画面上の最終的な正規化デバイス座標へ変換するときに除算が起きます。
+これは透視投影での _透視除算_ に使われ、近いオブジェクトが遠いオブジェクトより大きく見えるために不可欠です。
+
+== フラグメントシェーダ
+
+フラグメントシェーダは前の章と同じままです。
+
+[,slang]
+----
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+    return float4(vertIn.color, 1.0);
+}
+----
+
+== ディスクリプタセットレイアウト
+
+次のステップは、C{pp} 側で UBO を定義し、頂点シェーダ内のこのディスクリプタについて Vulkan に伝えることです。
+
+[,c++]
+----
+struct UniformBufferObject
+{
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+----
+
+GLM のデータ型を使って、シェーダ内の定義と正確に一致させることができます。
+行列内のデータはシェーダが期待する形とバイナリ互換なので、後で `UniformBufferObject` を `vk::raii::Buffer` へ単に `memcpy` できます。
+
+頂点属性とその `location` インデックスごとにそうしなければならなかったのと同様に、パイプライン作成のためにシェーダで使われるすべてのディスクリプタバインディングの詳細を提供する必要があります。
+この情報をすべて定義する新しい関数 `createDescriptorSetLayout` を用意します。
+パイプライン作成で必要になるので、その直前に呼び出すべきです。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createDescriptorSetLayout();
+    createGraphicsPipeline();
+    ...
+}
+
+...
+
+void createDescriptorSetLayout()
+{
+}
+----
+
+各バインディングは `vk::DescriptorSetLayoutBinding` 構造体で記述する必要があります。
+
+[,c++]
+----
+void createDescriptorSetLayout() {
+		vk::DescriptorSetLayoutBinding uboLayoutBinding{
+		    .binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex};
+}
+----
+
+最初の 2 つのフィールドは、シェーダで使う `binding` と、ユニフォームバッファオブジェクトであるディスクリプタの種類を指定します。
+シェーダ変数がユニフォームバッファオブジェクトの配列を表すこともでき、`descriptorCount` はその配列内の値の数を指定します。
+例えば、スケルタルアニメーションで骨格の各ボーンの変換を指定するのに使えます。
+MVP 変換は単一のユニフォームバッファオブジェクトにあるので、`descriptorCount` は `1` にします。
+
+ディスクリプタがどのシェーダステージで参照されるかも指定する必要があります。
+`stageFlags` フィールドは `vk::ShaderStageFlagBits` 値の組み合わせ、または値 `vk::ShaderStageFlagBits::eAllGraphics` にできます。
+今回は頂点シェーダからのみディスクリプタを参照します。
+
+`pImmutableSamplers` フィールドはイメージサンプリング関連のディスクリプタにのみ関係し、後で見ていきます。
+デフォルト値のままで構いません。
+
+すべてのディスクリプタバインディングは、単一の `vk::raii::DescriptorSetLayout` オブジェクトにまとめられます。
+`pipelineLayout` の上に新しいクラスメンバを定義します。
+
+[,c++]
+----
+vk::raii::DescriptorSetLayout descriptorSetLayout = nullptr;
+vk::raii::PipelineLayout      pipelineLayout      = nullptr;
+----
+
+その後、`vk::raii::DescriptorSetLayout` コンストラクタで作成できます。
+この関数は、バインディングの配列を持つ単純な `vk::DescriptorSetLayoutCreateInfo` を受け取ります。
+
+[,c++]
+----
+vk::DescriptorSetLayoutBinding uboLayoutBinding{
+    .binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex};
+vk::DescriptorSetLayoutCreateInfo layoutInfo{.bindingCount = 1, .pBindings = &uboLayoutBinding};
+descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
+----
+
+シェーダがどのディスクリプタを使うかを Vulkan に伝えるため、パイプライン作成時にディスクリプタセットレイアウトを指定する必要があります。
+ディスクリプタセットレイアウトはパイプラインレイアウトオブジェクトで指定します。
+レイアウトオブジェクトを参照するよう `vk::PipelineLayoutCreateInfo` を変更します。
+
+[,c++]
+----
+vk::PipelineLayoutCreateInfo pipelineLayoutInfo{ .setLayoutCount = 1, .pSetLayouts = &*descriptorSetLayout, .pushConstantRangeCount = 0 };
+----
+
+単一のレイアウトですでにすべてのバインディングが含まれるのに、なぜここで複数のディスクリプタセットレイアウトを指定できるのか不思議に思うかもしれません。
+それについては次の章で、ディスクリプタプールとディスクリプタセットを見るときに戻ります。
+
+== ユニフォームバッファ
+
+次の章でシェーダ用の UBO データを含むバッファを指定しますが、まずこのバッファを作成する必要があります。
+ユニフォームバッファには毎フレーム新しいデータをコピーするので、ステージングバッファを持つ意味はほとんどありません。
+この場合は余分なオーバーヘッドが増えるだけで、性能改善どころか低下しがちです。
+
+複数のバッファを持つべきです。複数のフレームが同時にフライト中になることがあり、前のフレームがまだ読んでいるあいだに次のフレームの準備としてバッファを更新したくないからです。
+したがって、フレームインフライトの数と同じだけのユニフォームバッファが必要で、GPU が現在読んでいないユニフォームバッファへ書き込みます。
+
+そのために、`uniformBuffers` と `uniformBuffersMemory` の新しいクラスメンバを追加します。
+
+[,c++]
+----
+vk::raii::Buffer       indexBuffer        = nullptr;
+vk::raii::DeviceMemory indexBufferMemory  = nullptr;
+
+std::vector<vk::raii::Buffer>       uniformBuffers;
+std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
+std::vector<void *>                 uniformBuffersMapped;
+----
+
+同様に、`createIndexBuffer` の後に呼ばれバッファを割り当てる新しい関数 `createUniformBuffers` を作成します。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createVertexBuffer();
+    createIndexBuffer();
+    createUniformBuffers();
+    ...
+}
+
+...
+
+void createUniformBuffers()
+{
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+    {
+        vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
+        auto [buffer, bufferMem]  = createBuffer(
+            bufferSize, vk::BufferUsageFlagBits::eUniformBuffer, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        uniformBuffers.emplace_back(std::move(buffer));
+        uniformBuffersMemory.emplace_back(std::move(bufferMem));
+        uniformBuffersMapped.emplace_back( uniformBuffersMemory.back().mapMemory(0, bufferSize));
+    }
+}
+----
+
+後でデータを書き込めるポインタを得るため、作成直後に `vk::raii::DeviceMemory::mapMemory` でバッファをマップします。
+バッファはアプリケーションの寿命全体にわたってこのポインタにマップされたままです。
+この手法は *「永続マッピング」* と呼ばれ、すべての Vulkan 実装で動作します。
+更新のたびにバッファをマップしなくて済むことで性能が上がります。マップは無料ではないからです。
+
+== ユニフォームデータの更新
+
+新しい関数 `updateUniformBuffer` を作成し、次のフレームをサブミットする前に `drawFrame` 関数から呼び出します。
+
+[,c++]
+----
+void drawFrame()
+{
+    ...
+
+    updateUniformBuffer(frameIndex);
+
+    ...
+
+		const vk::SubmitInfo   submitInfo{.waitSemaphoreCount   = 1,
+		                                  .pWaitSemaphores      = &*presentCompleteSemaphores[frameIndex],
+		                                  .pWaitDstStageMask    = &waitDestinationStageMask,
+		                                  .commandBufferCount   = 1,
+		                                  .pCommandBuffers      = &*commandBuffers[frameIndex],
+		                                  .signalSemaphoreCount = 1,
+		                                  .pSignalSemaphores    = &*renderFinishedSemaphores[imageIndex]};
+
+    ...
+}
+
+...
+
+void updateUniformBuffer(uint32_t currentImage)
+{
+}
+----
+
+この関数は、ジオメトリを回転させるために毎フレーム新しい変換を生成します。
+この機能を実装するために、新しいヘッダを 2 つインクルードする必要があります。
+
+[,c++]
+----
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <chrono>
+----
+
+`glm/gtc/matrix_transform.hpp` ヘッダは、`glm::rotate` のようなモデル変換、`glm::lookAt` のようなビュー変換、`glm::perspective` のようなプロジェクション変換を生成する関数を公開します。
+
+`chrono` 標準ライブラリヘッダは、精密な時間計測を行う関数を公開します。
+フレームレートに関係なくジオメトリが毎秒 90 度回転するよう保証するために使います。
+
+[,c++]
+----
+void updateUniformBuffer(uint32_t currentImage)
+{
+    static auto startTime = std::chrono::high_resolution_clock::now();
+
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    float time       = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+}
+----
+
+`updateUniformBuffer` 関数はまず、描画開始からの経過秒数を浮動小数点精度で計算するロジックから始まります。
+
+次に、ユニフォームバッファオブジェクト内でモデル、ビュー、プロジェクション変換を定義します。
+モデル回転は、`time` 変数を使った Z 軸周りの単純な回転にします。
+
+[,c++]
+----
+UniformBufferObject ubo{};
+ubo.model = rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+----
+
+`glm::rotate` 関数は、既存の変換、回転角、回転軸をパラメータに取ります。
+`glm::mat4(1.0f)` コンストラクタは単位行列を返します。
+回転角 `time * glm::radians(90.0f)` により、毎秒 90 度の回転という目的を達成します。
+
+[,c++]
+----
+ubo.view = lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+----
+
+ビュー変換では、45 度の角度で上からジオメトリを見ることにしました。
+`glm::lookAt` 関数は、視点位置、中心位置、上方向の軸をパラメータに取ります。
+
+[,c++]
+----
+ubo.proj =
+    glm::perspective(glm::radians(45.0f), static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height), 0.1f, 10.0f);
+----
+
+垂直視野角 45 度の透視投影を使うことにしました。
+他のパラメータはアスペクト比、ニアおよびファーのビュー平面です。
+リサイズ後のウィンドウの新しい幅と高さを考慮するため、アスペクト比の計算には現在のスワップチェーンの extent を使うことが重要です。
+
+[,c++]
+----
+ubo.proj[1][1] *= -1;
+----
+
+GLM はもともと OpenGL 向けに設計されており、クリップ座標の Y 座標が反転しています。
+それを補う最も簡単な方法は、プロジェクション行列の Y 軸のスケール係数の符号を反転することです。
+これをしないと、画像が上下逆に描画されます。
+
+変換はすべて定義できたので、ユニフォームバッファオブジェクト内のデータを現在のユニフォームバッファへコピーできます。
+これは頂点バッファのときとまったく同じ方法ですが、ステージングバッファはありません。
+前述のとおり、ユニフォームバッファは一度だけマップするので、再びマップせずに直接書き込めます。
+
+[,c++]
+----
+memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+----
+
+このように UBO を使うのは、頻繁に変わる値をシェーダへ渡す最も効率的な方法ではありません。
+小さなデータバッファをシェーダへ渡すより効率的な方法は _プッシュ定数_ です。
+今後の章でそれらを見るかもしれません。
+
+xref:./01_Descriptor_pool_and_sets.adoc[次の章]では、シェーダがこの変換データにアクセスできるよう、実際に ``vk::raii::Buffer`` をユニフォームバッファディスクリプタにバインドするディスクリプタセットを見ていきます。
+
+link:/attachments/22_descriptor_layout.cpp[C{pp} code] /
+link:/attachments/22_shader_ubo.slang[slang shader] /
+link:/attachments/22_shader_ubo.vert[GLSL Vertex shader] /
+link:/attachments/22_shader_ubo.frag[GLSL Fragment shader]

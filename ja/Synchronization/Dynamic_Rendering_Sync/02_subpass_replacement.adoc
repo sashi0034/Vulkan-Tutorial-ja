@@ -1,0 +1,63 @@
+:pp: {plus}{plus}
+= サブパスの置き換え: パスなしの同期
+
+== サブパス依存の終わり
+
+レガシーな Vulkan の「レンダーパス」システムでは、依存関係を事前に定義しました。G-Buffer パスの後にライティングパスを使いたい場合、データの遷移と同期の仕方を指定するサブパス依存を作成しました。同期を、実際にそれを使うコマンドから分離していたため、しばしば混乱を招きました。
+
+**ダイナミックレンダリング** では、これらの依存を、ドローコールの間に直接記録する **Synchronization 2** バリアに置き換えます。このアプローチははるかに直感的です。二番目のドローコールが一番目の出力を読む必要があるなら、その間にバリアを記録します。
+
+== 具体例
+
+G-Buffer を構築しているとします。デプスバッファを事前に埋める「Depth-Only」パスがあり、その後に早期 Z テストのためにそのデプスバッファを読む「Main Pass」があります。
+
+[,cpp]
+----
+// 1. Depth Pre-Pass
+commandBuffer.beginRendering(depthPrePassInfo);
+// ... record depth draw calls ...
+commandBuffer.endRendering();
+
+// 2. Synchronization Barrier
+auto depthBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eLateFragmentTests,
+    .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eEarlyFragmentTests,
+    .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+    .oldLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+    .newLayout = vk::ImageLayout::eDepthAttachmentOptimal, // No layout change needed
+    .image = depthBuffer.image(),
+    .subresourceRange = subresourceRange
+};
+
+commandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &depthBarrier});
+
+// 3. Main Pass
+commandBuffer.beginRendering(mainPassInfo);
+// ... record main draw calls ...
+commandBuffer.endRendering();
+----
+
+== なぜこれが良いか
+
+-   **明確さ**: 何がなぜ同期されているかが、コマンドバッファのその場所で正確に見えます。
+-   **柔軟性**: 同期を実行時に決められるため、柔軟なレンダリンググラフの構築がはるかに容易になります。
+-   **近代性**: DirectX 12 など他のモダン API が同期を扱う方法と一致し、エンジンコードの移植性が高まります。
+
+明示的なバリアを使うことで、レガシーレンダーパスシステムの「ブラックボックス」から離れ、明確で外科的な同期アーキテクチャへ移ります。次の節では、**Vulkan 1.4** が効率的なオンタイルリード操作を可能にすることで、これをさらにどう進めるかを見ます。
+
+== Simple Engine: ダイナミックレンダリング同期
+
+`Simple Engine` では、**不透明プリパス** と **メインパス** の間でこの明示的な同期を使います。これらの遷移を扱う伝統的なレンダーパスがないため、デプスバッファが適切にフラッシュされ無効化されるよう、独自の `vk::ImageMemoryBarrier2` を記録します。
+
+具体的には、`Renderer::Render` で次のシーケンスがあります。
+
+1.  **デプスプリパス**: デプスプリパス用に `commandBuffer.beginRendering` を呼びます。
+2.  **バリア**: `endRendering` の後、`depthToRead2` バリアを記録します。このバリアは、`eLateFragmentTests`（デプス書き込み）を次のパスの `eEarlyFragmentTests`（デプス読み取り）と同期します。
+3.  **メイン不透明パス**: 次にメインの不透明カラーパス用に再び `beginRendering` を呼びます。これで事前に埋められたデプスバッファへの安全なアクセスがあります。
+
+この明示的なアプローチにより、`Simple Engine` に **Forward+ ライティング** を容易に追加できました。デプスバッファがすでに同期されていたため、プリパスとメインパスの間にライトカリングコンピュートパスを追加することは、複雑なレガシーレンダーパスを再設計せずに、バリアをもう一つ追加するだけの単純な作業でした。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Dynamic_Rendering_Sync/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Dynamic_Rendering_Sync/03_local_read_sync.adoc[ローカルリード同期]

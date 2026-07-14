@@ -1,0 +1,189 @@
+:pp: {plus}{plus}
+
+= エージェンティック自動化とパフォーマンス監査
+
+== はじめに: 自動化されたシステム検証
+
+Vulkan 開発は正しさと性能のマラソンです。AI 支援の旅の最終段階では、「コーディング」と「デバッグ」から **自律メンテナンス** へ移ります。ここで **AI エージェント**（**Goose** など）を使い、エンジン全体にわたる高レベルタスクを実行し、システムが成長しても堅牢であり続けることを保証します。
+
+**協調エンジニアリング** では、AI は単なるヘルパーではなく、単一ファイルで作業する人間の開発者にはしばしば見えない微妙な非効率と「ヘッドレス」失敗を特定する **検証ツール** です。
+
+== コア概念: システム分析
+
+IDE アシスタントと異なり、自律エージェントは **システム分析** を実行できます。ビルドシステム、テストログ、ソースコードの状態をコンテキストに同時に保てます。これにより **CI/CD ログ診断** が可能になり、モデルが夜間「ヘッドレス」ビルドの難解なログを読み、特定ハードウェア上の失敗の根本原因を特定します。
+
+同時に **パフォーマンス非効率スキャン** を実行し、コマンドバッファ記録論理全体を見て、冗長な状態変更や最適 GPU オーバーラップには広すぎる同期バリアを見つけられます。
+
+== 実世界体験: 「夜間」修正
+
+Vulkan エンジンにはしばしばリモートサーバで動く自動テストスイートがあります。これらのテストが特定ハードウェアファーム（例: 「Mali GPU ファーム」）で失敗すると、ログは何万行にもなり、手動デバッグが困難になります。
+
+エージェンティックワークフローは、テスト失敗の通知から始まります。エージェントにログを分析し修正を提案する高レベルコマンドを与えます。このシナリオでは、エージェントは **コンテキストブリッジ** を使い、特定デバイスのハードウェアリミットを確認します。
+
+**法医的発見:** 分析中、エージェントは Adreno 750 ランナが `maxComputeWorkGroupInvocations` リミット超過を報告していることを特定します。Bloom シェーダが 512 スレッドにハードコードされているが、このデバイスは 256 しかサポートしないことに気づきます。次にワークグループサイズに specialization constant を使うようシェーダを自動リファクタし、ランタイムでこの定数を設定するよう C{pp} を更新し、修正を検証する新しい CI ビルドをトリガします。
+
+== チュートリアル: 自律ビルドガードの統合
+
+開発者のローカルワークステーションを超え、エージェンティック自動化は CI/CD パイプラインに直接統合できます。**Goose** を「ヘッドレス」環境（GitHub Actions ランナなど）で使うことで、ビルド失敗の診断と複雑なマージコンフリクトの解決を自動化できます。
+
+=== GitHub Action の設定
+
+CI で Goose を動かすには、標準 Linux ランナを使い、必要な API キーと環境コンテキストを与えます。次の設定は、ビルド失敗時にエージェンティック診断をトリガする方法を示します。
+
+[source,yaml]
+----
+name: Agentic Build Guard
+on:
+  workflow_run:
+    workflows: ["Build and Test"]
+    types: [completed]
+
+jobs:
+  agentic-diagnosis:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Goose
+        run: |
+          curl -fsSL https://github.com/block/goose/releases/download/stable/goose-linux-amd64 -o goose
+          chmod +x goose
+          sudo mv goose /usr/local/bin/
+      - name: Run Diagnosis
+        env:
+          GOOSE_PROVIDER: openrouter
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          ./scripts/agentic_ci_diagnosis.sh
+----
+
+=== 診断スクリプト
+
+スクリプト `agentic_ci_diagnosis.sh` は、エージェントに必要なコンテキストと問題解決の明確な指示を与えます。このシナリオでは、ビルドログとプルリクエスト diff を使い失敗の原因を特定します。
+
+[source,bash]
+----
+#!/bin/bash
+# scripts/agentic_ci_diagnosis.sh
+
+# 1. Collect context: The build failure log and the current diff
+BUILD_LOG=$(cat build_output.txt | tail -n 100)
+PR_DIFF=$(git diff origin/main...HEAD)
+
+# 2. Command the agent to resolve the failure
+goose session --instruction "
+I have a build failure in my Vulkan engine CI.
+BUILD LOG EXCERPT:
+$BUILD_LOG
+
+PR DIFF:
+$PR_DIFF
+
+Identify the cause of the failure. If it is a compilation error or a
+Vulkan validation error (VUID), propose a fix in a new branch
+'fix/ci-failure' and create a PR comment with the explanation.
+"
+----
+
+=== ネイティブプラットフォーム知能: GitHub Copilot Autofix
+
+=== チュートリアル: Guardian の有効化
+
+Vulkan プロジェクト向けに **GitHub Copilot Autofix** を有効にするには、次のステップに従ってください。
+
+1.  **Code Scanning の設定:**
+    `.github/workflows/codeql.yml` に新しい GitHub Actions ワークフローファイルを作成。これにより **CodeQL** 静的分析エンジンが動き、Copilot が修正生成に使う「Alerts」を提供する。
++
+[source,yaml]
+----
+name: "CodeQL Analysis"
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'cpp'
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+----
+
+2.  **リポジトリ設定で Autofix を有効化:**
+    GitHub でリポジトリへ移動。**Settings > Code security and analysis** へ行く。**GitHub Copilot Autofix** が **Enabled** にトグルされていることを確認。
+
+3.  **修正のレビュー:**
+    プルリクエストが作成されると、CodeQL がコードをスキャンする。未チェックの `vkMapMemory` 結果やディスクリプタ更新の潜在バッファオーバーフローのような脆弱性を見つけると、Copilot はセキュリティアラートに「Propose a fix」セクションを追加する。**「Fix with Copilot」** ボタンをクリックし、提案されたコード変更をレビューしてブランチに直接コミットする。
+
+これは **協調エンジニアリング** パラダイムの異なるレベルを表します。**Goose** が複雑な複数ファイルアーキテクチャリファクタを扱える積極的な「エージェント」である一方、**Copilot Autofix** はレビューフェーズに到達する前にコードの基本的な安全性と正しさを保証する反応的な「ガーディアン」です。
+
+=== 意味的マージコンフリクト解決
+
+複雑なグラフィックスエンジンのマージコンフリクトは、しばしば単純なテキストベースマージツールでは安全に解決できない同期論理やリソース管理の変更を含みます。エージェントは両方のブランチの意味的意図を分析し、競合条件を導入せずに統合できます。既存コンフリクトの解決や、git が見落とす「隠れた」意味コンフリクトについてプルリクエストを監査するのに使えます。
+
+[source,bash]
+----
+# Example command for semantic conflict resolution
+goose session --instruction "
+The current PR has merge conflicts with 'main' in 'Renderer.cpp'.
+Analyze the conflicting blocks. One side introduces Descriptor Buffers
+while the other refactors the Command Pool management.
+Resolve the conflict by integrating both features, ensuring that the new
+Descriptor Buffer paths correctly use the updated Command Pool lifecycle.
+"
+----
+
+マージが試みられる前に、パイプライン非互換や同期ハザードのようなシステム問題を引き起こすか、エージェントに積極的に確認するようタスクを与えることもできます。
+
+== チュートリアル: GPU 状態監査の実行
+
+「パフォーマンス監査」はバグ探しではなく、**無駄** を見つけることです。これを自動化するには、**RenderDoc CLI（`rdc-cli`）** と併せて **Goose** を使えます。
+
+=== ステップ 1: キャプチャとエクスポート
+まずフレームの RenderDoc キャプチャ（`.rdc`）を生成します。次にスクリプトを使い、エージェントが「読める」テキスト形式へコマンドリストをエクスポートします。
+
+[source,bash]
+----
+# Export the draw calls and their state to a structured text file
+rdc-cli replay --cmds --pipeline-state output_state.txt capture_frame.rdc
+----
+
+=== ステップ 2: 監査の指示
+**Goose** をエクスポートされた `output_state.txt` に向け、特定のアーキテクチャ目標を提供します。
+
+[source,text]
+----
+Goose, audit 'output_state.txt'.
+Look for redundant 'vkCmdBindPipeline' calls in the 'ShadowPass'.
+Also, identify any 'vkCmdPipelineBarrier' calls that use
+'VK_PIPELINE_STAGE_ALL_COMMANDS_BIT' and suggest more specific
+alternatives for a depth-only pass.
+----
+
+=== ステップ 3: AI レポートと修正
+監査でエージェントは、ドローコールソートがパイプラインステートではなくマテリアルでグループ化されているため、フレームあたり 3 回『Shadow』パイプラインをバインドしていることを特定するかもしれません。`DrawBucket` をパイプラインソート優先にリファクタするよう推奨します。加えて、Depth Buffer のバリアが `BOTTOM_OF_PIPE_BIT` を使い、完全な GPU ストールを引き起こしていることに気づきます。次のパスが頂点作業を早く始められるよう、スコープを `LATE_FRAGMENT_TESTS_BIT` へ狭めることを提案します。
+
+レポートが生成されたら、Goose にリファクタを `Renderer.cpp` ファイルへ **直接適用** するよう頼めます。
+
+== まとめ: プロレベルのパートナー
+
+エージェンティック自動化は AI 支援ワークフローの究極目標です。AI を自律検証ツールとして使うことで、エンジンが **正しく** かつ **高性能** であり続けることを保証します。エンジンの創造的「ビジョン」に集中し、何千ものハードウェア構成にわたって滑らかに動かし続けるのに必要なデータ重いタスクを AI が管理します。
+
+チュートリアルの最終セクションでは **デプロイ** へ移り、これらの AI 支援ワークフローを Android、iOS、組み込みシステムへ持ち込む方法を探ります。
+
+次へ: xref:AI_Assisted_Vulkan/08_deployment/01_introduction.adoc[デスクトップ、モバイル、組み込みデプロイ]

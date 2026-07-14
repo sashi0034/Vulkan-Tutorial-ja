@@ -1,0 +1,123 @@
+:pp: {plus}{plus}
+= モバイル GPU 向け最適化
+
+== 異なる目的関数
+
+デスクトップではほぼ専ら **時間** のために最適化します。ディスパッチに何ミリ秒かかるか？ モバイルと組み込みデバイスでは、目的関数に、生のレイテンシより*重要*であることが多い 2 つの項が加わります。
+
+*   **エネルギー** — 使われたすべてのジュールがバッテリーを減らし熱を生む。
+*   **持続性能** — 1 秒は速く動くが **熱スロットリング** を引き起こすカーネルは、平均では、電力エンベロープ内で安定して動くカーネルより遅い。
+
+これによりこれまでの章のすべてが再構成されます。最速のカーネルはしばしば、DRAM に最も触れないものです。
+
+== 何より DRAM トラフィックを最小化
+
+外部メモリ帯域がモバイルの電力予算を支配するため、主な最適化レバーは算術ではなく *データ移動* です。
+
+*   **パスを融合する。** それぞれがフル解像度バッファを読み書きする 2 カーネルは、DRAM への往復が 2 回かかる。中間をレジスタや共有メモリに保つ単一カーネルへ融合すると、帯域を半分にできる。
+*   **共有メモリとサブグループを積極的に使う。** デスクトップで *速度* のために使った LDS タイリング（第 3 章）とサブグループシャッフル（第 4 章）は、モバイルでは主に *電力* 最適化です——データをオンチップに保つことで高価な DRAM ホップを避けます。
+*   **圧縮とパック。** 正しい最小精度で中間を格納し（下記参照）、トランザクション数を減らすため単語あたり複数値をパックする。
+
+=== 実践例: ブラーとトーンマップの融合
+
+写真パイプラインが画像をブラーし、その後トーンマップ曲線を適用するとします。素朴なやり方は 2 ディスパッチです。
+
+[source,slang]
+----
+// Pass 1: src を読む (R)、blurred を書く (W) -> フル画像 1 回読み + 1 回書き
+// Pass 2: blurred を読む (R)、final を書く (W) -> さらにフル読み + フル書き
+----
+
+12 メガピクセル画像を FP16（2 バイト／チャネル、4 チャネル）で扱うと、片道およそ 96 MB、4 回で約 384 MB の DRAM トラフィックです。メガバイト動かすたびに測定可能なバッテリーと熱がかかるスマートフォンでは、それが支配的なコストです——算術はそれに比べほとんど無料です。
+
+2 ステージを単一カーネルへ融合すると、ブラーされたピクセルをレジスタに保ちすぐトーンマップを適用し、中間バッファの書き込み*と*読み取りを排除します。
+
+[source,slang]
+----
+[numthreads(8, 8, 1)]   // 64 呼び出し: 128 呼び出し上限の下で安全
+void fusedBlurToneMap(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= imageSize)) return;        // 境界チェック、第 2 章参照
+
+    half4 blurred = boxBlur(srcImage, id.xy);   // ギャザーはテクスチャキャッシュ経由
+    half4 mapped  = toneMap(blurred);           // レジスタに留まり、DRAM ホップなし
+    dstImage[id.xy] = mapped;                    // DRAM への単一書き込み
+}
+----
+
+往復が半分になり（約 384 MB の代わりに約 192 MB）、フルサイズ割り当てが 1 つ消えます。モバイルではこれがしばしば利用可能な最大の単一の勝ち筋で、算術コストはゼロです。
+
+== 16 ビット精度を活用する
+
+ほとんどの現代モバイル GPU は **FP16** を FP32 の 2 倍の速度で実行し、重要なことに、動かすバイト数は半分です。低減精度に耐えられるワークロード——画像処理、多くの ML 推論カーネル、オーディオ——では、ストレージと算術を 16 ビットへ切り替えることがしばしばほぼ無料の 2 倍になります。
+
+本チュートリアルは Slang 優先のため、ここは半精度カーネルを Slang で示します。`half` が 16 ビット float へ直接マップし、コンパイラが 16 ビット SPIR-V 能力を出力します。
+
+[source,slang]
+----
+RWStructuredBuffer<half> values;
+
+[numthreads(64, 1, 1)]
+void scale(uint3 id : SV_DispatchThreadID)
+{
+    // 半精度数学: 動くバイト数が半分、電力が減り、しばしば 2 倍スループット。
+    values[id.x] = values[id.x] * half(1.5);
+}
+----
+
+同等の GLSL は必要な拡張を明示し、ベンダーサンプルを読むときに役立ちます。
+
+[source,glsl]
+----
+#extension GL_EXT_shader_16bit_storage    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(set = 0, binding = 0) buffer Data { float16_t values[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    values[i] = values[i] * float16_t(1.5);
+}
+----
+
+いずれにせよ、デバイス作成時に `VkPhysicalDeviceShaderFloat16Int8Features::shaderFloat16` と一致する 16 ビットストレージ機能を有効にしなければならず（前セクションの防御的機能有効化コードを参照）、ユースケースで数値が許容できることを*常に*検証してください。有用なトリックは、入力と出力を FP16 で格納しつつ累積を FP32 に保つことです——コオペラティブ行列章の同じ混合精度の考えを、テンソルユニットではなく帯域のために適用します。
+
+== ワークグループを適切なサイズに
+
+デスクトップの「とりあえず 256 や 1024 呼び出し」という習慣は、モバイルでは積極的に有害です。
+
+*   前セクションで問い合わせた `maxComputeWorkGroupInvocations`（128 になり得る）と `maxComputeSharedMemorySize`（16 KB になり得る）を尊重する。
+*   レーンが無駄にならないよう、デバイスが報告する `subgroupSize` の倍数のワークグループサイズを好む。
+*   より小さなワークグループは狭いモバイルコアでの **占有率** を改善し、共有メモリ圧力を減らせる。想定せずプロファイルする。
+
+== 熱と周波数を管理する
+
+スマートフォンはピーク GPU クロックを持続できません。重い負荷が数秒続くと、ガバナーが熱エンベロープ内に留まるため周波数を下げ、測定スループットが落ちます。実践的な戦略:
+
+*   **ピークではなく持続を測る。** スロットルされた定常状態を見るため、単一ディスパッチではなく数十秒にわたってベンチマークする。
+*   **バーストせず償却する。** 背景や定期作業では、全力バーストの後にスロットリングするより、低いクロックでフレーム間にコンピュートを分散する方がジュールあたりの総仕事量が多いことがある。
+*   **`VK_EXT_global_priority` を慎重に使う。** 高いキュー優先度はシステムの残りを飢餓させ、熱／UX のトレードオフを悪化させ得る。
+
+== 実デバイスでプロファイルする
+
+エミュレータとデスクトップ GPU はモバイル性能について嘘をつききます。実際のハードウェアでベンダーツールを使ってください。
+
+*   link:https://developer.arm.com/Tools%20and%20Software/Arm%20Performance%20Studio[**Arm Performance Studio**（旧 Streamline）] (https://developer.arm.com/Tools%20and%20Software/Arm%20Performance%20Studio) — Mali と Immortalis GPU 向けの主要プロファイリングスイート。タイムラインレベルの CPU/GPU カウンタ用 **Arm Streamline**、シェーダごとのレジスタとスループット見積もり用 **Mali Offline Compiler**、**Mali Texture Compression Tool** を含む。無料ダウンロード、Windows/Linux/macOS ホスト。
+
+*   link:https://developer.qualcomm.com/software/snapdragon-profiler[**Qualcomm Snapdragon Profiler**] (https://developer.qualcomm.com/software/snapdragon-profiler) — Adreno デバイス上で GPU カウンタ、メモリ帯域、Vulkan コマンドバッファトレースをキャプチャ。低レベルシェーダ分析用 **Adreno GPU Profiler** も同梱。Qualcomm 開発者アカウント（無料）が必要。
+
+*   link:https://developer.imaginationtech.com/pvrtune/[**Imagination PVRTune**] (https://developer.imaginationtech.com/pvrtune/) — PowerVR/BXT/IMG 部品向けの GPU カウンタキャプチャとタイムラインビューア。**PVRShaderEditor**（オフラインシェーダ分析）と **PowerVR SDK** ツールと組み合わせる。無料ダウンロード。
+
+*   link:https://gpuinspector.dev/[**Android GPU Inspector（AGI）**] (https://gpuinspector.dev/) — Google のオープンソース、ベンダー中立プロファイラ。すべての Vulkan API 呼び出し、リソース寿命、サポートされるデバイスではハードウェアパフォーマンスカウンタを含む完全な **フレームトレース** をキャプチャ。どのベンダーツールに最初に手を伸ばすか分からないときの最良の出発点。Mali、Adreno、`VK_LAYER_performance_counters` レイヤを公開する他ドライバで動く。
+
+=== プロファイラが伝えることの読み方
+
+これらは、ALU 利用率と占有率と並び、ここで最も重要なメトリクス——外部メモリの **読み／書きバイト**——を公開します。良い習慣は、カーネルの*理論*最小トラフィック（入力バイト + 出力バイト）を計算し、プロファイラが報告する測定外部読み／書きバイトと比較することです。理論最小の 3〜4 倍動かしているなら、融合またはキャッシュで取り除く冗長 DRAM トラフィックがあります。これはパフォーマンス監査章の Roofline 分析のモバイル版ですが、軸は FLOPS ではなく *バイトとジュール* です。
+
+`clvk` ベースのワークロードでは、AGI の Vulkan レベルキャプチャが特に有用です。`clvk` が OpenCL 呼び出しを Vulkan コマンドへ変換するため、AGI はどの `vkCmdDispatch` 呼び出しが生成され、バリアとメモリトラフィックがどこに着地したかを正確に示します。
+
+== まとめ
+
+モバイルコンピュートの最適化は、算術より先に *帯域とワット* です。パスを融合し、共有メモリとサブグループでデータをオンチップに保ち、正しさが許すところで FP16 へ落とし、デバイスの実制限に合わせてワークグループを適切なサイズにし、ベンダープロファイラでハードウェア上の持続性能を検証してください。これらの習慣があれば、デスクトップ向けに書いた同じカーネルが、バッテリー駆動デバイスのよく振る舞う市民になります。
+
+xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/02_android_compute.adoc[前へ: Android 上のコンピュート] | xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/04_embedded_beyond_mobile.adoc[次へ: モバイルを超えて: 組み込みとヘッドレスコンピュート]

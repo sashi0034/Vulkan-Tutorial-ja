@@ -1,0 +1,15 @@
+:pp: {plus}{plus}
+
+= ツーリング
+
+この章では、Vulkan アプリケーションの開発・デバッグ・配布に不可欠なツーリングと技法を扱い、モダンな C++20 モジュールと vk::raii 名前空間の使用に焦点を当てます。
+
+* xref:Building_a_Simple_Engine/Tooling/01_introduction.adoc[はじめに]
+* xref:Building_a_Simple_Engine/Tooling/02_cicd.adoc[Vulkan プロジェクト向け CI/CD]
+* xref:Building_a_Simple_Engine/Tooling/03_debugging_and_renderdoc.adoc[VK_KHR_debug_utils と RenderDoc によるデバッグ]
+* xref:Building_a_Simple_Engine/Tooling/04_crash_minidump.adoc[クラッシュ処理とミニダンプ]
+* xref:Building_a_Simple_Engine/Tooling/05_extensions.adoc[堅牢性のための Vulkan 拡張]
+* xref:Building_a_Simple_Engine/Tooling/06_packaging_and_distribution.adoc[パッケージングと配布]
+* xref:Building_a_Simple_Engine/Tooling/07_conclusion.adoc[まとめ]
+
+xref:Building_a_Simple_Engine/Subsystems/06_conclusion.adoc[前へ: サブシステムのまとめ] | xref:../index.adoc[シンプルなエンジンの構築へ戻る]

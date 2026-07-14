@@ -1,0 +1,74 @@
+:pp: {plus}{plus}
+= レイトラッチングの実装
+
+レイトラッチングの効率は、CPU が GPU をシグナルする最終瞬間に依存します。エンジンでは、永続マップメモリとタイムラインセマフォを使い、可能な限り低いレイテンシを保証します。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準を超えて**。
+
+OpenXR がポーズを提供する一方、「レイトラッチング」という低レイテンシ同期技法は Vulkan のコア同期機能で実装します。標準的な統合より良い結果を得るために Vulkan で実装する強力な最適化です。
+
+== 「最後の瞬間」のビュー予測
+
+レイトラッチングの魔法は、CPU が GPU に「進め」を出す最終瞬間に起きます。エンジンのメインループでは、`predictedDisplayTime` を使い `xrLocateSpace` を呼び、絶対最新の頭のポーズを取得します。
+
+[source,cpp]
+----
+// 1. Get the absolute latest head pose from OpenXR
+XrSpaceLocation spaceLocation{
+    .type = XR_TYPE_SPACE_LOCATION
+};
+xrLocateSpace(viewSpace, baseSpace, predictedDisplayTime, &spaceLocation);
+
+if (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
+    // 2. Convert to matrix and update persistently mapped memory
+    auto latestViewMatrix = convertXrPoseToMatrix(spaceLocation.pose);
+    std::memcpy(mappedUboPointer, &latestViewMatrix, sizeof(latestViewMatrix));
+
+    // 3. Flush if memory is not host-coherent using designated initializers
+    vk::MappedMemoryRange flushRange{
+        .memory = *uboBufferMemory,
+        .offset = 0,
+        .size = sizeof(latestViewMatrix)
+    };
+    device.flushMappedMemoryRanges(flushRange);
+}
+
+// 4. Signal the timeline semaphore to unblock the GPU
+vk::SemaphoreSignalInfo signalInfo{
+    .semaphore = *lateLatchingSemaphore,
+    .value = nextValue
+};
+device.signalSemaphore(signalInfo);
+----
+
+== 永続マッピング: 効率要件
+
+レイトラッチングが機能するには、毎フレーム `vkMapMemory` と `vkUnmapMemory` を呼ぶオーバーヘッドを払えません。初期化時に Vulkan バッファを一度マップし、アプリケーションの寿命中 CPU 側ポインタを利用可能に保ちます。これにより、時間的に重要な更新ウィンドウで直接 `memcpy` の生パフォーマンスを使えます。
+
+メモリを更新している間、ランタイムは内部センサーフュージョンモデルをリフレッシュし（1000Hz 以上で IMU をサンプリング）、予測表示時刻向けに最も正確な外挿を提供します。
+
+== コヒーレンシの問題: `vkFlushMappedMemoryRanges`
+
+一部のハードウェア（特にディスクリートデスクトップ GPU）では、CPU と GPU に別キャッシュがあります。`memcpy` しても、GPU はキャッシュ内の「古い」版をまだ見ているかもしれません。
+
+メモリヒープに `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT` フラグがない場合、`vkFlushMappedMemoryRanges` を呼ばなければなりません。これにより CPU キャッシュが物理 VRAM へデータを書き出し、GPU が見えるようになります。
+
+== 発展: 投機的レンダリングと転送キュー
+
+Vulkan では後期更新の境界を押し広げられます。
+
+*   **投機的レンダリング**: 異なる予測ポーズ向けに複数の小さな「候補」コマンドバッファを記録し、タイムラインセマフォで最後の瞬間に正しいものを選択できます——CPU 更新がわずかに遅れてもゼロレイテンシ整合を保証します。
+*   **非同期転送キュー**: レイトラッチングは変換行列のような小さなデータ専用です。より大きなデータセット（アニメーションのボーン変換など）を更新する必要がある場合、Vulkan の **非同期転送キュー** を使い、レンダリング作業と並行してこのデータをストリームし、OpenXR メインループのシングルスレッドボトルネックを迂回できます。
+
+== レイトラッチングの制限
+
+この技法は、頭のポーズやハンドトラッキングデータのような「高速に動く」データに最も効果的です。
+
+*   **データサイズ**: レイトラッチ更新は小さく保つ（通常は数行列だけ）。
+*   **タイミング**: 更新が長すぎると、GPU はセマフォ待ちでアイドルし、全体のフレームレートが下がる可能性があります。
+
+TIP: メモリマッピングと永続バッファの詳細は、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#memory-device-hostaccess[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/06_Late_Latching/02_last_second_update.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/06_Late_Latching/04_incorporating_into_the_engine.adoc[次へ]

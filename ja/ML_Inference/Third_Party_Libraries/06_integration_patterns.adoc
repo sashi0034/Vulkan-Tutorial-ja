@@ -1,0 +1,413 @@
+:pp: {plus}{plus}
+
+= 統合パターン
+
+== 導入
+
+ML 推論ライブラリを選びました——柔軟性の ONNX Runtime、モバイル最適化の TensorFlow Lite、学習からデプロイ seamless の PyTorch Mobile など。次は実践的課題: Vulkan アプリケーションと実際にどう統合するか。
+
+自明ではありません。Vulkan アプリには独自 GPU コンテキスト、コマンドキュー、メモリ割り当て、同期プリミティブ。ML ライブラリには独自ランタイム、GPU リソース管理、実行モデル。2 世界の橋渡しには careful なアーキテクチャ判断が必要。
+
+良いニュース: 確立された統合パターンがあり、各々異なるトレードオフ。本章では 3 つの基本アプローチ——別コンテキストでの ML 推論、Vulkan と ML ライブラリ間 GPU リソース共有、統一コマンドストリームでのインターリーブ実行——を探ります。パターン理解が用途に合った選択に役立ちます。
+
+== 統合の課題
+
+特定パターンの前に、なぜ統合が challenging か理解しましょう。
+
+=== 2 つの別世界
+
+Vulkan アプリと ML 推論ライブラリは fundamentally 別システム。Vulkan は GPU リソースの明示制御——バッファ割り当て、コマンドバッファ、同期、キュー submit。ML ライブラリは抽象化——モデル読み込み、入力、推論呼び出し、結果。
+
+ML ワークフローには強力だが境界を作る。ML ライブラリは独自 GPU コンテキスト（内部は **WebGPU**、**DirectML**、**CUDA**）を管理。Vulkan レンダリングコンテキストは別。Vulkan バッファのデータは ML ライブラリに自動 accessible ではなく、その逆も。
+
+=== データ転送問題
+
+最も obvious な課題はデータ移動。AI ベースアップスケーリング ML を使うゲームを想像。各フレーム低解像度レンダリング後 ML でネイティブ解像度へ。レンダリ画像は Vulkan image。ML モデルは入力として必要。Vulkan image から ML ライブラリへどう渡すか？
+
+素朴なアプローチ: image を CPU に読み戻し ML ライブラリ GPU コンテキストへ upload。動くが遅い。フレームあたり GPU→CPU→GPU を 2 回。60 FPS なら秒 120 転送、各々レイテンシと帯域コスト。
+
+better: Vulkan と ML ライブラリ間 GPU メモリ共有、CPU 往復排除。プラットフォーム固有拡張、careful 同期、より深い統合が必要。
+
+=== 同期問題
+
+データ転送を解いても同期は tricky。Vulkan レンダリングと ML 推論は非同期。推論開始時 GPU がまだレンダリング中、または次フレームで結果必要前に推論未完了の可能性。
+
+確保すべきこと:
+
+- 推論がレンダリ image 読み始める前にレンダリング完了
+- レンダリングがアップスケール結果使用前に推論完了
+- スループットのため複数フレーム in-flight
+
+Vulkan 同期（セマフォ、フェンス、バリア）と ML ライブラリ同期（ライブラリと実行プロバイダで異なる）の調整が必要。
+
+=== 性能問題
+
+統合オーバーヘッドは重要。フレームあたり 5ms レイテンシ追加はレンダリングやゲームプレイに使えない 5ms。60 FPS 目標（16.67ms/フレーム）で 5ms は nearly 3 分の 1。
+
+選ぶ統合パターンがこのオーバーヘッドに直接影響。一部はレイテンシ最小だが複雑性増。他はシンプルだがオーバーヘッド増。トレードオフ理解が informed 判断に。
+
+== パターン 1: 別コンテキスト
+
+最もシンプルな統合は ML 推論を Vulkan レンダリングと完全別コンテキストで実行。2 システムはリソース共有せず——CPU メモリのみ通信。
+
+=== 仕組み
+
+2 つの独立 GPU コンテキスト:
+
+*Vulkan コンテキスト*: 全レンダリング。Vulkan instance、device、コマンドバッファ、パイプラインを usual に作成。レンダリングはこのコンテキスト内 entirely。
+
+*ML コンテキスト*: ML ライブラリが独自 GPU コンテキスト（**WebGPU**、**DirectML** など）作成。推論はこのコンテキスト内 entirely。
+
+データフロー:
+
+1. Vulkan でフレームレンダリ、Vulkan image に書き込み
+2. image を CPU メモリへ読み戻し（vkCmdCopyImageToBuffer + vkMapMemory）
+3. CPU バッファを ML ライブラリ推論関数へ
+4. ML ライブラリが独自 GPU コンテキストへ upload、推論、結果を CPU へ download
+5. アプリが CPU から結果読み取り
+6. 必要なら Vulkan へ upload してレンダリング継続
+
+=== 実装
+
+完全 decouple のため straightforward:
+
+[source,cpp]
+----
+// Vulkan レンダリング
+commandBuffer.draw(...);  // シーンをレンダリング
+commandBuffer.copyImageToBuffer(renderedImage, stagingBuffer, ...);  // ステージングバッファへコピー
+
+// レンダリング完了待ち
+graphicsQueue.waitIdle();
+
+// ステージングバッファを CPU にマップ
+void* data = stagingBufferMemory.mapMemory(0, imageSize);
+
+// ML 推論（ライブラリが独自 GPU コンテキストを処理）
+std::vector<float> input = preprocessImage(data, width, height);
+std::vector<float> output = mlRuntime->run(input);
+
+// ステージングバッファのマップ解除
+stagingBufferMemory.unmapMemory();
+
+// 出力を次フレームまたは表示に使用
+processResults(output);
+----
+
+共有リソースなし、複雑同期なし、プラットフォーム固有拡張なし。CPU 仲介データ転送のみ。
+
+=== 利点
+
+*シンプルさ*: 最も easy 実装。外部メモリ拡張、クロスコンテキスト同期、プラットフォーム相互運用を理解不要。Vulkan から CPU 読み取り ML へ渡せば完了。
+
+*移植性*: プラットフォーム固有コードなしで全プラットフォーム。Linux、Windows、macOS、Android、iOS——CPU メモリ仲介で同アプローチ。
+
+*デバッグ*: 問題時 inspect しやすい。Vulkan と ML 間 CPU バッファ検査、データ検証、破損確認、レンダリング vs 推論の切り分け。
+
+*柔軟性*: 2 システム完全独立。ML ライブラリ swap で Vulkan 触らない。Vulkan 更新が ML に ripple しない。
+
+=== 欠点
+
+*性能オーバーヘッド*: CPU 往復 expensive。GPU→CPU はパイプライン stall。ML 入力 CPU→GPU もレイテンシ。1920×1080 RGB（約 6MB）で typical ハードウェア 2–5ms——リアルタイムで significant。
+
+*帯域無駄*: PCIe 帯域 2 回——GPU→CPU、CPU→GPU。帯域限られたシステム（モバイル、統合 GPU）でボトルネック。
+
+*レイテンシ*: vkQueueWaitIdle、推論完了待ちがレイテンシ追加。CPU メモリ通信のためレンダリングと推論 overlap 困難。
+
+*メモリ重複*: データ 3 箇所——Vulkan GPU、CPU ステージング、ML GPU。転送データメモリ 3 倍。
+
+=== いつこのパターンを使うか
+
+別コンテキストが意味を持つとき:
+
+*プロトタイピング*: ML 統合探索、迅速に動かしたい。シンプルに始め後で最適化。
+
+*低頻度推論*: 秒 1 回以下（スクリーンショット分析、ユーザー入力処理）。数 ms/推論は許容。
+
+*小データ*: 入出力数 KB なら転送 overhead negligible。小 feature ベクトルで意思決定など。
+
+*クロスプラットフォーム優先*: 多プラットフォーム、プラットフォーム固有コード避けたい——シンプルさと移植性が性能コスト上回る。
+
+*デバッグフェーズ*: ML 統合問題デバッグ時、段階間 CPU バッファ inspect は invaluable。開発中このパターン、必要なら shared へ最適化。
+
+== パターン 2: 共有リソース
+
+第 2 パターンは CPU 往復を排除し Vulkan と ML ライブラリ間 GPU メモリを直接共有。データは GPU 上に留まり両コンテキストから accessible。
+
+=== 仕組み
+
+別割り当ての代わり、両方がアクセス可能 GPU メモリ:
+
+1. Vulkan 外部メモリ拡張でメモリ割り当て
+2. ハンドル export（Linux fd、Windows NT handle など）
+3. ML ライブラリ GPU コンテキストへ import
+4. 両コンテキストが同 GPU メモリ read/write
+5. セマフォ/フェンスでアクセス調整
+
+データフロー:
+
+1. Vulkan が共有 image にレンダリ
+2. レンダリ完了でセマフォ signal
+3. ML がセマフォ待ち、共有 image から推論
+4. 推論完了で別セマフォ signal
+5. Vulkan がセマフォ待ち、結果使用前
+
+CPU 転送なし。データは throughout GPU 上。
+
+=== 実装概要
+
+プラットフォーム固有拡張と careful 同期でより複雑。高レベル概要（詳細はプラットフォームと ML ライブラリで異なる）:
+
+[source,cpp]
+----
+// 1. 外部メモリ付き Vulkan image 作成
+vk::ExternalMemoryImageCreateInfo externalInfo{
+    .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd  // Linux
+};
+
+vk::ImageCreateInfo imageInfo{
+    .pNext = &externalInfo
+    // ... 他 image 作成パラメータ
+};
+vk::raii::Image sharedImage(device, imageInfo);
+
+// 2. 外部メモリで割り当て
+vk::ExportMemoryAllocateInfo exportInfo{
+    .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+};
+
+vk::MemoryAllocateInfo allocInfo{
+    .pNext = &exportInfo
+    // ... 他割り当てパラメータ
+};
+vk::raii::DeviceMemory sharedMemory(device, allocInfo);
+sharedImage.bindMemory(*sharedMemory, 0);
+
+// 3. メモリハンドル export
+vk::MemoryGetFdInfoKHR getFdInfo{
+    .memory = *sharedMemory,
+    .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+};
+
+int memoryFd = device.getMemoryFdKHR(getFdInfo);
+
+// 4. ML ライブラリへ import（ライブラリ固有 API）
+// OpenCL の例:
+cl_mem clMem;
+cl_mem_properties_khr desc = {};
+desc.type = CL_EXTERNAL_MEMORY_HANDLE_OPAQUE_FD_KHR;
+desc.handle.fd = memoryFd;
+desc.size = memorySize;
+clCreateBufferWithProperties(&clMem, &desc);
+
+// 5. 同期用セマフォ作成
+vk::SemaphoreCreateInfo semaphoreInfo;
+// ... Vulkan セマフォ作成
+// メモリと同様 export/import
+----
+
+実装はプラットフォーム差（Linux fd、Windows NT handle、macOS IOSurface）、ライブラリ固有 import API、careful 同期の処理が必要。
+
+=== 利点
+
+*性能*: CPU 往復排除。データ GPU 上、expensive 転送回避。大 image や頻繁推論でフレーム 2–10ms 節約。
+
+*帯域効率*: 実データ移動（新フレーム upload など）のみ PCIe 使用。冗長 GPU→CPU→GPU なし。
+
+*低レイテンシ*: 同期点削減。CPU 転送待ちなしでレンダリングと推論 pipeline 効果的。
+
+*メモリ効率*: データ 1 箇所——共有 GPU メモリ。CPU と複数 GPU コンテキスト間重複なし。
+
+=== 欠点
+
+*複雑性*: Vulkan 外部メモリ、プラットフォーム handle、ML import API の理解必要。別コンテキストより significantly 複雑。
+
+*プラットフォーム固有コード*: handle 型と機構が OS ごとに異なる。Linux/Windows/macOS 向け条件コンパイルまたはランタイム検出。
+
+*限定的ライブラリサポート*: 全 ML ライブラリが外部メモリ import 非対応。ONNX Runtime OpenCL/DirectML は対応、CPU のみは不可。TFLite GPU デリゲートはプラットフォームで varies。
+
+*デバッグ困難*: 共有メモリ問題は GPU 上データ inspect 困難。
+
+*同期複雑性*: セマフォ/フェンス調整。ミスは race、破損、デッドロック。
+
+=== いつこのパターンを使うか
+
+共有リソースが意味を持つとき:
+
+*性能クリティカル*: 60+ FPS 毎フレーム推論、各 ms 重要。複雑さは性能 gain に worth。
+
+*大データ*: 1080p/4K image や大量データで CPU 転送 overhead significant。
+
+*密結合*: ML がコアレンダリングパイプラインの一部——リアルタイムスタイル転送、AI レンダリング、ニューラルデノイズ。
+
+*制御プラットフォーム*: 特定 OS（Windows DirectML、Linux OpenCL）向け thorough 検証可能。
+
+*本番最適化*: 別コンテキストでプロトタイプ、正しさ検証後、本番性能向け最適化。
+
+== パターン 3: インターリーブ実行
+
+最も advanced は Vulkan レンダリングと ML 推論を単一コマンドストリームに interleave。別コンテキストではなく ML ライブラリが内部 Vulkan 使用、同一コマンドバッファにレンダリングと推論コマンド混在。
+
+=== 仕組み
+
+WebGPU 実行プロバイダサポートが必要。歴史的には稀——多くは内部 CUDA/DirectML/TensorRT。モダンフレームワークは WebGPU（内部 Vulkan または DirectML）サポート増加、 tightest 統合可能:
+
+1. ML ライブラリが推論操作を Vulkan コンピュートパイプラインとして作成
+2. 同一 Vulkan コマンドバッファにレンダリングと推論記録
+3. 単一キューへ submit
+4. パイプラインバリアでレンダリングと推論段階間同期
+
+データフロー:
+
+1. レンダリングコマンド記録（vkCmdDraw など）
+2. レンダリ完了保証のパイプラインバリア
+3. ML 推論コマンド記録（ML 操作実装 compute shader の vkCmdDispatch）
+4. 推論完了保証のバリア
+5. 推論結果使用コマンド（アップスケール image 合成など）
+6. コマンドバッファ submit
+
+1 コンテキスト、1 コマンドバッファ、1 submit。
+
+=== 実装概念
+
+クロスベンダ API サポートに heavily 依存。概念的:
+
+[source,cpp]
+----
+// コマンドバッファ開始
+commandBuffer.begin(beginInfo);
+
+// シーンレンダリ
+commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *renderPipeline);
+commandBuffer.draw(...);
+
+// バリア: レンダリング → 推論
+vk::ImageMemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+    .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .image = *renderedImage
+    // ... 他バリアフィールド
+};
+
+commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {}, {}, {}, barrier);
+
+// ML 推論（ライブラリが compute dispatch 記録）
+mlRuntime->recordInferenceCommands(commandBuffer, renderedImage, outputImage);
+
+// バリア: 推論 → 次段階
+// ... 別バリア
+
+// 推論結果を使用
+commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *compositePipeline);
+commandBuffer.draw(...);
+
+// 終了して submit
+commandBuffer.end();
+queue.submit(submitInfo, *fence);
+----
+
+鍵: ML ライブラリが独自 submit ではなくコマンドバッファへ操作記録 API を公開。
+
+=== 利点
+
+*最適性能*: コンテキスト切替なし、別 submit なし、クロスコンテキスト同期 overhead なし。単一最適化コマンドストリーム。
+
+* fine-grained 同期*: パイプラインバリアで precise 同期。独立操作 overlap、必要箇所のみ同期。
+
+*統一メモリ管理*: すべて Vulkan メモリ。外部メモリ、プラットフォーム handle、import/export 複雑性なし。
+
+*デバッグ*: RenderDoc、Nsight がフレーム全体（ML 推論含む）capture。1 タイムラインでレンダリングと推論。
+
+=== 欠点
+
+*限定的ライブラリサポート*: 改善中だが全操作で equal サポートではない。多くは CUDA/DirectML を peak 性能優先。強 Vulkan/WebGPU サポートか独自エンジン（本チュートリアル後章）が必要。
+
+*柔軟性制限*: ML 推論 Vulkan ロック。OpenCL、TensorRT 等へ容易切替不可。
+
+*複雑性*: ライブラリサポートあっても unified コマンドバッファ管理は Vulkan 同期、メモリバリア、パイプライン段階の深い理解必要。
+
+*移植性懸念*: Vulkan コンピュートサポートはデバイスで varies。モバイル GPU は compute 能力限定的。フォールバック必要かも。
+
+=== いつこのパターンを使うか
+
+インターリーブが意味を持つとき:
+
+*カスタム推論エンジン*: Vulkan コンピュートシェーダで独自 ML 推論エンジン構築（本シリーズが教える）。推論操作実装と記録を完全制御。
+
+*最大性能*: 絶対最小レイテンシと最大スループット。別コンテキストや shared でも overhead 不可。
+
+*Vulkan ファースト*: アプリ全体 Vulkan 中心。physics、パーティクル、ポストプロセスに既に Vulkan コンピュート、ML 推論追加が natural。
+
+*制御ハードウェア*: Vulkan compute 性能 well-understood な特定ハードウェア。
+
+*学習と実験*: 最低レベル ML 推論理解。Vulkan ベース推論エンジン構築で ML 操作→GPU コンピュート写像を正確に学ぶ。
+
+== 適切なパターンの選択
+
+どう決めるか。要因:
+
+=== 性能要件
+
+*大データで 60+ FPS*: 共有リソースまたはインターリーブ。別コンテキストはフレーム予算 miss likely。
+
+*30 FPS 以下*: 別コンテキストで probably 十分。
+
+*低頻度推論*: 別コンテキスト。秒 1 回以下なら性能 irrelevant。
+
+=== 開発リソース
+
+*小チーム、タイト締切*: 別コンテキスト。迅速に動かし必要なら後で最適化。
+
+*経験チーム、最適化時間*: 共有リソース。経験者なら複雑性 manageable。
+
+*学習プロジェクト*: カスタム推論エンジンでインターリーブ。最大学習、significant 時間投資。
+
+=== プラットフォーム
+
+*単一（Windows のみ）*: 1 OS 外部メモリ実装のみで shared が easier。
+
+*複数*: 別コンテキストでプラットフォーム固有回避。または各 OS 条件コンパイルで shared 投資。
+
+*モバイル*: まず別コンテキスト。モバイル GPU/ドライバの外部メモリサポート variability 大。
+
+=== ML ライブラリ
+
+*ONNX Runtime + WebGPU*: shared well サポート。
+
+*TFLite*: 別コンテキスト simpler。shared メモリ GPU デリゲート varies。
+
+*PyTorch Mobile*: 別コンテキスト。shared 限定的。
+
+*カスタム Vulkan エンジン*: インターリーブ natural。
+
+=== 反復戦略
+
+一般的: パターンを反復:
+
+1. *別コンテキストでプロトタイプ*: 迅速統合、正しさ検証、モデルテスト、ハイパーパラメータ調整。
+2. *プロファイルと計測*: 性能許容か。フレームレート達成ならここで停止。
+3. *shared へ最適化*: 不足なら shared メモリ実装、改善計測。
+4. *カスタムエンジン検討*: shared でも不足、またはライブラリにない機能ならカスタム Vulkan 推論エンジン。
+
+ premature 過最適化しない。シンプルに始め計測、必要箇所のみ最適化。
+
+== まとめ
+
+3 統合パターンが Vulkan レンダリングと ML 推論を橋渡し:
+
+*別コンテキスト*: シンプル、移植性、デバッグ容易。CPU メモリ仲介。プロトタイプ、低頻度推論、シンプルさ優先に best。
+
+*共有リソース*: GPU メモリ共有で CPU 往復排除。複雑、プラットフォーム固有、大データ/高頻度で significantly 高速。性能クリティカル、制御プラットフォーム向け。
+
+*インターリーブ実行*: レンダリングと推論混在 unified コマンドストリーム。最適性能だがライブラリサポートまたはカスタム実装必要。カスタム Vulkan 推論エンジン、最大性能向け。
+
+性能要件、開発リソース、プラットフォーム、ML ライブラリ能力で選択。シンプルに始め計測、必要箇所最適化。
+
+パターン理解後、次章は GPU リソース共有の技術詳細——Vulkan と ML ライブラリ間 shared メモリと同期の実装。
+
+xref:ML_Inference/Third_Party_Libraries/05_directml.adoc[前へ: DirectML] | xref:ML_Inference/Third_Party_Libraries/07_gpu_resource_sharing.adoc[次へ: GPU リソース共有]

@@ -1,0 +1,184 @@
+= 本番向け clspv: OpenCL C を Vulkan SPIR-V へ
+
+Vulkan エンジン向けに `clspv` で OpenCL カーネルをコンパイルするとき、OpenCL を Vulkan 内に
+ラップしたり、実行時に互換レイヤを動かしたりしているのではありません。SPIR-V を
+*共有中間言語*——Vulkan がすべてのシェーダに消費するのと同じバイナリ形式——として使い、
+`clspv` はその形式への OpenCL C からの変換器です。
+
+この区別が重要なのは、SPIR-V に 2 つの異なる方言があるからです。OpenCL エコシステムは
+独自の SPIR-V 能力セット（実行モデル、ストレージクラス、組み込み変数、拡張命令）を定義し、
+Vulkan も同様です。中央で重なりますが、どちら側も他方の厳密な部分集合ではありません。
+
+== 同じ形式の 2 つの方言
+
+image::images/spirv_dialects_venn.svg[SPIR-V Dialects Venn Diagram — OpenCL and Vulkan overlap in a shared common region,780]
+
+`clspv` がターゲットするのは *Vulkan 方言* です——OpenCL の `Kernel` 実行モデルではなく、
+`StorageBuffer` と `Workgroup` ストレージクラス付きの `GLCompute` 実行モデルを出力します。
+生成された SPIR-V は有効な Vulkan シェーダコードであり、GLSL や HLSL で書くコンピュートシェーダと
+同様に `vkCreateShaderModule` でロードできます。
+
+これが AOT パスがそもそも動く理由です。Vulkan ドライバレベルでの特別扱いはありません。
+ドライバは通常のコンピュートシェーダを見て、それが OpenCL C から来たことを知りません。
+
+== きれいにコンパイルされるもの
+
+OpenCL C の核心は Vulkan コンピュートシェーダへ直接マップされます。
+
+* **バッファ引数**（`__global` ポインタ）→ `StorageBuffer` ディスクリプタ。
+  引数 *n* → `set=0, binding=n`。予測可能、決定的、`--descriptormap` で検査可能。
+* **共有メモリ**（固定サイズ `__local`）→ `Workgroup` ストレージクラス配列——
+  GLSL の `shared` 変数が住むのと同じメモリ。
+* **NDRange 組み込み**（`get_global_id`、`get_local_id`、`get_group_id`、
+  `get_global_size`）→ `gl_GlobalInvocationID`、`gl_LocalInvocationID`、
+  `gl_WorkGroupID` など。
+* **数学組み込み**（`sin`、`cos`、`sqrt`、`fma`、`clamp`、`mix`、`dot`、`cross`、
+  `native_sqrt`、…）→ `GLSL.std.450` 拡張命令。マッピングはほぼ 1 対 1。
+* **グローバルバッファ上の整数アトミック**（`atomic_add`、`atomic_cmpxchg` など）→
+  `OpAtomicIAdd`、`OpAtomicCompareExchange`。
+* **バリア**（`barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)`）→
+  適切なスコープ付きの `OpControlBarrier`。
+* **サブグループ演算**（`cl_khr_sub_groups` 経由）→ GLSL サブグループ拡張が出力する
+  同じ `OpGroupNonUniform*` 命令。
+
+== 翻訳を生き延びないもの
+
+一部の OpenCL C 機能は Vulkan SPIR-V 方言に存在しないか、普遍的に利用できない
+Vulkan ハードウェア機能を必要とします。
+
+=== printf なし
+
+Vulkan コンピュートシェーダ内の `printf` には標準化された仕組みがありません。`clspv` は
+サポートしません。慣用的な代替はデバッグ出力ストレージバッファです。診断値を
+`__global uint*`（または構造化バッファ）へ書き、カーネル完了後にホストでリードバックします。
+
+=== 限定的な double / float64
+
+`double` と `double` 型の組み込みは `shaderFloat64` Vulkan デバイス機能を必要とし、
+多くのモバイル・統合 GPU にはありません。`clspv` はデフォルトで double サポートを無効にします。
+`double` を使うカーネルは次が必要です。
+
+. `clspv` に `-DCMAKE_DOUBLE_SUPPORT=ON`（または同等）を渡し、
+. デバイス選択時に `VkPhysicalDeviceFeatures::shaderFloat64 == VK_TRUE` を検証する。
+
+移植性のため、カーネルは `float` で書き、デバイス機能を検証済みのデスクトップ専用
+デプロイにだけ `double` を予約してください。
+
+=== パイプとデバイス側エンキュー
+
+`read_pipe`、`write_pipe`、`enqueue_kernel` は Vulkan に相当のない OpenCL 2.0 機能です。
+`clspv` は OpenCL 1.2 セマンティクス（`-cl-std=CL1.2`）をターゲットとし、これらの構文は
+コンパイルしません。
+
+=== バッファからの動的ループ境界
+
+これは `clspv` AOT パスを使うときの最も重要な本番落とし穴の一つです。`clspv` の
+構造化制御フローパスは、有効な構造化 SPIR-V を生成するためにすべてのループが終了することを
+証明できなければなりません。ループ境界が実行時にストレージバッファからロードされると、
+パスはその証明ができず、結果のシェーダは典型的に GPU をハングさせます。
+
+これは OpenCL 仕様ではなく、`clspv` 固有の制限です。適合ネイティブ OpenCL ドライバ
+（NVIDIA、AMD ROCm）は構造化制御フローを要求しないため、動的境界を問題なくコンパイルします。
+カーネルはそれらのプラットフォームで動き、`clspv` AOT コンパイル経由でのみ静かに GPU ハングを生みます。
+
+`clspv` AOT パスの規則: **ループ境界はコンパイル時定数でなければならない。**
+`#define`、`constexpr`、または SPIR-V 特殊化定数を使い——ディスクリプタから読んだ値は決して使わない。
+
+[WARNING]
+====
+この失敗モードはコンパイルエラーやバリデーションレイヤメッセージではなく、**静かな GPU ハング**を
+生みます。ネイティブ OpenCL ドライバで動いたカーネルが `clspv` AOT パスでハングする場合、
+動的ループ境界が最初に確認すべきことです。
+====
+
+=== 可変長配列なし
+
+可変長配列は https://registry.khronos.org/OpenCL/specs/unified/html/OpenCL_C.html#_footnotedef_31[OpenCL C でサポートされていません]——これは仕様の制限であり、`clspv` の制限ではありません。
+`__local` 配列サイズはコンパイル時に固定でなければなりません。実際には、カーネル引数として
+渡したくなるようなローカル配列次元には `#define` または特殊化定数を使うことを意味します。
+
+=== OpenCL C から到達できない Vulkan 専用能力
+
+ベン図の右側——レイトレーシング、メッシュシェーダ、可変レートシェーディング、コオペラティブ行列、
+フラグメント演算——は OpenCL C からは一切アクセスできません。それらの能力が必要なカーネルは
+GLSL/HLSL/SLANG で書き、Vulkan 対応コンパイラでコンパイルしなければなりません。clspv AOT パスは
+コンピュート専用ワークロードに正しい選択であり、フル Vulkan シェーダエコシステムへの道ではありません。
+
+== 本番での引数マッピング
+
+決定的なディスクリプタレイアウトは `clspv` の最も有用な本番特性です。
+すべての `__global` バッファ引数 *n* は `set=0, binding=n` のストレージバッファへマップされ、
+スカラー（POD）引数は予測可能なバインディングのユニフォームバッファにまとめられます。
+記憶に頼らず、常にマップを生成してコミットしてください。
+
+[source,bash]
+----
+clspv -cl-std=CL1.2 --inline-entry-points \
+      --descriptormap=forest.map \
+      forest.cl -o forest.spv
+----
+
+`.map` ファイルはカーネルインターフェースの権威ある仕様です。`.cl` ソースと一緒に
+バージョン管理へ入れ、マップと `VkDescriptorSetLayout` のずれをビルドエラーとして扱ってください。
+
+=== POD 引数とプッシュ定数
+
+デフォルトでは `clspv` はスカラー引数（例: `float scale, int steps`）をユニフォームバッファへ入れます。
+プッシュ定数——より低いレイテンシ、ディスクリプタ更新なし——を好む場合は `--pod-pushconstant` を渡します。
+
+[source,bash]
+----
+clspv --pod-pushconstant -cl-std=CL1.2 --descriptormap=kernel.map kernel.cl -o kernel.spv
+----
+
+`.map` ファイルはバインディングの代わりに `pushconstant` オフセットを示し、
+`VkPipelineLayout` は一致する `VkPushConstantRange` を宣言しなければなりません。どちらのやり方も
+正しいです。一つを選び、ホストコードが追えるようマップをコミットしてください。
+
+== 特殊化定数
+
+ディスパッチごとに固定だが再コンパイルなしで変更可能であるべき値（ワークグループタイルサイズ、
+アルゴリズム変種、機能トグル）が必要なとき、`clspv` は `clspv_builtin` 属性経由で
+SPIR-V 特殊化定数をサポートします。エンジンが実行時に変える値には `#define` より好ましく、
+シェーダの視点では依然コンパイル時定数であるため動的境界問題も避けられます。
+
+[source,c]
+----
+int __attribute__((annotate("clspv,spec_constant,0,0"))) kMaxSteps;
+----
+
+`spec_constant` の後の 2 つの整数は、生成 SPIR-V における特殊化定数のディスクリプタセットと
+バインディングです。パイプライン作成時に `VkSpecializationInfo` 経由で値を設定し、
+シェーダ再コンパイルは不要です。
+
+== 必要な Vulkan デバイス機能
+
+`clspv` が生成する SPIR-V は内部でポインタ演算を使い、デフォルトでは有効でない
+2 つの Vulkan 1.1 機能を必要とします。
+
+[source,cpp]
+----
+vk::PhysicalDeviceVulkan11Features vk11{
+    .variablePointersStorageBuffer = true,
+    .variablePointers               = true};
+----
+
+これをデバイス機能チェーンに追加してください。欠落した機能はバリデーションが即座に検出します。
+本章の `compute_common.h` は全サンプルで両方を有効にしています。
+
+== 本番チェックリスト
+
+`clspv` AOT パス経由でカーネルを出荷する前に:
+
+[%checklist]
+- [ ] すべてのループ境界がコンパイル時定数（`#define`、特殊化定数）。
+- [ ] `printf` なし — デバッグ出力バッファで置換済み。
+- [ ] `double` 使用を監査済み。存在する場合は `shaderFloat64` を検証済み。
+- [ ] `--descriptormap` を生成・コミット済み。ホストレイアウトが正確に一致。
+- [ ] デバイス機能チェーンに `variablePointers` + `variablePointersStorageBuffer`。
+- [ ] `VkPipelineShaderStageCreateInfo::pName` のエントリポイント名が OpenCL カーネル名と一致し、
+      **`"main"` ではない**。
+- [ ] ワークグループサイズが `reqd_work_group_size` で固定され、ホスト側のディスパッチ切り上げと一致。
+- [ ] CI で `spirv-val forest.spv` により SPIR-V を検証済み。
+
+xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/06_a_practical_sample.adoc[前へ: 実践サンプル] | xref:Advanced_Vulkan_Compute/06_Advanced_Data_Structures/01_introduction.adoc[次へ: 高度なデータ構造]

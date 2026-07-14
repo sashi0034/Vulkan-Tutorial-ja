@@ -1,0 +1,239 @@
+:pp: {plus}{plus}
+
+= ツール: Vulkan プロジェクト用の CI/CD
+
+== Vulkan の継続的な統合と展開
+
+継続的インテグレーション (CI) と継続的デプロイメント (CD) は、最新のソフトウェア開発において不可欠な実践です。これらは、コードの品質を確保し、問題を早期に発見し、リリース プロセスを合理化するのに役立ちます。多くの場合、異なる GPU アーキテクチャを備えた複数のプラットフォームで実行する必要がある Vulkan アプリケーションの場合、堅牢な CI/CD パイプラインは特に価値があります。
+
+=== CI/CD パイプラインのセットアップ
+
+Vulkan プロジェクト専用に調整された CI/CD パイプラインをセットアップする方法を見てみましょう。サンプル プラットフォームとして GitHub Actions を使用しますが、その概念は GitLab CI、Jenkins、Azure DevOps などの他の CI/CD システムにも当てはまります。
+
+==== 基本的なパイプライン構造
+
+Vulkan プロジェクトの一般的な CI/CD パイプラインには、次の段階が含まれる場合があります。
+
+1. *ビルド*: 複数のプラットフォーム (Windows、Linux、macOS) でアプリケーションをコンパイルします。
+2. *テスト*: 単体テストと統合テストを実行します。
+3. *パッケージ*: プラットフォームごとに配布可能なパッケージを作成します
+4. *デプロイ*: ステージング環境にデプロイするか、ユーザーにリリースします。
+
+Vulkan プロジェクトの基本的な GitHub Actions ワークフロー ファイルは次のとおりです。
+
+[source,yaml]
+----
+name: Vulkan CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Debug, Release]
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Install Vulkan SDK
+      uses: humbletim/install-vulkan-sdk@v1.1.1
+      with:
+        version: latest
+        cache: true
+
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{matrix.build_type}}
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      run: ctest -C ${{matrix.build_type}}
+
+    - name: Package
+      if: matrix.build_type == 'Release'
+      run: |
+        # Platform-specific packaging commands
+        if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
+          # Linux packaging (e.g., .deb or .AppImage)
+          echo "Packaging for Linux"
+        elif [ "${{ matrix.os }}" == "windows-latest" ]; then
+          # Windows packaging (e.g., .exe installer)
+          echo "Packaging for Windows"
+        elif [ "${{ matrix.os }}" == "macos-latest" ]; then
+          # macOS packaging (e.g., .app bundle or .dmg)
+          echo "Packaging for macOS"
+        fi
+----
+
+==== Vulkan 固有の考慮事項
+
+Vulkan プロジェクトの CI/CD を設定するときは、次の具体的な課題を考慮してください。
+
+===== Vulkan SDK のインストール
+
+CI 環境に Vulkan SDK がインストールされていることを確認してください。多くの CI プラットフォームには、デフォルトではこれが含まれていません。上の例では、GitHub アクションを使用して SDK をインストールしました。
+
+===== CI 環境での GPU の可用性
+
+ほとんどの CI 環境には利用可能な GPU がないため、Vulkan アプリケーションのテストが困難になる可能性があります。次のアプローチを検討してください。
+
+* 基本的なテストにはソフトウェア レンダリング (SwiftShader など) を使用します。
+* ディスプレイを必要としないヘッドレステストモードを実装する
+* より包括的なテストにはクラウドベースの GPU インスタンスを使用します
+
+===== プラットフォーム固有の Vulkan ローダー
+
+プラットフォームが異なれば、Vulkan のロードの処理方法も異なります。ビルド システムがこれらの違いを正しく処理していることを確認してください。
+
+* Windows: Vulkan-1.dll は通常、実行時にロードされます。
+* Linux: libvulkan.so.1 は実行時にロードされます
+* macOS: MoltenVK は Metal 経由で Vulkan サポートを提供します
+
+===== シェーダーのコンパイル
+
+シェーダーのコンパイルは、ビルド プロセスの複雑な部分になる場合があります。次のアプローチを検討してください。
+
+* ビルド段階でシェーダーをプリコンパイルする
+* GLSL/SPIR-V エラーを早期に検出するために、CI パイプラインにシェーダー コンパイルを含めます。
+* クロスプラットフォームの違いを処理するシェーダー管理システムを使用する
+
+=== Vulkan アプリケーションのテストの自動化
+
+Vulkan アプリケーションのテストには独特の課題が伴います。考慮すべきいくつかのアプローチを次に示します。
+
+==== Vulkan コードの単体テスト
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+// A testable function using vk::raii
+bool create_pipeline(vk::raii::Device& device,
+                     vk::raii::RenderPass& render_pass,
+                     vk::raii::PipelineLayout& layout,
+                     vk::raii::Pipeline& out_pipeline) {
+    try {
+        // Pipeline creation code using RAII
+        return true;
+    } catch (vk::SystemError& err) {
+        std::cerr << "Failed to create pipeline: " << err.what() << std::endl;
+        return false;
+    }
+}
+
+// In a test file
+TEST_CASE("Pipeline creation") {
+    // Setup test environment with mock or real Vulkan objects
+    vk::raii::Context context;
+    auto instance = create_test_instance(context);
+    auto device = create_test_device(instance);
+    auto render_pass = create_test_render_pass(device);
+    auto layout = create_test_pipeline_layout(device);
+
+    vk::raii::Pipeline pipeline{nullptr};
+    REQUIRE(create_pipeline(device, render_pass, layout, pipeline));
+    REQUIRE(pipeline);
+}
+----
+
+==== 統合テスト
+
+統合テストの場合は、CI 環境で実行できるヘッドレス レンダリング モードの作成を検討してください。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+class HeadlessRenderer {
+public:
+    HeadlessRenderer() {
+        // Initialize Vulkan without surface
+        init_vulkan();
+    }
+
+    bool render_frame() {
+        // Render to an image without presenting
+        try {
+            // Rendering code
+            return true;
+        } catch (vk::SystemError& err) {
+            std::cerr << "Render failed: " << err.what() << std::endl;
+            return false;
+        }
+    }
+
+    // Compare rendered image with reference
+    bool verify_output(const std::string& reference_image) {
+        // Image comparison code
+        return true;
+    }
+
+private:
+    void init_vulkan() {
+        // Vulkan initialization code
+    }
+
+    vk::raii::Context context;
+    vk::raii::Instance instance{nullptr};
+    vk::raii::PhysicalDevice physical_device{nullptr};
+    vk::raii::Device device{nullptr};
+    // Other Vulkan objects
+};
+
+// In a test file
+TEST_CASE("Render output matches reference") {
+    HeadlessRenderer renderer;
+    REQUIRE(renderer.render_frame());
+    REQUIRE(renderer.verify_output("reference_image.png"));
+}
+----
+
+=== 配布に関する考慮事項
+
+アプリケーションがすべてのテストに合格すると、最終段階はパッケージ化と配布です。以下に考慮事項をいくつか示します。
+
+==== Vulkan アプリケーションのパッケージ化
+
+* 各プラットフォームに適切な Vulkan ローダーを含める
+* パッケージ シェーダ ファイルまたはプリコンパイル済み SPIR-V
+* プラットフォーム固有のパッケージ化ツールの使用を検討してください。
+  ** Windows: NSIS、WiX、または MSIX
+  ** Linux: AppImage、Flatpak、または .deb/.rpm パッケージ
+  ** macOS: DMG または App Store パッケージ
+
+==== Vulkan の依存関係の処理
+
+パッケージにすべての依存関係が含まれているか、正しく処理されていることを確認してください。
+
+* Vulkan ローダー (またはそのインストール手順)
+* 必要な Vulkan 拡張機能
+* GPUドライバーの要件
+
+==== バージョン管理とアップデート
+
+以下を含むバージョン管理システムを実装します。
+
+* アプリケーションのバージョン
+* 最低限必要な Vulkan バージョン
+* 必要な拡張機能とそのバージョン
+
+=== 結論
+
+Vulkan アプリケーションを開発する際の品質と生産性を維持するには、適切に設計された CI/CD パイプラインが不可欠です。構築、テスト、パッケージ化を自動化することで、手動プロセスではなく機能の開発に集中できるようになります。
+
+次のセクションでは、強力な VK_KHR_debug_utils 拡張機能や RenderDoc などの外部ツールなど、Vulkan アプリケーションのデバッグ ツールについて説明します。
+
+xref:Building_a_Simple_Engine/Tooling/01_introduction.adoc[前へ: はじめに] | xref:Building_a_Simple_Engine/Tooling/03_debugging_and_renderdoc.adoc[次へ: VK_KHR_debug_utils と RenderDoc を使用したデバッグ]

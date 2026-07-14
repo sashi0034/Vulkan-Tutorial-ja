@@ -1,0 +1,37 @@
+= Forward+ レンダリング（このサンプル）
+
+Forward+ は、すでに知っているフォワードシェーディングモデルを保ちつつ、ピクセルごとのライトループを、そのピクセルに影響し得るライトだけに制限します。画面をタイル（必要なら Z スライスも）に分け、コンピュートパスでタイルごとのライトリストを構築します。
+
+== やっていること
+
+* Depth pre-pass（オプション）: コンピュート段階が Z でより効果的にカリングできるようデプスを埋める。
+* コンピュートパス: ライトをタイル（とスライス）に割り当て、コンパクトなリストを SSBO へ書く。
+* メイン PBR パス: 各ピクセルでタイルヘッダを取り、そのライトだけを反復する。
+
+== コードの参照先
+
+* バッファ、フレームごとの状態、ディスクリプタバインディング:
+** `renderer_compute.cpp` と `renderer_resources.cpp`（`ForwardPlusPerFrame` データを探す）
+* コンピュートディスパッチとフレームごとのパラメータ:
+** `renderer_rendering.cpp`
+* シェーダー側のライトリスト消費:
+** `shaders/pbr.slang`（Forward+ のライトループ）
+
+== ヒント
+
+* タイルサイズを調整する; 1080p では 16×16 が妥当なデフォルト。
+* デプスを pre-pass した場合、続く不透明カラーパスでは `depthWriteEnable=false` と `depthCompare=equal` を使う。
+
+== 今後のアイデア
+
+コンパクトなサンプルを超えて進めたい場合:
+
+* 2D タイルから clustered Forward+（デプススライスおよび／または対数 Z）へアップグレードする。
+* 開発ビルドフラグの裏に、小さなライト「予算」UI とデバッグ可視化（タイルヒートマップ）を追加する。
+* シャドウ（まず単一のディレクショナルライトのシャドウマップから）を追加し、シャドウ付きライトのインデックスを含むようタイルデータを拡張する。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Forward_ForwardPlus_Deferred.adoc[Forward+ deferred レンダリング]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Rendering_Pipeline_Overview.adoc[レンダリングパイプライン概要]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_2_Frame_Pacing.adoc[フレームペーシング]

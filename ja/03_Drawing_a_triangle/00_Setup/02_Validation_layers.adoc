@@ -1,0 +1,357 @@
+:pp: {plus}{plus}
+
+= バリデーションレイヤ
+
+== バリデーションレイヤとは？
+
+Vulkan API はドライバオーバーヘッドを最小限にするという考えに基づいて設計されており、その現れの 1 つが、デフォルトでは API 内のエラーチェックが非常に限られていることです。列挙値を誤った値に設定する、必須パラメータにヌルポインタを渡すといった単純なミスでさえ、c{pp} の型チェックを超えた明示的な扱いは一般にされず、クラッシュや未定義動作につながるだけです。
+Vulkan では行っていることをすべて非常に明示的に指定する必要があるため、新しい GPU 機能を使っているのに論理デバイス作成時に要求し忘れるなど、小さなミスをたくさん起こしやすいです。
+
+とはいえ、これらのチェックを API に追加できないわけではありません。Vulkan には *バリデーションレイヤ* と呼ばれる洗練された仕組みがあります。バリデーションレイヤは、Vulkan 関数呼び出しにフックして追加の操作を適用するオプションのコンポーネントです。バリデーションレイヤでよくある操作は次のとおりです。
+
+* 仕様に照らしてパラメータ値を検査し、誤用を検出する
+* オブジェクトの作成と破棄を追跡し、リソースリークを見つける
+* 呼び出し元のスレッドを追跡してスレッド安全性を検査する
+* すべての呼び出しとそのパラメータを標準出力にログする
+* プロファイリングと再生のために Vulkan 呼び出しをトレースする
+
+診断用バリデーションレイヤ内の関数実装がどうなり得るかの例です。
+
+[,c++]
+----
+VkResult vkCreateInstance(
+    const VkInstanceCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator,
+    VkInstance* instance) {
+
+    if (pCreateInfo == nullptr || instance == nullptr) {
+        log("Null pointer passed to required parameter!");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    return real_vkCreateInstance(pCreateInfo, pAllocator, instance);
+}
+----
+
+これらのバリデーションレイヤは自由に積み重ねて、関心のあるデバッグ機能をすべて含められます。デバッグビルドではバリデーションレイヤを有効にし、リリースビルドでは完全に無効にできるので、両方の利点を得られます。
+
+Vulkan 自体にバリデーションレイヤは組み込まれていませんが、LunarG Vulkan SDK はよくあるエラーを検査する便利なレイヤ一式を提供しています。また完全に https://github.com/KhronosGroup/Vulkan-ValidationLayers[オープンソース] なので、どのようなミスを検査しているか確認したり貢献したりできます。未定義動作に偶然依存して別ドライバでアプリケーションが壊れるのを避ける最良の方法が、バリデーションレイヤの利用です。
+
+バリデーションレイヤはシステムにインストールされている場合にのみ使えます。たとえば LunarG のバリデーションレイヤは、Vulkan SDK がインストールされた PC でのみ利用可能です。
+
+ほかのレイヤも存在し、それらを使うことも推奨します。ほかのレイヤを発見して試すのは読者への課題とします。ただし、より新しい形で Vulkan を使うための助けと提案については BestPractices を見ることをおすすめします。
+
+かつては Vulkan にインスタンス用とデバイス固有の 2 種類のバリデーションレイヤがありました。インスタンスレイヤはインスタンスなどのグローバルな Vulkan オブジェクトに関する呼び出しだけを検査し、デバイス固有レイヤは特定の GPU に関する呼び出しだけを検査する、という考え方でした。デバイス固有レイヤは現在非推奨となっており、インスタンスのバリデーションレイヤがすべての Vulkan 呼び出しに適用されます。
+
+== バリデーションレイヤの利用
+
+この節では、Vulkan SDK が提供する標準の診断レイヤを有効にする方法を見ます。拡張と同様、バリデーションレイヤも名前を指定して有効化する必要があります。有用な標準バリデーションはすべて、SDK に含まれる `VK_LAYER_KHRONOS_validation` というレイヤにまとめられています。
+
+まず、有効にするレイヤと、有効にするかどうかを指定する 2 つの設定変数をプログラムに追加します。プログラムがデバッグモードでコンパイルされているかどうかに基づいてその値を決めています。`NDEBUG` マクロは c{pp} 標準の一部で、「not debug（デバッグではない）」を意味します。
+
+[,c++]
+----
+constexpr uint32_t WIDTH = 800;
+constexpr uint32_t HEIGHT = 600;
+
+const std::vector<char const*> validationLayers = {
+    "VK_LAYER_KHRONOS_validation"
+};
+
+#ifdef NDEBUG
+constexpr bool enableValidationLayers = false;
+#else
+constexpr bool enableValidationLayers = true;
+#endif
+----
+
+要求したレイヤがすべて利用可能かを確認します。要求レイヤを走査し、必要なレイヤがすべて Vulkan 実装でサポートされていることを検証する必要があります。このチェックは `createInstance` 関数内で直接行います。
+
+[,c++]
+----
+void createInstance()
+{
+    ...
+
+    // Get the required layers
+    std::vector<char const*> requiredLayers;
+    if (enableValidationLayers)
+    {
+        requiredLayers.assign(validationLayers.begin(), validationLayers.end());
+    }
+
+    // Check if the required layers are supported by the Vulkan implementation.
+    auto layerProperties = context.enumerateInstanceLayerProperties();
+    auto unsupportedLayerIt = std::ranges::find_if(requiredLayers,
+		                                               [&layerProperties](auto const &requiredLayer) {
+			                                               return std::ranges::none_of(layerProperties,
+                                                                [requiredLayer](auto const &layerProperty) { return strcmp(layerProperty.layerName, requiredLayer) == 0; });
+		                                               });
+    if (unsupportedLayerIt != requiredLayers.end())
+    {
+        throw std::runtime_error("Required layer not supported: " + std::string(*unsupportedLayerIt));
+    }
+
+    ...
+}
+----
+
+== 拡張の利用
+
+前述のとおり、拡張も名前で有効化する必要があります。ただしここでは、インスタンス拡張とデバイス拡張を区別しなければなりません。
+
+まず、必要なインスタンス拡張のリストを返す getRequiredInstanceExtensions 関数を作成します。
+
+[,c++]
+----
+std::vector<const char*> getRequiredInstanceExtensions()
+{
+    uint32_t glfwExtensionCount = 0;
+    auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
+
+    std::vector extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+
+    return extensions;
+}
+----
+
+ウィンドウ処理に GLFW 依存を使っているため、GLFW が指定する拡張は常に必要です。
+
+必要な拡張がすべて利用可能かを確認します。まず `vk::raii::Context::enumerateInstanceLayerProperties` 関数でサポートされているすべてのインスタンス拡張のリストを取得し、必要なレイヤがそのリストに含まれているかを確認します。このチェックも `createInstance` 関数内で直接行います。
+
+[,c++]
+----
+void createInstance()
+{
+    ...
+
+    // Get the required extensions.
+    auto requiredExtensions = getRequiredInstanceExtensions();
+
+    // Check if the required extensions are supported by the Vulkan implementation.
+    auto extensionProperties = context.enumerateInstanceExtensionProperties();
+    auto unsupportedLayerIt = std::ranges::find_if(requiredLayers,
+                                                   [&layerProperties](auto const &requiredLayer) {
+                                                       return std::ranges::none_of(layerProperties,
+                                                                                   [requiredLayer](auto const &layerProperty) { return strcmp(layerProperty.layerName, requiredLayer) == 0; });
+                             });
+    if (unsupportedPropertyIt != requiredExtensions.end())
+    {
+        throw std::runtime_error("Required extension not supported: " + std::string(*unsupportedPropertyIt));
+    }
+
+    ...
+}
+----
+
+デバッグモードでプログラムを実行し、エラーが起きないことを確認してください。起きる場合は FAQ を参照してください。
+
+最後に、`vk::InstanceCreateInfo` 構造体のインスタンス化を修正し、バリデーションレイヤ名と拡張名を含めます。
+
+[,c++]
+----
+void createInstance()
+{
+    ...
+
+    vk::InstanceCreateInfo createInfo{.pApplicationInfo        = &appInfo,
+                                      .enabledLayerCount       = static_cast<uint32_t>(requiredLayers.size()),
+                                      .ppEnabledLayerNames     = requiredLayers.data(),
+                                      .enabledExtensionCount   = static_cast<uint32_t>(requiredExtensions.size()),
+                                      .ppEnabledExtensionNames = requiredExtensions.data()};
+    instance = vk::raii::Instance(context, createInfo);
+}
+----
+
+チェックが成功すれば、`vk::raii::Instance` コンストラクタは `vk::Result::eErrorLayerNotPresent` エラーを投げることはないはずですが、念のためプログラムを実行して確認してください。
+
+== メッセージコールバック
+
+バリデーションレイヤはデフォルトでデバッグメッセージを標準出力に出力しますが、プログラム内で明示的なコールバックを提供して自分で扱うこともできます。すべてのメッセージが必ずしも（致命的な）エラーではないため、どの種類のメッセージを見たいかも決められます。今すぐやりたくない場合は、本章の最後の節まで飛ばしても構いません。
+
+メッセージと関連する詳細を扱うコールバックをプログラムに設定するには、`VK_EXT_debug_utils` 拡張を使ってコールバック付きのデバッグメッセンジャーを設定します。
+
+まず、バリデーションレイヤが有効かどうかにもとづいて `getRequiredInstanceExtensions` 関数を拡張します。
+
+[,c++]
+----
+std::vector<const char*> getRequiredInstanceExtensions()
+{
+    uint32_t glfwExtensionCount = 0;
+    auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
+
+    std::vector extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+    if (enableValidationLayers)
+    {
+        extensions.push_back(vk::EXTDebugUtilsExtensionName);
+    }
+
+    return extensions;
+}
+----
+
+デバッグメッセンジャー拡張は条件付きで追加されます。ここではリテラル文字列 "VK_EXT_debug_utils" と等しい `vk::EXTDebugUtilsExtensionName` マクロを使っています。このマクロを使うとタイプミスを避けられます。
+
+ではデバッグコールバック関数がどう見えるか見てみましょう。`PFN_vkDebugUtilsMessengerCallbackEXT` プロトタイプを持つ新しい静的メンバ関数 `debugCallback` を追加します。`VKAPI_ATTR` と `VKAPI_CALL` により、Vulkan が呼び出せる正しいシグネチャになります。
+
+[,c++]
+----
+static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSeverityFlagBitsEXT       severity,
+                                                      vk::DebugUtilsMessageTypeFlagsEXT              type,
+                                                      const vk::DebugUtilsMessengerCallbackDataEXT * pCallbackData,
+                                                      void *                                         pUserData)
+{
+  std::cerr << "validation layer: type " << to_string(type) << " msg: " << pCallbackData->pMessage << std::endl;
+
+  return vk::False;
+}
+----
+
+最初のパラメータはメッセージの重大度を指定し、次のいずれかのフラグです。
+
+* `vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose`: ローダ、レイヤ、ドライバなどの Vulkan コンポーネントからの診断メッセージ
+* `vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo`   : リソースの作成などの情報メッセージ
+* `vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning`: 必ずしもエラーではないが、アプリケーションのバグである可能性が非常に高い挙動についてのメッセージ
+* `vk::DebugUtilsMessageSeverityFlagBitsEXT::eError`  : 無効でクラッシュを引き起こし得る挙動についてのメッセージ
+
+この列挙の値は、ある重大度レベル以上かどうかを比較演算で確認できるようになっています。例:
+
+[,c++]
+----
+if (messageSeverity >= vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning) {
+    // Message is important enough to show
+}
+----
+
+`messageType` パラメータは次の値を取り得ます。
+
+* `vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral`    : 仕様やパフォーマンスとは無関係な何らかのイベントが起きた
+* `vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation` : 仕様違反や起こり得るミスを示す何かが起きた
+* `vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance`: Vulkan の潜在的に非最適な使い方
+
+`pCallbackData` パラメータは、メッセージ自体の詳細を含む `vk::DebugUtilsMessengerCallbackDataEXT` 構造体を指し、最も重要なメンバは次のとおりです。
+
+* `pMessage`   : ヌル終端文字列としてのデバッグメッセージ
+* `pObjects`   : メッセージに関連する Vulkan オブジェクトハンドルの配列
+* `objectCount`: 配列内のオブジェクト数
+
+最後に、`pUserData` パラメータはコールバック設定時に指定したポインタを含み、独自のデータを渡せます。
+
+コールバックは、バリデーションレイヤメッセージを引き起こした Vulkan 呼び出しを中止すべきかどうかを示すブール値を返します。コールバックが true を返すと、呼び出しは `vk::Result::eErrorValidationFailedEXT` エラーで中止されます。これは通常バリデーションレイヤ自体のテストにのみ使われるので、常に `vk::False` を返すべきです。
+
+あとはコールバック関数を Vulkan に伝えるだけです。そのようなコールバックは *デバッグメッセンジャー* の一部であり、好きなだけ持てます。`instance` のすぐ下にこのハンドル用のクラスメンバを追加します。
+
+[,c++]
+----
+vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
+----
+
+次に、`createInstance` の直後に `initVulkan` から呼ばれる関数 `setupDebugMessenger` を追加します。
+
+[,c++]
+----
+void initVulkan()
+{
+    createInstance();
+    setupDebugMessenger();
+}
+
+void setupDebugMessenger()
+{
+    if (!enableValidationLayers) return;
+
+}
+----
+
+メッセンジャーとそのコールバックに関する詳細を構造体に埋める必要があります。
+
+[,c++]
+----
+void setupDebugMessenger()
+{
+    ...
+    vk::DebugUtilsMessageSeverityFlagsEXT severityFlags(vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                                                        vk::DebugUtilsMessageSeverityFlagBitsEXT::eError);
+    vk::DebugUtilsMessageTypeFlagsEXT     messageTypeFlags(
+            vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral | vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance | vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation);
+    vk::DebugUtilsMessengerCreateInfoEXT debugUtilsMessengerCreateInfoEXT{.messageSeverity = severityFlags,
+                                                                          .messageType     = messageTypeFlags,
+                                                                          .pfnUserCallback = &debugCallback};
+    debugMessenger = instance.createDebugUtilsMessengerEXT( debugUtilsMessengerCreateInfoEXT );
+}
+----
+
+`messageSeverity` フィールドでは、コールバックを呼び出してほしい重大度の種類をすべて指定できます。アプリケーションの問題を示唆し、修正が必要かもしれないメッセージだけに関心があるので、`eWarning` と `eError` フラグを要求します。
+
+同様に、`messageType` フィールドではコールバックに通知するメッセージの種類をフィルタできます。ここでは単純にすべての種類を有効にしています。役に立たないものがあればいつでも無効にできます。
+
+最後に、`pfnUserCallback` フィールドはコールバック関数へのポインタを指定します。オプションで `pUserData` フィールドにポインタを渡すと、コールバック関数の `pUserData` パラメータ経由で渡されます。たとえば `HelloTriangleApplication` クラスへのポインタを渡すといった使い方ができます。
+
+バリデーションレイヤのメッセージとデバッグコールバックの設定方法はほかにもたくさんありますが、本チュートリアルを始めるにはこれで十分な設定です。可能なことについては https://docs.vulkan.org/spec/latest/chapters/debugging.html#VK_EXT_debug_utils[拡張の仕様] を参照してください。
+
+完成した `createInstance` 関数は次のようになります。
+
+[,c++]
+----
+void createInstance()
+{
+    constexpr vk::ApplicationInfo appInfo{ .pApplicationName   = "Hello Triangle",
+                .applicationVersion = VK_MAKE_VERSION( 1, 0, 0 ),
+                .pEngineName        = "No Engine",
+                .engineVersion      = VK_MAKE_VERSION( 1, 0, 0 ),
+                .apiVersion         = vk::ApiVersion14 };
+
+    // Get the required layers
+    std::vector<char const*> requiredLayers;
+    if (enableValidationLayers)
+        {
+            requiredLayers.assign(validationLayers.begin(), validationLayers.end());
+        }
+
+    // Check if the required layers are supported by the Vulkan implementation.
+    auto layerProperties = context.enumerateInstanceLayerProperties();
+    auto unsupportedLayerIt = std::ranges::find_if(requiredLayers,
+                                                   [&layerProperties](auto const &requiredLayer) {
+                                                       return std::ranges::none_of(layerProperties,
+                                                                                   [requiredLayer](auto const &layerProperty) { return strcmp(layerProperty.layerName, requiredLayer) == 0; });
+                                                   });
+    if (unsupportedLayerIt != requiredLayers.end())
+    {
+        throw std::runtime_error("Required layer not supported: " + std::string(*unsupportedLayerIt));
+    }
+
+    // Get the required extensions.
+    auto requiredExtensions = getRequiredInstanceExtensions();
+
+    // Check if the required extensions are supported by the Vulkan implementation.
+    auto extensionProperties = context.enumerateInstanceExtensionProperties();
+		auto unsupportedPropertyIt =
+		    std::ranges::find_if(requiredExtensions,
+		                         [&extensionProperties](auto const &requiredExtension) {
+			                         return std::ranges::none_of(extensionProperties,
+			                                                     [requiredExtension](auto const &extensionProperty) { return strcmp(extensionProperty.extensionName, requiredExtension) == 0; });
+		                         });
+		if (unsupportedPropertyIt != requiredExtensions.end())
+		{
+			throw std::runtime_error("Required extension not supported: " + std::string(*unsupportedPropertyIt));
+		}
+
+    vk::InstanceCreateInfo createInfo{
+        .pApplicationInfo        = &appInfo,
+        .enabledLayerCount       = static_cast<uint32_t>(requiredLayers.size()),
+        .ppEnabledLayerNames     = requiredLayers.data(),
+        .enabledExtensionCount   = static_cast<uint32_t>(requiredExtensions.size()),
+        .ppEnabledExtensionNames = requiredExtensions.data() };
+    instance = vk::raii::Instance(context, createInfo);
+}
+----
+
+== 設定
+
+バリデーションレイヤの挙動には、`vk::DebugUtilsMessengerCreateInfoEXT` 構造体で指定するフラグ以外にも多くの設定があります。Vulkan SDK の `Config` ディレクトリに移動してください。そこにレイヤの設定方法を説明する `vk_layer_settings.txt` ファイルがあります。
+
+自分のアプリケーション向けにレイヤ設定をするには、プロジェクトの `Debug` と `Release` ディレクトリにファイルをコピーし、指示に従って望ましい挙動を設定します。ただし本チュートリアルの残りでは、デフォルト設定を使っているものとします。
+
+このチュートリアル全体を通して、バリデーションレイヤがどれほど役に立つか、そして Vulkan で何をしているかを正確に知ることがどれほど重要かを教えるために、意図的なミスをいくつか作ります。それでは xref:./03_Physical_devices_and_queue_families.adoc[システム内の Vulkan デバイス] を見ていきましょう。
+
+link:/attachments/02_validation_layers.cpp[C{pp} code]

@@ -1,0 +1,936 @@
+:pp: {plus}{plus}
+:stem: latexmath
+
+= レイトレーシング最適化: デノイジングと適応サンプリング
+
+レイトレーシングはグラフィックスの「聖杯」ですが、計算コストが高い技術です。現代の Vulkan レイトレーシング拡張（`VK_KHR_ray_tracing_pipeline`）があっても、リアルタイムでノイズのない十分なサンプル数のシーンをレンダリングするのは、現行のハードウェアでは多くの場合不可能です。
+
+1 ピクセルあたり 1〜2 本のレイしか発射しなければ「塩胡椒」ノイズになります。クリーンな画像には 1000 本以上のレイ/ピクセルが必要で、1 フレームに秒から分単位の時間がかかります。本章では ML でそのギャップを埋め、ノイズの多い 1 サンプル/ピクセル（1spp）のレンダー結果を、AI で本番品質の画像に変換します。
+
+単に「ごまかす」だけではありません。確率の法則とニューラルネットワークを使って、ハードウェアに計算する時間がない物理現象を知的に再構成します。本章の終わりには、1 本のレイを 1000 本のレイのように機能させるパイプラインの構築方法が理解できます。
+
+== ノイズの物理学: レイトレーシングが難しい理由
+
+AI が必要な理由を理解するには、まずレイトレーシングがなぜこれほどノイズが多いのかを知る必要があります。
+
+従来のラスタライザでは三角形を描き、3D 座標を 2D スクリーン空間へ投影し、頂点属性を補間してフラグメントシェーダを実行します——決定的な数学で各ピクセルの色が決まります。結果は「シャープ」になりますが、光の微妙な相互作用——反射、ソフトシャドウ、グローバルイルミネーション——はしばしば欠けてしまいます。
+
+レイトレーシングでは決定的な投影から**モンテカルロ積分**へ移ります。**レンダリング方程式**という複雑な積分を解こうとするのです。
+
+=== レンダリング方程式: 手早い解説
+
+レンダリング方程式はグラフィックスの数学的な核心です。ある点から出る光は、その点自身が発する光と、周囲の環境からその点に当たり目に向かって反射する光の和になります。
+
+[latexmath]
+++++
+L_o(p, \omega_o) = L_e(p, \omega_o) + \int_{\Omega} f_r(p, \omega_i, \omega_o) L_i(p, \omega_i) (\omega_i \cdot n) d\omega_i
+++++
+
+数学を怖がらないでください。人間向けに訳すとこうなります。
+
+*   **latexmath:[L_o]**: 点 latexmath:[p] から目（latexmath:[\omega_o]）へ出ていく光。
+*   **latexmath:[L_e]**: 表面自身が発する光（ネオンサインなど）。
+*   **積分（latexmath:[\int]）**: ここが難しい部分です。光が来る可能性のあるすべての方向（latexmath:[\Omega]）を確認します。
+*   **latexmath:[f_r]**: 材質の特性（BRDF）。光沢があるか、マットか。
+*   **latexmath:[L_i]**: その方向から*入ってくる*光。
+*   **latexmath:[(\omega_i \cdot n)]**: 光の入射角を補正する係数。
+
+完璧な世界であれば、すべての光子を調べてこの積分を解けます。しかしコンピュータでは**モンテカルロサンプリング**を使います。ランダムな方向をいくつか選んで色を確認し、その平均を取るのです。
+
+=== ディスコボール問題: 分散を可視化する
+
+暗い部屋にあるスポットライト付きディスコボールの平均色を知ろうとする状況を考えてみましょう。
+
+1. 1 本のレイをボールに向けて発射します。
+2. 小さな鏡の一片に当たります。
+3. その鏡がスポットライトを反射していれば、ピクセルは**真っ白（明るさ 10,000.0）**になります。
+4. 暗い壁を反射していれば**真っ黒（0.0）**になります。
+
+1 サンプル/ピクセル（1spp）では、白と黒の点が混在した雑然とした状態になります。これが**分散（Variance）**です。数学的には平均からの二乗差の平均を意味します。グラフィックスの世界では、これは推測の数学的な「誤差」であり——レンダー結果を台無しにする「塩胡椒」ノイズです。
+
+グラフィックスにおけるノイズは、文字通り推測の数学的誤差です。レイの数（サンプル数）を増やすとノイズは**大数の法則**に従って減っていきますが、その減り方は遅く、誤差はサンプル数の平方根（latexmath:[1/\sqrt{N}]）に反比例して減少します。ノイズを半分にするには 4 倍のレイが、10 分の 1 に減らすには 100 倍のレイが必要になります。
+
+=== 従来のフィルタが失敗する理由
+
+ガウシアンやバイリニアといった単純なブラーは、近傍ピクセルの平均を取ることで問題を解決しようとします。しかしブラーは「何も考えない」演算です——「ノイズ」と「シャープなエッジ」の区別ができません。
+
+黒から白へ切り替わるシャープなエッジ（影の境界など）をブラーすると、灰色のにじんだ跡になります。ノイズは取り除けましたが、ジオメトリも一緒に破壊してしまいます。
+
+AI を使う理由はここにあります。ニューラルネットワークはノイズの*パターン*を認識し、ジオメトリの*パターン*から分離するように学習できます。「曲面上の明るい点」はランダムなアーティファクトではなく、鏡面ハイライトである可能性が高い、という文脈を「読み取る」ことができるのです。
+
+1 フレームに 1000 本のレイを待たずにこれを解決する 3 段階の AI パイプラインを紹介します。
+
+1. **デノイジング**: 数百万件の高品質な例から学習し、ノイズの多い 1spp のフレームから欠落した詳細を再構成します。
+2. **適応サンプリング**: 2 つ目の小さな AI が「難しい」（高分散）ピクセルを*レンダリング前*に予測し、より多くのレイが必要な場所を特定します。
+3. **時間的安定性**: モーションベクトルと AI を使って複数フレームを時間方向にブレンドし、「ゴースト」アーティファクトを取り除きます。
+
+== 技法 1: AI デノイジング（U-Net）
+
+AI デノイジングは**再構成**のタスクです。ピクセルを平滑化するだけでなく、ノイズのあるパッチを見て、学習中に見た数百万の例に基づいてクリーンな版を「推測して補完」します。
+
+=== 語彙: テンソルとチャンネル
+
+アーキテクチャの説明に入る前に、共通の言葉を確認しましょう。ML では「画像」というより**テンソル**と呼びます。
+
+テンソルは多次元配列です。Vulkan のスワップチェーンにある標準的な色ピクセルは 3 つの**チャンネル**を持ちます。赤、緑、青（RGB）です。これは 3 枚の別々の「シート」が積み重なったデータと考えられます。
+
+AI を強化したグラフィックスでは、この概念を拡張します。**深度**用に 1 枚のシート、**サーフェスノーマル**（X, Y, Z）用に 3 枚のシートを積めば、7 チャンネルのテンソルになります。AI はこれらの追加チャンネルを「ヒント」や「補助バッファ」として扱います。これらはレイの最初のヒット（G-Buffer）から得られるためノイズフリーです——AI がノイズの多いライティングの上に再構築するための、安定した「骨格」を提供します。
+
+=== アーキテクチャ: U-Net が詳細を捉える方法
+
+再構成タスクの業界標準は **U-Net** です。もともと医用画像（ノイズの多い X 線から腫瘍を検出するなど）向けに考案されましたが、ノイズの多いレンダー結果から「クリーンなピクセル」を見つけ出すのにも最適です。
+
+U-Net は画像の**スケールの問題**に対応するために設計されています。
+
+.AI デノイジングアーキテクチャ（U-Net）
+image::images/ML_Inference/Desktop_Applications/rt_denoising_diagram.svg[U-Net diagram showing Encoder, Decoder, and Skip Connections, 800]
+
+「U」字型の 3 つの部分を詳しく見ていきます。
+
+==== 1. エンコーダ: 圧縮と文脈理解
+「U」の前半はダウンサンプリング段階の連続です。各段は**二重畳み込み**の後に**マックスプーリング**を行います。
+
+===== 3x3 畳み込みの数学
+`nn.Conv2d(3, 32, 3)` の内部では実際に何が起きているのでしょうか。
+
+3×3 の重みグリッド（**カーネル**）を想像してください。カーネルが画像上をスライドするとき、現在カバーしているピクセルの「重み付き合計」を計算します。
+
+[source,cpp]
+----
+// Conceptual Convolution in C++
+float kernel[3][3] = {
+    {-1, -1, -1},
+    {-1,  8, -1},
+    {-1, -1, -1}
+}; // This is a simple edge-detection kernel
+
+float output_pixel = 0;
+for(int i = -1; i <= 1; i++) {
+    for(int j = -1; j <= 1; j++) {
+        output_pixel += input_image[y+i][x+j] * kernel[i+1][j+1];
+    }
+}
+----
+
+平坦な領域（同じ色のピクセル）では出力はゼロになります。エッジであれば高い数値になります。デノイザーでは 1 個のカーネルだけでなく**1 層あたり 32 個または 64 個のカーネル**を使います。水平エッジ、firefly ノイズ、テクスチャの勾配などをそれぞれ学習するのです。
+
+===== なぜ二重畳み込みなのか
+2 つの 3×3 フィルタを連続して適用します。第 1 層は「原始的な」特徴（エッジ）を捉えます。第 2 層は第 1 層の出力を見て「複雑な」特徴（曲線、コーナー、ノイズのクラスタ）を捉えます。大きなフィルタ（7×7 など）を使わずに**実効受容野**を拡大できます。
+
+===== マックスプーリング（2x2）: スケールの切り替え
+畳み込みの後、解像度を半分にします。
+
+*   **仕組み**: 2×2 ブロックごとに最大値だけを残します。
+*   **直感的な理由**: 1080p で 3×3 の畳み込みが見られるのはごく小さな 3 ピクセルの領域だけです。文脈が分かりません。白いピクセルが「firefly」（明るいノイズのアーティファクト）なのか、小さな電球なのか区別できません。
+*   1/2、1/4、1/8 に縮小していくと、同じ 3×3 のカーネルが元画像のはるかに大きな部分を見ることになります。最も低い解像度では、3×3 が元画像の 64×64 相当に対応します。これが**グローバルな文脈**です——ノイズの多いピクセルのクラスタが、実は建物の大きな滑らかな影の一部だと分かるのです。
+
+==== 2. ボトルネック: 潜在表現
+「U」の底では、ネットワークは非常に低い解像度になりますが、高い意味的理解を持ちます。画像を「ボトルネック」に押し込め、最も重要な情報だけを保持します。この段階では AI はもう「ピクセル」ではなく「特徴」を見ています。
+
+*   「中央に金属の球体がある。」
+*   「主光源は天井のエリアライトだ。」
+*   「背景は柔らかい間接光を反射するマットな壁だ。」
+
+==== 3. デコーダ: 再構成と精緻化
+「U」の後半は**転置畳み込み**を使って元の 1080p へアップサンプリングします。
+
+*   **転置畳み込み**: プーリングの逆操作です。小さな画像を大きく「引き伸ばし」、学習済みの重みで新しいピクセルの埋め方を決定します。
+
+==== 4. スキップ接続: 幾何のシャープネスを保つ
+U-Net で最も重要な部分です。デコーダが画像を成長させる際に、「U」を横切ってエンコーダの対応する層から高解像度の特徴を取り込みます。
+
+*   **問題**: エンコーダで縮小する際に、エッジの正確な位置を失ってしまいました。「球体がある」ことは分かりますが、ピクセル単位の輪郭はプーリングによって失われています。
+*   **解決策**: スキップ接続は「カンニングペーパー」のような役割を果たします。縮小前の初期層にあったシャープな幾何エッジの情報を、最終的な再構成層へ直接供給します。
+*   **高レベルの理解**（ボトルネック）と**ピクセル単位の詳細**（エンコーダ）を組み合わせます。これが U-Net のデノイザーが、平坦なノイズ領域を平滑化しながらもエッジのシャープさを保てる理由です。
+
+[source,python]
+----
+import torch
+import torch.nn as nn
+
+class DenoisingUNet(nn.Module):
+    def __init__(self, in_channels=10):
+        super().__init__()
+        # Input: Noisy RGB (3) + Albedo (3) + Normals (3) + Depth (1) = 10 channels
+
+        # Encoder Stage 1 (Full Res -> Half Res)
+        # We start with 10 channels and expand to 32 internal 'feature' channels
+        self.enc1 = self.double_conv(in_channels, 32)
+        self.pool1 = nn.MaxPool2d(2)
+
+        # Encoder Stage 2 (Half Res -> Quarter Res)
+        self.enc2 = self.double_conv(32, 64)
+        self.pool2 = nn.MaxPool2d(2)
+
+        # Bottleneck (Quarter Res)
+        # This is where the AI understands the 'meaning' of the noise
+        self.bottleneck = self.double_conv(64, 128)
+
+        # Decoder Stage 2 (Quarter -> Half)
+        # We use a Transpose Convolution to upsample
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        # We concatenate the upsampled data (64) with the skip connection (64)
+        self.dec2 = self.double_conv(128, 64)
+
+        # Decoder Stage 1 (Half -> Full)
+        self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec1 = self.double_conv(64, 32) # 32 (up) + 32 (skip)
+
+        # Final Layer: Map the 32 feature channels back to 3-channel RGB
+        self.final = nn.Conv2d(32, 3, kernel_size=1)
+
+    def double_conv(self, in_c, out_c):
+        """A helper that applies two convolutions back-to-back with ReLU"""
+        return nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(out_c, out_c, 3, padding=1), nn.ReLU()
+        )
+
+    def forward(self, x):
+        # Encoder Path
+        # We save 's1' and 's2' to use as Skip Connections later
+        s1 = self.enc1(x)
+        p1 = self.pool1(s1)
+        s2 = self.enc2(p1)
+        p2 = self.pool2(s2)
+
+        # Bottleneck
+        b = self.bottleneck(p2)
+
+        # Decoder Path with Skip Connections (torch.cat)
+        d2 = self.up2(b)
+        # Concatenate along the 'channel' dimension
+        d2 = torch.cat([d2, s2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, s1], dim=1)
+        d1 = self.dec1(d1)
+
+        return self.final(d1)
+----
+
+=== 構造的な支え: G-Buffer の利点
+
+ノイズの多い色画像だけを使うデノイザーは盲目です。物体の終端と背景の境界を推測しなければなりません。しかし Vulkan のレイトレーサーでは推測は不要です。**G-Buffer**（Geometry Buffer）にアクセスできるからです。
+
+G-Buffer はレイの最初のヒットで生成されます。部屋中を反射する光には依存しないため**数学的に完璧**です——ノイズも分散もありません。
+
+*   **ワールドノーマル（3 チャンネル）**: 各表面の正確な向き（XYZ）です。隣接するピクセルで法線が大きく異なれば、それは幾何的なエッジ（コーナー）であると AI は知ることができます。そこで色の漏れを拒否し、従来のブラーにありがちな「にじんだ」見た目を防ぎます。
+*   **アルベド／ベースカラー（3 チャンネル）**: 影やライティングを含まない、生のテクスチャ（木目、石模様）です。AI が「ノイズ」と「テクスチャの詳細」を区別できるようになります。アルベドにパターンがあれば、それを保持します。
+*   **深度（1 チャンネル）**: カメラからの距離です。重なった物体の分離や、シーンのスケールの理解に使います。
+
+10 チャンネル（Noisy RGB + Albedo + Normals + Depth）を U-Net に入力すれば、高解像度の「骨格」を AI に与えることになります。AI の仕事は画像を「発明」することではなく、完全に理解した 3D モデルの上に光を「描く」ことなのです。
+
+=== データレイアウト: Vulkan で NCHW が重要な理由
+
+通常は 3 チャンネル（RGB）を想定しているネットワークに 10 チャンネルをどう入力すればよいでしょうか。**入力テンソルのレイアウト**が性能のボトルネックになり得ます。
+
+多くのグラフィックスプログラマは**インターリーブ**レイアウト（RGBA, RGBA...）に慣れています。ML の世界では **NHWC** が使われます。
+
+*   **N**: バッチサイズ
+*   **H**: 高さ
+*   **W**: 幅
+*   **C**: チャンネル（RGB の値がメモリ上で隣接する）
+
+GPU は**プラナー**な **NCHW** の方がはるかに速く処理できます。
+
+*   NCHW では、まず全ての Red、次に全ての Green、Blue、Normals などを順に格納します。
+*   **なぜでしょうか？** 畳み込みフィルタを実行するとき、同じ「チャンネル」から多数のピクセルを一度に読みたいものです。プラナーレイアウトなら GPU が読み込みを結合でき、1 回のメモリサイクルで 32〜64 ピクセルを取得できます。インターリーブレイアウトでは G/B を読み飛ばして次の R へジャンプすることになり、帯域幅を浪費してしまいます。
+
+Vulkan の前処理コンピュートシェーダで、インターリーブされた G-Buffer を単一のプラナー NCHW バッファへ変換してから ONNX Runtime へ送ります。
+
+=== 安定性: HDR の対数スケーリング問題
+
+Vulkan のレイトレーサーは通常 16 ビットまたは 32 ビットの浮動小数点（HDR）で出力します。太陽光のランプは **50,000.0**、暗い影は **0.0001** といった値になり得ます。
+
+ニューラルネットワークはこれを苦手とします。数学的な基礎(重みの初期化、ReLU など)は 0.0〜1.0 の範囲を前提としています。50,000.0 のような値を入力するのは、耳元で叫ぶようなものです——勾配が「爆発」し、重みが `NaN` になり、学習が不可能になります。
+
+解決策は**対数圧縮**です。AI へ送る前に、コンピュートシェーダで値の範囲を圧縮します。
+
+[source,glsl]
+----
+// Preprocessing Compute Shader
+// Squash HDR range [0, infinity] to a manageable [0, ~12]
+vec3 compressed = log(1.0 + noisyColor.rgb);
+----
+
+AI が「クリーンな」出力を返したら、元の HDR の範囲へ展開します。
+
+[source,glsl]
+----
+// Postprocessing Compute Shader
+// Expand [0, ~12] back to [0, infinity]
+vec3 cleanHDR = exp(aiOutput.rgb) - 1.0;
+----
+
+これにより AI は扱いやすい数値だけを見ることになります——学習がより安定し、多くのレンダーを台無しにする単一の明るいピクセル「firefly」も大幅に減ります。
+
+=== 学習戦略: デノイジングの「教え方」
+
+このネットワークを学習するには「参照用パストレーサー」が必要です。遅くても構わない、高品質なレンダラーの別バージョンです。
+
+1.  **シーンの選定**: Vulkan エンジン内の複雑なシーンを使います——多様な材質（金属、ガラス、木材）、複雑なライティング（点光源、エリアライト）、深い影を含むものです。
+2.  **ノイズの多いレンダー（入力）**: 1spp でレンダリングします。これが AI への入力になります。RGB とすべての G-Buffer（アルベド、ノーマル、深度）を保存します。
+3.  **正解となるレンダー（真値）**: 同じフレームを 4096spp でレンダリングします。1 フレームに数分かかりますが、これが「グラウンドトゥルース」です——1spp が*本来あるべきだった*ノイズフリーの参照結果です。
+4.  **移動と繰り返し**: カメラをわずかに動かしてこれを繰り返します。堅牢なデノイザーを作るには、多様なシーンから 1000〜5000 組のペアが通常必要です。
+
+**損失関数**:
+AI は良い仕事をしたでしょうか。「正解の参照」と**損失関数**で出力を比較します。
+
+**MSE（平均二乗誤差）**だけは使いません。MSE はピクセル間の二乗差の平均です。数学的には単純ですが、グラフィックスには不向きです。シャープなエッジが 1 ピクセルずれただけで MSE は非常に大きくなりますが、人間の目にはほとんど問題になりません。さらに MSE は高周波成分を「平均化」してしまい、ぼやけた「プラスチックのような」見た目になってしまいます。
+
+代わりに、次の要素を加重した組み合わせを使います。
+
+*   **L1 損失（平均絶対誤差）**: 全体的な色の精度に関わります。MSE より頑健で、小さな差を過度に罰しません。
+*   **SSIM（構造的類似性指標）**: 最も重要な指標です。局所的なコントラストと構造的なパターンを見ます。シャープなエッジと細かいテクスチャの保持を AI に強制します。
+*   **LPIPS**: CI 検証の章で学んだように、別のニューラルネットワークを使って人間にとって「似ているか」を判定します。ライティングの「印象」を捉えるのに役立ちます。
+
+業界で一般的なデノイザー学習のレシピは次のとおりです。
+**損失 = 0.8 × SSIM + 0.2 × L1**
+
+== 技法 2: AI 誘導による適応サンプリング
+
+素朴なレンダラーでは、すべてのピクセルに同じ数のレイを使います。しかし実際のシーンでは光は均等には分布していません。白い壁は 1〜2 サンプルで「解決」します（ノイズフリーになります）。複雑なガラスのシャンデリアは 100 サンプルでも「塩胡椒」ノイズが残ります。
+
+**適応サンプリング**とは、計算予算をノイズが「頑固に」残る場所だけに使う技術です。すべてのピクセルに 8 本のレイを使うのではなく、壁には 1 本、シャンデリアには 64 本を使うことを目指します。これにより画像の各部分がほぼ同時に同じ品質へ到達します。
+
+.適応サンプリングワークフロー
+image::images/ML_Inference/Desktop_Applications/adaptive_sampling_diagram.svg[Diagram showing Probe Pass, Heatmap Generation, and Targeted Pass, 800]
+
+=== 分散理論: ノイズはどこに隠れているか
+
+モンテカルロ積分において**分散**はサンプル間の差の尺度です。グラフィックスでは高分散は高ノイズを意味します。
+
+*   **低分散**: 10 本のレイがほぼ同じ明るさを示す場合（薄暗い壁など）→ 平均値に確信を持てます。ピクセルは「解決」しています。
+*   **高分散**: 5 本のレイが黒、5 本が真っ白（シャープな影の境界や小さな光源の近くなど）→ 平均は 0.5 になりますが、これは単なる推測です。11 本目のレイで平均が大きく変わる可能性があります。これが「ノイズ」であり、より多くのサンプルが必要な兆候です。
+
+問題は何でしょうか。従来の分散計算では、まず複数のレイ（4〜8 本）が必要でした——*さらに多く*必要かどうかを判断するためです。これは時間の無駄です。AI は 1spp のプローブから視覚的なパターンを見て分散を**予測**します——常にノイズにつながるパターンです。
+
+=== エラー予測器: 予算管理用の小さな AI
+
+適応サンプラーを駆動する 2 つ目の、極めて軽量な CNN が **Error Predictor**（エラー予測器）です。
+
+デノイザー（画像を修復する重い U-Net）とは異なり、これは「専門家」のような存在です——通常は畳み込み層が 4〜5 個だけで、コストの高いデコーダはありません。唯一の仕事は、ノイズの多い 1spp を見て「ここは難しそうだ」と判断することです。
+
+1.  **入力**: 最初のノイズの多い 1spp レンダー。
+2.  **学習時のターゲット**: 1spp と 4096spp の正解画像との絶対誤差（`abs(1spp - Gold)`）。
+3.  **目標**: 高コントラストな影の境界、金属の鏡面反射、屈折するガラスなどが常に高い誤差を示す「危険」領域であること、壁の滑らかな勾配は「簡単」でレイをあまり必要としないことを AI が学習します。
+
+=== ヒートマップ: レイ予算の管理
+
+小さな AI の出力は**ヒートマップ**です——1 チャンネルのテクスチャ（グレースケール）で、1.0 は「高ノイズを予測」、0.0 は「低ノイズを予測」を意味します。
+
+これを**レイ予算マップ**として使います。AI の予測と Vulkan のレイトレーシングハードウェアをつなぐ橋渡しです。
+
+==== 数学的なスケーリング関数
+ヒートマップの値をそのままレイの数として使うわけではありません。**非線形なスケーリング関数**を使います。
+
+なぜでしょうか。人間の目は明るい部分より影のノイズに敏感だからです。また「レイのスパイク」を防ぐためでもあります——1 つのピクセルが突然 1000 本のレイを要求して GPU 全体を停止させてしまうことを避けます。
+
+[source,glsl]
+----
+// Inside the Ray Generation Shader
+float heat = texture(heatmap, uv).r;
+
+// We use a Power Function to create a steep ramp.
+// Most pixels (heat < 0.2) stay at 1 ray.
+// Difficult pixels (heat > 0.8) scale up rapidly.
+float scaledHeat = pow(heat, 3.0);
+
+int maxExtraRays = 31;
+int extraRays = int(scaledHeat * float(maxExtraRays));
+----
+
+==== Vulkan での統合: マルチパス戦略
+
+Vulkan では、3 つの独立したパスにわたってコマンドバッファを調整します。
+
+**パス 1: プローブパス（1spp）**
+`vkCmdTraceRaysKHR` で正確に 1 本のレイ/ピクセルを発射します。
+*   **入力**: シーンの TLAS、カメラの UBO。
+*   **出力**: `probeColorImage`（1spp のノイズ画像）。
+
+**パス 2: AI による分散予測**
+Error Predictor の ONNX モデルを実行します。
+*   **入力**: `probeColorImage`。
+*   **出力**: `heatmapImage`。
+*   **最適化**: モデルが小さいため、GPU が他のタスクを完了している間に**コンピュートキューでの非同期実行**が可能です。
+
+**パス 3: ターゲットパス（可変 spp）**
+`probeColorImage` と `heatmapImage` の両方を読む、2 つ目のレイ生成シェーダを使います。
+
+[source,glsl]
+----
+// Ray Generation Shader (Targeted Pass)
+void main() {
+    // 1. Fetch the 'Heat' value for this pixel
+    float heat = texture(heatmap, uv).r;
+
+    // 2. Decide the extra ray budget
+    int extraRays = int(pow(heat, 2.0) * 31.0);
+
+    // 3. Retrieve the color from our first (probe) pass
+    vec3 accumulatedColor = texelFetch(probePassBuffer, ivec2(gl_LaunchIDEXT.xy), 0).rgb;
+
+    // 4. Cast the additional rays only where needed
+    for(int i = 0; i < extraRays; i++) {
+        // We use the 'i' as an offset to our Blue Noise texture
+        // to ensure we don't sample the same direction twice.
+        uint seed = initRandom(gl_LaunchIDEXT.xy, frameCount, i);
+        vec3 sample = traceIndirectRay(seed);
+        accumulatedColor += sample;
+    }
+
+    // 5. Compute the final average (Total samples = 1 probe + extraRays)
+    finalOutput = accumulatedColor / (1.0 + float(extraRays));
+}
+----
+
+シャンデリアには 32 本、壁には 1 本のレイで——*どこでも* 32 本を使う場合と同等の視覚品質を、わずかなコストで実現できます。通常は全体のレンダリング時間が **3〜5 倍**速くなります。
+
+=== 高度な適応サンプリング: 確率と Blue Noise
+
+適応サンプリングの真価を発揮させるには、AI の予測を高品質な**サンプリング分布**と組み合わせます。
+
+==== モンテカルロの確率密度関数
+レイ生成シェーダがヒートマップで「熱い」ピクセル（Heat = 1.0）を読み取ったとしても、32 本のレイをランダムな方向へ発射するわけではありません。**確率密度関数（PDF）**を使って光源の方向へ偏らせます。AI のヒートマップは、複雑な相互作用が起きている場所をハードウェアに伝える「二次的な PDF」の役割を果たします。
+
+==== Blue Noise と White Noise
+標準的な乱数（`rand()`）を使うと「かたまり」が生じます——多くのレイが同じ方向に集中し、他の領域は暗いままになります。これは「汚れた」ノイズです。
+
+*   **Blue Noise**: サンプルが可能な限り均等に分布します。
+*   **AI との関係**: AI デノイザーは「White Noise」より「Blue Noise」の方がクリーンにしやすい傾向があります——Blue Noise は U-Net が識別・除去しやすい特定の周波数特性を持っているためです。
+
+**実装のヒント**: 64×64 の Blue Noise テクスチャを Vulkan のレイトレーシングパイプラインに読み込みます。ピクセル座標とサンプルのインデックスでオフセットを取ります。少ないレイ予算(1〜32 本)でも、半球を効率的にカバーできます。
+
+== 技法 3: 時間的安定性（アンチゴースト AI）
+
+AI 誘導のサンプリングを使っても、単一フレームにはまだノイズが残る可能性があります。シネマ品質の滑らかさには**過去のフレーム**の情報が必要です。カメラが静止していれば、直近 60 フレームの平均を取ることで、完璧な 1000 本のレイに相当する結果が得られます。
+
+ゲームでは物が動きます。カメラが回転し、キャラクターが走り、光が揺らぎます。素朴な平均を取ると**ゴースト**が発生します——動いている物体の後ろに「古い」色のぼやけた軌跡が残ってしまうのです。
+
+**時間的リプロジェクション** + **AI 信頼度モデル**でこれを解決します。
+
+=== リプロジェクションの数学: 過去を振り返る
+
+前のフレームを使うには、現在のピクセルが*前のフレームではどこにあったか*を知る必要があります——座標変換の問題です。
+
+==== ピクセルの数学的な旅
+3D の点が Vulkan パイプラインを通過する過程です。
+1.  **ワールド空間**: `(10.0, 5.0, -2.0)` のような座標です。
+2.  **ビュー空間**: **ビュー行列**（カメラの位置と回転）を乗算します。
+3.  **クリップ空間**: **プロジェクション行列**（レンズ）を乗算します。
+4.  **スクリーン空間**: latexmath:[W] で除算し、モニタのピクセルグリッド（1920×1080）へマッピングします。
+
+「過去を振り返る」には、この過程を逆にたどります。現在のピクセルと深度から 3D のワールド座標を求め、**前フレームの行列**で再投影します。
+
+[source,cpp]
+----
+// Reprojection Logic in C++ (Conceptual)
+// This is what you would implement in your Motion Vector shader
+vec4 current_clip_pos = vec4(pixel_x / width * 2 - 1, pixel_y / height * 2 - 1, depth, 1.0);
+vec4 world_pos = inv_current_view_proj * current_clip_pos;
+world_pos /= world_pos.w;
+
+// Now, where was this world position in the previous frame's screen?
+vec4 prev_clip_pos = prev_view_proj * world_pos;
+prev_clip_pos /= prev_clip_pos.w;
+
+vec2 prev_screen_uv = (prev_clip_pos.xy + 1.0) / 2.0;
+vec2 motion_vector = current_uv - prev_screen_uv;
+----
+
+==== キャラクターアニメーションの処理
+カメラは静止していて、キャラクターだけが走っている場合はどうでしょうか。カメラの行列はカメラの移動しか捉えられません。動いている物体には、各オブジェクトの**前フレームのモデル行列**も保存する必要があります。頂点シェーダで「現在」と「過去」の位置をそれぞれ計算し、その差をモーションベクトルとしてフラグメントシェーダへ渡します。
+
+[source,glsl]
+----
+// Motion Vector Calculation in Vertex Shader
+void main() {
+    vec4 currentPos = ubo.viewProj * ubo.model * vec4(inPos, 1.0);
+    vec4 previousPos = ubo.prevViewProj * ubo.prevModel * vec4(inPos, 1.0);
+
+    // Pass these to the fragment shader
+    outCurrentPos = currentPos;
+    outPreviousPos = previousPos;
+    gl_Position = currentPos;
+}
+
+// Fragment Shader
+void main() {
+    vec2 curUV = (outCurrentPos.xy / outCurrentPos.w) * 0.5 + 0.5;
+    vec2 prevUV = (outPreviousPos.xy / outPreviousPos.w) * 0.5 + 0.5;
+    outMotionVector = curUV - prevUV;
+}
+----
+
+モーションベクトルが誤っていると、単純なシーンでも「にじみ」が発生します。**プロのヒント**: モーションベクトルを色として可視化してみてください（X を赤、Y を緑に割り当てます）。物体の移動方向と色が一致しなければ、時間的安定性が破綻している証拠です。
+
+=== シェーダでのベクトルの利用
+
+[source,glsl]
+----
+// In the Temporal Accumulation Shader
+vec2 velocity = texture(motionVectorBuffer, uv).xy;
+vec2 historyUV = uv - velocity;
+
+// Fetch the color we rendered in the previous frame
+vec3 historyColor = texture(previousFrameResult, historyUV).rgb;
+----
+
+数学が完璧で、シーンに変化がなければ、`historyColor` は 1 フレーム前の現在ピクセルの色と一致するはずです。これをブレンドします。`finalColor = mix(historyColor, currentColor, 0.05)`。これが**指数移動平均（EMA）**です。
+
+=== 問題: オクルージョンとライティングの変化
+
+リプロジェクションが失敗する典型的な 2 つのシナリオを紹介します。
+
+1.  **オクルージョン・ディスオクルージョン**: キャラクターが壁の前を歩き、通り過ぎると壁が「露出」します。前のフレームではその位置にキャラクターしかなく、壁は見えていませんでした。過去のデータを使うと、キャラクターの色が壁に「にじんで」しまいます。
+2.  **動的なライティングの変化**: 爆発が起きて現在のフレームが急に明るくなったのに、過去のフレームは暗いままです。ブレンドすると光がゆっくりと立ち上がり、鈍い印象になります。
+
+=== AI 信頼度モデル: 知的なブレンディング
+
+「悪い」履歴データに対処するために、3 つ目の AI である**信頼度予測器（Confidence Predictor）**を使います。現在のフレームとリプロジェクションされた履歴を見て、ピクセルごとに過去のデータをどれだけ信頼すべきかを判断します。
+
+==== 拒否のロジック
+AI は履歴が「古い」か「隠されていた」ことを検出します。具体的な「危険信号」は次のとおりです。
+
+*   **深度の不一致**: 現在の深度と、前フレームから再投影された深度を比較します。大きく異なる場合（例えば 5% 超）は、物体が前後に移動したことを示し、履歴は無効です。
+*   **法線の整合性**: 現在の法線と前フレームの法線の内積を取ります。値が低い場合（例えば 0.9 未満）は、表面が大きく回転して光の向きが変わったことを示します。
+*   **輝度の差**: 再投影された履歴と現在のノイズの多いプローブの明るさ(輝度)を比較します。大きな飛躍は、急なライティングの変化か、ディスオクルージョンを示す幾何的な信号の見落としを意味します。
+
+==== 信頼度モデルの学習
+デノイザーとは学習方法が異なります。ターゲットは「正解」画像ではなく、リプロジェクションが失敗する場所を示す**二値マスク**です。
+1. 4096spp の「正解」画像を 2 フレーム用意します。
+2. 完璧なモーションベクトルを使って 1 枚目を 2 枚目へワープします。
+3. 一致しない箇所が「ディスオクルージョン」や「ライティングの変化」に対応します。
+4. AI はノイズの多い 1spp の入力だけから、その差分マスクを予測するように学習します。
+
+=== 知的なブレンディング: EMA のロジック
+
+AI の出力は **信頼度スコア** で、0.0（履歴を拒否）から 1.0（履歴を維持）の範囲を取ります。これが **EMA** のブレンドを駆動します。
+
+[source,glsl]
+----
+float confidence = predictConfidence(current_buffers, history_buffers);
+
+// 'Alpha' is our blending factor.
+// If confidence is 1.0 (Static), alpha is 0.01 (99% history, 1% new).
+// If confidence is 0.0 (Moving), alpha is 1.0 (0% history, 100% new).
+float alpha = mix(1.0, 0.01, confidence);
+
+// We also cap the accumulation to prevent 'Forever Smearing'
+alpha = max(alpha, 1.0 / float(maxFramesAccumulated));
+
+vec3 finalColor = mix(historyColor, currentNoisyColor, alpha);
+----
+
+AI 主導のこの仕組みにより、静止した領域では**数百本分のレイ**が時間方向に蓄積されます（完璧にクリーンな結果になります)。動きがあった瞬間には新しいデータへ即座に切り替わり——ゴーストを完全に取り除けます。
+
+=== 時間的クランプ: 数学的な安全網
+
+最良の AI でも時には誤ることがあります。数学的な「漏れ」や「無限の軌跡」を防ぐため、プロのレンダラーでは**カラーボックスクランプ**（近傍クリッピング)を使います。
+
+1.  **近傍**: *現在*のフレームにおける、現在のピクセルを囲む 3×3 の領域。
+2.  **統計量**: その 3×3 領域の**最小値**、**最大値**、**平均値**。
+3.  **履歴のクランプ**: `historyColor` が [最小値, 最大値] の範囲外にある場合、その範囲の端に「クリップ」します。
+
+[source,glsl]
+----
+// Simple Color Box Clamping logic
+vec3 minColor = vec3(10000.0);
+vec3 maxColor = vec3(-10000.0);
+
+for(int y = -1; j <= 1; y++) {
+    for(int x = -1; x <= 1; x++) {
+        vec3 neighbor = texelFetch(currentFrame, pos + ivec2(x, y), 0).rgb;
+        minColor = min(minColor, neighbor);
+        maxColor = max(maxColor, neighbor);
+    }
+}
+
+// Ensure history stays within the bounds of current reality
+vec3 clampedHistory = clamp(historyColor, minColor, maxColor);
+----
+
+これにより履歴が現在の実際の状態から大きく逸脱しないことが保証されます——AI の信頼度予測が一時的に混乱しても、ゴースト現象に対する最終的な安全網として機能します。
+
+=== 高度な時間的安定性: 分散補正
+
+カラーボックスクランプはシャープな画像にはよく機能しますが、ノイズの多いレイトレース画像には過度に強すぎます。現在のフレームが非常にノイズが多い場合、「ボックス」が巨大になり、履歴のクランプが効かなくなります。逆にクリーンな場合は、ボックスが小さくなりすぎて履歴を破壊してしまいます。
+
+==== 分散のロジック
+高品質な時間フィルタでは**分散補正**を使います。
+1.  現在のフレームの 3×3 近傍の**平均**（latexmath:[\mu]）と**標準偏差**（latexmath:[\sigma]）を計算します。
+2.  有効な範囲を latexmath:[[\mu - k\sigma, \mu + k\sigma]] とします。latexmath:[k] は通常 1.0〜2.0 です。
+3.  現在のフレームの統計的なノイズを考慮した「あいまいなボックス」になります。
+
+[source,glsl]
+----
+// Variance Rectification Snippet
+vec3 m1 = vec3(0.0); // First moment (Sum)
+vec3 m2 = vec3(0.0); // Second moment (Sum of squares)
+
+for(int i = -1; i <= 1; i++) {
+    for(int j = -1; j <= 1; j++) {
+        vec3 color = texelFetch(current, pos + ivec2(i, j), 0).rgb;
+        m1 += color;
+        m2 += color * color;
+    }
+}
+
+vec3 mean = m1 / 9.0;
+vec3 stddev = sqrt(max(vec3(0.0), (m2 / 9.0) - (mean * mean)));
+
+// Clamp history to Mean +/- 1.5 * StdDev
+vec3 rectifiedHistory = clamp(historyColor, mean - 1.5 * stddev, mean + 1.5 * stddev);
+----
+
+この統計的なアプローチと AI による高レベルの信頼度判断を組み合わせることで、非常に滑らかで、かつシャープさを保った時間フィルタが実現します。
+
+== データ収集と学習: 自前の AI を構築する
+
+これらのモデルを構築するには、数百万件の「ノイズあり」「クリーン」のペアを生成する学習パイプラインが必要です。本チュートリアルの「教育的な経路」の成果がここにあります——Vulkan レンダラーを自分で制御しているからこそ、このプロセスを自動化できるのです。
+
+=== ステップ 1: 「正解生成エンジン」をスクリプト化する
+
+Vulkan アプリに専用の**データセットモード**を追加します。リアルタイム表示ではなく、学習データを生成する「正解生成エンジン」として動作させます。
+
+1.  **ワールドの固定**: 物理演算、パーティクル、時間アニメーションを無効化します。まったく同じ状態を 2 回レンダリングします。
+2.  **入力（ノイズあり）レンダー**:
+    *   1spp でレンダリングします。
+    *   最終的な色バッファをキャプチャします。
+    *   G-Buffer(アルベド、ワールド空間法線、線形深度)をキャプチャします。
+    *   高精度の `.exr` または `.hdr` 形式で保存します。
+3.  **正解（Gold）レンダー**:
+    *   4,096spp（複雑なシーンなら 16,384spp）でレンダリングします。
+    *   完了を待ちます（1 フレームあたり 5〜10 分）。
+    *   これを「グラウンドトゥルース」のターゲットとして保存します。
+4.  **移動と繰り返し**:
+    *   カメラをスプライン軌道で飛ばすか、ランダムにテレポートさせて自動化します。
+    *   ライティングを変化させます——正午、夕暮れ、ろうそくの光のみなど。
+    *   材質を変化させます——金属、ガラス、複雑なテクスチャを追加します。
+
+多様なデータセットだけが「過学習」を防ぎます——開発時のシーンでは完璧に動くのに、新しいレベルでは失敗するという事態を避けられます。
+
+=== ステップ 2: PyTorch での学習
+
+`.exr` ファイルのフォルダが揃ったら、PyTorch でニューラルネットワークを学習します。
+
+**プロのヒント: パッチ学習**
+1080p や 4K の画像全体で学習するのは遅すぎて、メモリも大量に必要です。データローダーはランダムに **256×256 のクロップ**（パッチ）を切り出します。これにより AI が全体のレイアウトを記憶するのではなく、局所的なテクスチャやノイズのパターンを学習することを強制します。
+
+=== ステップ 3: 高度な学習レシピ
+
+「トリプル A」品質のデノイザーを作るには、単純なループを超える工夫が必要です。プロのスタジオが使う秘訣を紹介します。
+
+==== データ拡張: AI を頑健にする
+「完璧」な G-Buffer だけで学習すると脆弱になります。実際のハードウェアでは丸め誤差が生じ、モーションベクトルもわずかにずれます。学習データに手を加えて、より頑健にしましょう。
+
+1.  **ガウシアンノイズの注入**: 「完璧な」アルベドやノーマルにわずかなランダムノイズを加えます。完璧な入力に過度に依存しないように学習させます。
+2.  **カラージッタリング**: 明るさやコントラストをランダムに調整します。暗いダンジョンでも明るい野原でも同様にうまく機能するようにします。
+3.  **回転と反転**: パッチを水平・垂直に反転させます。影のエッジは向きに関わらず影のエッジです。
+
+==== カリキュラム学習: 走る前に這うことを学ぶ
+最初から 1spp で学習を始めるのではありません。AI がノイズに圧倒されてしまう可能性があります。
+*   **ステージ 1**: 16spp（中程度のノイズ）のクリーンな学習から始めます。
+*   **ステージ 2**: 良くなってきたら 4spp に移ります。
+*   **ステージ 3**: 最後に 1spp で学習します。
+この「カリキュラム」により、最も混沌としたデータに触れる前に、光の挙動に関する内部モデルを段階的に構築できます。
+
+==== 損失の重み付け: 「Firefly」へのペナルティ
+レイトレーシングの「firefly」は、隣接ピクセルより latexmath:[1000\times] も明るい単一のピクセルです——光源に直接当たった結果です。標準的な損失関数はこれらを過度に重視してしまい、残りの部分を過剰にぼかす代償を払うことになります。
+*   **解決策**: **頑健な損失関数**（Charbonnier）や勾度クランプを使います——これにより単一の明るいピクセルが学習全体を乗っ取ることを防ぎます。
+
+[source,python]
+----
+# Example of Robust Training Loop snippet
+def train_step(noisy, clean):
+    output = model(noisy)
+
+    # SSIM captures structural edges
+    ssim_loss = 1 - ssim(output, clean)
+
+    # L1 captures color accuracy
+    l1_loss = torch.abs(output - clean).mean()
+
+    # Combined Loss with a bias toward structure
+    total_loss = 0.8 * ssim_loss + 0.2 * l1_loss
+
+    total_loss.backward()
+
+    # Gradient Clamping to prevent Fireflies from ruining weights
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    optimizer.step()
+----
+
+[source,python]
+----
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from my_vulkan_dataset import RayTracingDataset
+
+def train_model():
+    # 1. Initialize our U-Net
+    # Input is 10 channels (RGB, Albedo, Normals, Depth)
+    model = DenoisingUNet(in_channels=10).cuda()
+
+    # 2. Setup optimizer and loss
+    # We use Adam, the industry standard for neural network optimization
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = CombinedLoss() # SSIM + L1
+
+    # 3. Load the data captured from Vulkan
+    dataset = RayTracingDataset("path/to/vulkan_data/")
+    loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+    # 4. The Training Loop
+    for epoch in range(100):
+        for noisy_patch, clean_patch in loader:
+            optimizer.zero_grad()
+
+            # AI tries to clean the noisy patch
+            output = model(noisy_patch.cuda())
+
+            # Compare output to the 'Gold' reference
+            loss = criterion(output, clean_patch.cuda())
+
+            # Update the AI's weights
+            loss.backward()
+            optimizer.step()
+
+        print(f"Epoch {epoch} complete. Loss: {loss.item()}")
+
+    # 5. Export for Vulkan use
+    # We export to ONNX format so we can load it in our C++ application
+    dummy_input = torch.randn(1, 10, 256, 256).cuda()
+    torch.onnx.export(model, dummy_input, "denoiser.onnx")
+
+train_model()
+----
+
+== 実装ロードマップ: 統合ガイド
+
+Vulkan プロジェクトをゼロから実装するなら、具体的な 5 段階のパイプラインを紹介します。GPU の固定機能から AI の学習済み重みへとつながる流れです。
+
+=== ステージ 1: アンカーパス（G-Buffer）
+
+間接光のレイを発射する前に「アンカー」となるデータを用意します。高速なラスタパス、あるいはシンプルな「プライマリレイ」ヒットパスを使います。ノイズフリーであることが必須です。
+
+*   **目標**: アルベド（RGB）、ワールドノーマル（XYZ）、線形深度（Z）、モーションベクトル（XY）を生成します。
+*   **精度が重要**: 法線とモーションベクトルには `VK_FORMAT_R16G16B16A16_SFLOAT` を使います。8 ビットの `UNORM`（`R8G8B8A8`）では精度が不足します——丸め誤差が AI にとって「揺れ」として現れてしまいます。
+*   **モーションベクトル**: 現在のワールド座標を*現在の* VP で投影し、*前フレームの* VP でも投影し、その差が速度になります。
+
+=== ステージ 2: 確率的レイパス
+
+モンテカルロレイトレーシングの本体です。
+
+1.  **誘導サンプリング**:
+    *   手早い 1spp のプローブから小さな **Error Predictor** の ONNX モデルを実行します。
+    *   ヒートマップテクスチャを出力します。
+2.  **ターゲットトレース**:
+    *   `vkCmdTraceRaysKHR` でパイプラインをディスパッチします。
+    *   レイ生成シェーダでヒートマップを読み取ります。
+    *   レイの予算を動的に割り当てます。
+
+[source,glsl]
+----
+// Inside RayGen Shader
+float heat = texture(heatmap, uv).r;
+int samples = (heat > 0.5) ? 32 : 1; // Simplest adaptive logic
+
+for(int i = 0; i < samples; i++) {
+    // Trace and accumulate...
+}
+----
+
+=== ステージ 3: ML 前処理（Vulkan Compute）
+
+AI には特定の形式のデータが必要です。Vulkan コンピュートを使って、インターリーブされたグラフィックス用バッファを単一の ML テンソルへ変換します。
+
+1.  **正規化**: ワールドノーマルを [-1, 1] から [0, 1] へ変換します。
+2.  **対数スケーリング**: ノイズの多い色に `log(1.0 + x)` を適用して HDR の範囲を圧縮します。
+3.  **プラナーパッキング（NCHW）**: データを再編成します。しばしばシェーダの中で最も複雑な部分です。各チャンネルを最終バッファの専用セクションへ書き込みます。
+
+[source,glsl]
+----
+layout(std430, binding = 0) writeonly buffer TensorBuffer { float data[]; } tensor;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    uint pixelIdx = pos.y * width + pos.x;
+    uint planeSize = width * height;
+
+    vec3 color = log(1.0 + texelFetch(noisyImage, pos, 0).rgb);
+
+    // NCHW Planar Layout
+    tensor.data[0 * planeSize + pixelIdx] = color.r;
+    tensor.data[1 * planeSize + pixelIdx] = color.g;
+    tensor.data[2 * planeSize + pixelIdx] = color.b;
+    // ... continue for Albedo, Normals, Depth ...
+}
+----
+
+=== ステージ 4: 推論ステージ（ONNX Runtime）
+
+重い AI モデルを実行します。パイプライン全体の中で最も計算コストの高い段階です。リアルタイムで 60 FPS（16.6ms）を維持するには、GPU メモリの取り扱いを極めて慎重に行う必要があります。
+
+==== 高度な GPU メモリ管理
+
+素朴な実装では G-Buffer を GPU から CPU へダウンロードし、ONNX Runtime へ渡し、結果を GPU へアップロードし直します。**これは避けてください。** PCIe バスは、60 FPS で毎フレーム往復するには遅すぎます。
+
+代わりに**ゼロコピーのメモリ共有**を使います。
+
+1.  **Vulkan 側**:
+    *   前処理の出力バッファを `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT` で確保します。
+    *   `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT`（Windows）または `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`（Linux）を使ってメモリをエクスポート可能にします。
+    *   `vkGetMemoryWin32HandleKHR` または `vkGetMemoryFdKHR` でハンドルを取得します。
+
+2.  **ML 側（ONNX Runtime / TensorRT）**:
+    *   そのハンドルを ML フレームワークへインポートします。
+    *   AI に「入力用メモリを自分で確保せず、このハンドルを使え」と指示します。
+    *   AI は Vulkan のバッファを GPU メモリから直接読み取ります。
+
+3.  **同期（「ハンドシェイク」）**:
+    *   GPU が前処理パスを完了した後にだけ、AI がバッファの読み取りを開始することを保証します。
+    *   Vulkan と ONNX Runtime は同じ GPU 上にあるため——**タイムラインセマフォ**または**タイムラインフェンス**で調整します。
+    *   Vulkan がセマフォを待つ latexmath:[\to] ONNX が signal する latexmath:[\to] ONNX が完了する latexmath:[\to] Vulkan の後処理が開始する signal、という順序になります。
+
+==== モデル精度: FP32 vs FP16
+
+標準的な U-Net は 32 ビット浮動小数点（FP32）です。現代の GPU が備える 16 ビット浮動小数点（FP16）専用のハードウェア（NVIDIA の Tensor Cores など）を使えば、多くの場合 latexmath:[2\times] から latexmath:[4\times] 速くなります。
+
+*   **FP32**: 安全で高精度ですが遅いです。
+*   **FP16**: 高速でメモリも半分になりますが、前述の対数スケーリングを行わないと `NaN` が発生します。
+*   **推奨**: デノイザーと信頼度予測器には FP16 を使いましょう。視覚的な差はほとんど認識できない程度で、性能面では 30 FPS と 60 FPS の差になります。
+
+==== リアルタイムグラフィックス向けのモデル最適化
+
+FP16 でも U-Net は「重い」モデルです。テンポの速いゲームでは、デノイジングパス全体にかけられる時間は 5ms 程度しかありません。これを実現するための**モデル最適化技法**を紹介します。
+
+1.  **レイヤー融合**: ONNX へのエクスポート時にオプティマイザ（`onnx-simplifier` や TensorRT のグラフコンパイラ)でレイヤーを結合します。「畳み込み + ReLU」を単一の GPU カーネルへ融合し、メモリ帯域を節約します。
+2.  **プルーニング**: 最終画像への寄与がほとんどない「不要な」重みを取り除きます。20% を刈り込んだ U-Net は、視覚品質の損失をほぼゼロに保ちながら大幅に速くなります。
+3.  **カーネルの特化**: ハイエンド環境（NVIDIA OptiX）では手書きの Winograd 畳み込みを使います——標準的な ML フレームワークの汎用実装よりもはるかに高速です。
+
+=== ステージ 5: 最終的な蓄積とポストエフェクト
+
+すべてを画面へ統合します。
+
+1.  **逆スケーリング**: コンピュートディスパッチで AI の出力に `exp(x) - 1.0` を適用します。
+2.  **時間的ブレンディング**: AI の信頼度マップとモーションベクトルを使って、現在の結果と前フレームをブレンドします。
+3.  **トーンマッピング**: 標準的なポストプロセッシング——露出（Reinhard、ACES）、カラーグレーディング、ガンマ補正を行います。
+
+== AI と従来型デノイザーの比較: 視覚面のトレードオフ
+
+「**SVGF（Spatiotemporal Variance-Guided Filtering）**のような従来のフィルタがあるのに、なぜ重いニューラルネットワークを使うのか」という疑問が浮かぶかもしれません。
+
+[options="header"]
+|===
+| 特徴 | 従来型（SVGF/ASVGF） | AI（U-Net）
+| **詳細の保持** | 細かいテクスチャをぼかしがちです。 | ノイズとテクスチャの分離に優れています。
+| **エッジのシャープさ** | 手作業で調整した G-Buffer の重みに依存します。 | 「正解」データから自動的に学習されます。
+| **セットアップの手間** | エッジの重みを手作業で何ヶ月も調整します。 | 学習中に自動的に「調整」されます。
+| **性能** | 非常に高速です（2〜5ms）。 | より重いです（10〜20ms）。
+| **汎用性** | 特定の光の種類向けに最適化されています。 | どのようなライティングスタイルにも学習できます。
+|===
+
+**業界の結論**: リアルタイムゲームでは、ハイブリッド構成が最良の選択になることが多いです。単純な直接光のノイズには SVGF を、複雑で「手強い」ノイズ（光沢のある反射、グローバルイルミネーションなど)には専用の AI デノイザーを使うという分担です。
+
+== モデルの取得: 「構造の設計図」
+
+AI の研究者でなくても実験を始められます。以下の Python コードで「空の」モデル（構造の設計図）を生成できます。まだ学習されていませんが、Vulkan の統合コードに必要な、正確な入出力の形状を定義しています。
+
+[source,python]
+----
+import torch
+import torch.nn as nn
+
+# 1. The Denoiser: The U-Net architecture we discussed
+class DenoisingUNet(nn.Module):
+    def __init__(self, in_channels=10, out_channels=3):
+        super().__init__()
+        # 10 channels = Noisy RGB (3) + Albedo (3) + Normals (3) + Depth (1)
+        self.enc1 = self.conv_block(in_channels, 32)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = self.conv_block(32, 64)
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec1 = self.conv_block(64, 32)
+        self.final = nn.Conv2d(32, out_channels, 1)
+
+    def conv_block(self, in_c, out_c):
+        return nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(out_c, out_c, 3, padding=1), nn.ReLU()
+        )
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        d1 = self.up1(self.enc2(self.pool1(e1)))
+        return self.final(self.dec1(torch.cat([d1, e1], dim=1)))
+
+# 2. The Error Predictor: A very lightweight CNN for adaptive sampling
+class ErrorPredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 16, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 1, 1), nn.Sigmoid()
+        )
+    def forward(self, x): return self.net(x)
+
+# 3. The Confidence Predictor: Handles temporal anti-ghosting
+class ConfidencePredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Input: Current RGB, History RGB, Current Depth, Previous Depth
+        self.net = nn.Sequential(
+            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 1, 1), nn.Sigmoid()
+        )
+    def forward(self, x): return self.net(x)
+
+def export_all():
+    torch.onnx.export(DenoisingUNet(), torch.randn(1, 10, 256, 256), "denoiser.onnx")
+    torch.onnx.export(ErrorPredictor(), torch.randn(1, 3, 256, 256), "error_predictor.onnx")
+    torch.onnx.export(ConfidencePredictor(), torch.randn(1, 8, 256, 256), "confidence.onnx")
+    print("Empty ONNX models exported successfully.")
+
+export_all()
+----
+
+== プロフェッショナル向けソリューション: 自作するか既製品を使うか
+
+ゼロから AI グラフィックスパイプラインを自作するのは基盤技術を理解するには最適な方法ですが、大規模な本番プロジェクトでは、しばしば高度に最適化されたベンダー製ソリューションに頼ります。これらは類似した U-Net や時空間アーキテクチャを採用していますが、特定のハードウェア向けに手作業で調整されています。
+
+*   **NVIDIA OptiX Denoiser**: OptiX SDK に同梱されており、NVIDIA GPU における事実上の標準です。専用の A-SVGF と RTX の Tensor Cores 向けに最適化されたディープラーニングデノイザーです。link:https://developer.nvidia.com/optix-denoiser[NVIDIA OptiX]
+*   **Intel® Open Image Denoise (OIDN)**: 高性能なオープンソースのデノイザーで、*任意*の CPU/GPU（NVIDIA、AMD、Intel）で動作します。Blender Cycles などのオフラインレンダリングエンジンで広く使われており、インタラクティブな速度にも近づいています。link:https://www.openimagedenoise.org/[Intel OIDN]
+*   **NVIDIA Real-Time Denoisers (NRD)**: 低レイテンシな時空間デノイジング向けのリアルタイムゲーム向けライブラリです。適応サンプリングと時間的安定性の数学的処理を代わりに行ってくれるため、開発者は創造的なシェーダ作業に集中できます。link:https://developer.nvidia.com/nrd[NVIDIA NRD]
+
+== まとめ: グラフィックスの未来は AI にある
+
+AI を強化したレイトレーシングは**効率**についての話です。ディープラーニングを使って、計算時間のない物理現象を「予測」します。U-Net による再構成、適応的なレイ予算配分、時間的な検証を組み合わせることで、リアルタイムの Vulkan 環境で「映画品質」の映像を提供できます。
+
+三角形をレンダリングするだけの世界から、確率の法則とニューラルネットワークの力でシーンを知的に再構成する世界へ——これが現代のグラフィックスエンジニアリングの最前線です。
+
+=== Vulkan 開発者への要点
+
+1.  **G-Buffer は宝**: 最初のヒットで得られるデータ（アルベド、ノーマル、深度）が最も頼りになる情報源です。AI モデルにとっての「構造的な支え」になります。
+2.  **調整こそが王**: ボトルネックは AI の計算そのものではなく、データの移動です。ゼロコピーのメモリ共有と非同期コンピュートを使って 60 FPS のパイプラインを実現しましょう。
+3.  **統計的な安全性**: AI は常に、カラーボックスクランプや分散補正といった数学的な安全策と組み合わせて使いましょう。AI が「推測」を担い、数学が「保証」を担うという役割分担です。
+
+=== この先の道: ハードウェアの進化
+
+この旅を続けるにあたり、ハードウェアの進化にも注目してください。`VK_NV_ray_tracing_motion_blur` のような新しい拡張機能や、専用の AI コアが、本章で議論した技法をさらに強力にしていくでしょう。「グラフィックスプログラマ」と「ML エンジニア」の境界は曖昧になりつつあり、あなたはその変化の最前線に立っています。
+
+良いレンダリングを。
+
+=== 最後に: 学習の無限ループ
+
+AI デノイザーは決して本当の意味で「完成」しません。エンジンに新しい材質(シャボン玉の薄膜干渉、複雑なボリューメトリックフォグなど)を追加するたびに、新しいデータの収集と再学習が必要になります。
+
+グラフィックスパイプラインを、生きて学び続けるシステムとして扱えば、世界がどれだけ複雑になっても、アプリは常に最良の見た目を保てます。
+
+xref:ML_Inference/Desktop_Applications/06_rl_automated_exploration.adoc[前へ: RL ベース自動探索] | xref:ML_Inference/Desktop_Applications/08_future_directions.adoc[次へ: 将来の方向性]

@@ -1,0 +1,396 @@
+:pp: {plus}{plus}
+
+= モデルの読み込み: モデル読み込みシステムの実装
+:doctype: book
+:sectnums:
+:sectnumlevels: 4
+:toc: left
+:icons: font
+:source-highlighter: highlightjs
+:source-language: c++
+
+== モデル読み込みシステムの実装
+
+=== glTF の知識に基づく構築
+
+xref:15_GLTF_KTX2_Migration.adoc[glTF と KTX2 の移行の章] で学んだように、glTF は、PBR マテリアル、アニメーション、シーン階層などの幅広い機能をサポートする最新の 3D フォーマットです。この章では、これらの機能を活用して、より堅牢なエンジンを構築します。
+
+前の章では glTF モデルのロードの基本について説明しましたが、ここでは、ロードされたデータを適切なシーン グラフに整理し、アニメーション サポートを実装することに焦点を当てます。このアプローチにより、より複雑でダイナミックなシーンを作成できるようになります。
+
+この章では、モデル読み込みの技術的側面を実装するだけでなく、設計の背後にあるアーキテクチャ上の決定と、開発者がアプリケーションでこのシステムを効果的に使用する方法についても説明します。これらの概念を理解することは、保守可能で拡張可能なエンジンを構築するために重要です。
+
+=== エンジンのモデル システムのセットアップ
+
+前の章と同じ tinygltf ライブラリのセットアップから始めます。
+
+[source,cpp]
+----
+// Include tinygltf for model loading
+#include <tiny_gltf.h>
+----
+
+ただし、モデル データを頂点バッファーとインデックス バッファーに直接ロードするだけではなく、シーンを表す適切なデータ クラスを使用して、より構造化されたアプローチを作成します。
+
+=== データ構造の定義
+
+glTF が提供する豊富なデータを処理するには、いくつかのデータ構造を定義する必要があります。
+
+[source,cpp]
+----
+// Vertex structure with position, normal, color, and texture coordinates
+struct Vertex {
+    glm::vec3 pos;
+    glm::vec3 normal;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+    // Binding and attribute descriptions for Vulkan
+    static vk::VertexInputBindingDescription getBindingDescription() {
+        return { 0, sizeof(Vertex), vk::VertexInputRate::eVertex };
+    }
+
+    static std::array<vk::VertexInputAttributeDescription, 4> getAttributeDescriptions() {
+        return {
+            vk::VertexInputAttributeDescription( 0, 0, vk::Format::eR32G32B32Sfloat, offsetof(Vertex, pos) ),
+            vk::VertexInputAttributeDescription( 1, 0, vk::Format::eR32G32B32Sfloat, offsetof(Vertex, normal) ),
+            vk::VertexInputAttributeDescription( 2, 0, vk::Format::eR32G32B32Sfloat, offsetof(Vertex, color) ),
+            vk::VertexInputAttributeDescription( 3, 0, vk::Format::eR32G32Sfloat, offsetof(Vertex, texCoord) )
+        };
+    }
+
+    // Equality operator and hash function for vertex deduplication
+    bool operator==(const Vertex& other) const {
+        return pos == other.pos && normal == other.normal && color == other.color && texCoord == other.texCoord;
+    }
+};
+
+// Structure for PBR material properties
+struct Material {
+    glm::vec4 baseColorFactor = glm::vec4(1.0f);
+    float metallicFactor = 1.0f;
+    float roughnessFactor = 1.0f;
+    glm::vec3 emissiveFactor = glm::vec3(0.0f);
+
+    int baseColorTextureIndex = -1;
+    int metallicRoughnessTextureIndex = -1;
+    int normalTextureIndex = -1;
+    int occlusionTextureIndex = -1;
+    int emissiveTextureIndex = -1;
+};
+
+// Structure for a mesh with vertices, indices, and material
+struct Mesh {
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    int materialIndex = -1;
+};
+----
+
+=== シーングラフが必要な理由
+
+シーン グラフは、グラフィカル シーンの空間表現を編成するツリー状のデータ構造です。 3D オブジェクトを保存するために単純なコレクションまたはマップを使用したくなるかもしれませんが、シーン グラフにはいくつかの重要な利点があります。
+
+==== シーングラフを使用する利点
+
+* *階層変換*: シーン グラフを使用すると、子オブジェクトが親から変換を継承できます。親ノードを移動、回転、スケールすると、そのすべての子は親を基準にして自動的に変換されます。これは、胴体を動かすと付属の手足も動かす必要があるキャラクターのような複雑なモデルに不可欠です。
+
+* *空間構成*: シーン グラフは、オブジェクトの空間関係に基づいてオブジェクトを整理し、カリング、衝突検出、詳細レベルの管理などの操作を簡単に実行できるようにします。
+
+* *アニメーションのサポート*: 階層構造は、動きがボーンのチェーンを通じて伝播するスケルトン アニメーションにとって重要です。
+
+* *シーン管理*: シーン グラフにより、シーンの保存/読み込み、インスタンス化 (別の場所で同じモデルを再利用)、動的なシーンの変更などの操作が容易になります。
+
+==== シーン グラフと単純なコレクション
+
+単純なマップやオブジェクトの配列とは異なり、シーン グラフは次のことを行います。
+
+* オブジェクト間の親子関係を維持します。
+* 変換を階層の下に自動的に伝播します。
+* トラバーサル アルゴリズム (レンダリング、ピッキング、衝突) の自然な構造を提供します。
+* ローカルからグローバルへの座標変換をサポート
+
+たとえば、オブジェクトのフラットなコレクションで、キャラクターとそのすべての装備を移動したい場合は、各部分を個別に更新する必要があります。シーングラフを使用すると、キャラクターノードを移動するだけで、付属の装備がすべて自動的に移動します。
+
+==== シーン グラフと空間分割システム (ゲーム マップ)
+
+シーン グラフと空間分割システム (エンジン開発では「ゲーム マップ」と呼ばれることが多い) を区別することが重要です。
+
+* *シーン グラフ* は、オブジェクト間の階層関係と変換に焦点を当てています。
+* *空間分割システム* は、衝突検出、可視性の決定、物理計算のために空間内のオブジェクトを効率的に整理することに重点を置いています。
+
+シーン グラフが論理関係 (キャラクターとその装備など) に基づいてオブジェクトを編成するのに対し、空間分割システムはゲーム世界内の物理的な位置に基づいてオブジェクトを編成します。
+
+===== 一般的な空間分割システム
+
+ゲーム開発では、いくつかの空間分割手法が使用されます。
+
+* *八分木*: 3D 空間を 8 つの等しい八分円に再帰的に分割します。オブジェクトが不均一に配置されている大規模なオープンワールドに使用されます。オクツリーはオブジェクトの密度に適応し、混雑したエリアではより多くの細分化が行われます。
+
+* *Binary Space Partitioning (BSP)*: プレーンを使用して空間を再帰的に分割します。屋内環境で特に効率的であり、Doom や Quake などの初期の一人称シューティング ゲームによって普及しました。
+
+* *四分木*: オクツリーに相当する 2D で、空間を再帰的に 4 つの象限に分割します。一般的に 2D ゲームまたは 3D ゲームの地形に使用されます。
+
+* *Axis-Aligned Bounding Boxes (AABB) Trees*: 境界ボックスに基づいてオブジェクトを整理し、効率的な衝突チェックを可能にする階層を作成します。
+
+* *ポータルシステム*: 世界を「ポータル」でつながる「部屋」に分割します。このアプローチは、明確なエリアがある屋内環境に特に効果的です。
+
+* *空間ハッシュ*: 3D 位置をハッシュ テーブルにマッピングし、近くのオブジェクトの定時検索を可能にします。パーティクル システムや、同様のサイズのオブジェクトが多数あるその他のシナリオに役立ちます。
+
+* *バウンディング ボリューム階層 (BVH)*: ネストされたバウンディング ボリュームのツリーを作成し、効率的なレイ キャスティングと衝突検出を可能にします。
+
+===== 一般的なエンジンにおける空間パーティショニング
+
+ゲーム エンジンごとに異なる空間分割システムが使用され、多くの場合、複数のアプローチが組み合わされます。
+
+* *Unreal Engine*: 世界全体にはオクツリーを、詳細な屋内環境には BSP を組み合わせて使用​​します。また、ポータルと表示可能なセットを組み合わせた「Unreal Visibility Determination」と呼ばれるカスタム システムも使用します。
+
+* *Unity*: 物理演算とレンダリングのために 4 分木/8 分木ハイブリッド システムを実装します。ナビゲーションにはナビゲーションメッシュシステムを採用。
+
+* *CryEngine/CRYENGINE*: 屋外環境にはオクツリーを使用し、屋内エリアにはポータル システムを使用します。
+
+* *Godot*: 物理エンジンには BVH ツリーを、レンダリングにはオクツリーを採用しています。
+
+* *ソース エンジン (Valve)*: バイナリ スペース パーティショニング (BSP) と「Potentially Visible Set」(PVS) と呼ばれるポータル システムを組み合わせたもので有名です。
+
+* *id Tech (id Software)*: 初期のバージョン (Doom、Quake) は BSP の使用の先駆けとなりました。それ以降のバージョンでは、BSP、オクツリー、およびポータル システムを組み合わせて使用​​します。
+
+* *Frostbite (EA)*: 大規模な破壊可能な環境にオクツリーと組み合わせた階層グリッド システムを使用します。
+
+実際には、多くの最新のエンジンはハイブリッド アプローチを使用し、ゲーム世界のさまざまな部分の特定のニーズに基づいて適切なパーティショニング システムを選択します。
+
+=== アーキテクチャ上の決定
+
+モデル システムを設計する際、いくつかの重要なアーキテクチャ上の決定を行いました。
+
+* *ノードベースの構造*: 各ノードがメッシュ、変換、および子を持つことができるノードベースのアプローチを使用します。これにより、複雑なシーン階層に柔軟性が提供されます。
+
+* *関心事の分離*: ジオメトリック データ (頂点、インデックス) をマテリアルのプロパティや変換から分離し、メモリの使用効率を高め、更新を容易にします。
+
+* *アニメーション対応*: 当社の設計にはアニメーション専用の構造が含まれており、キーフレーム補間やさまざまなアニメーション チャンネル (移動、回転、スケール) をサポートしています。
+
+* *メモリ管理*: Model クラスがすべてのノードを所有する集中所有権モデルを使用し、クリーンアップを簡素化し、メモリ リークを防ぎます。
+
+* *効率的なトラバーサル*: さまざまなトラバーサル パターンを効率的にサポートするために、階層構造 (`nodes`) とフラット リスト (`linearNodes`) の両方を維持します。
+
+=== 開発者がモデル システムを使用する方法
+
+開発者がアプリケーションでこのモデル システムを通常どのように使用するかを次に示します。
+
+==== モデルのロードと初期化
+
+[source,cpp]
+----
+// Create and load a model
+Model* characterModel = new Model();
+loadFromFile(characterModel, "character.gltf");
+
+// Find specific nodes in the model
+Node* headNode = characterModel->findNode("Head");
+Node* weaponAttachPoint = characterModel->findNode("RightHand");
+
+// Attach additional objects to the model
+Model* weaponModel = new Model();
+loadFromFile(weaponModel, "weapon.gltf");
+weaponAttachPoint->children.push_back(weaponModel->nodes[0]);
+----
+
+==== モデルの更新とアニメーション化
+
+[source,cpp]
+----
+// Play an animation
+// NB: Keep deltaTime relative to frame instead of a constant in actual code
+// as some systems are faster resulting in faster animation on a constant
+// that isn't tied to the frame time.
+float deltaTime = 0.016f; // 16ms or ~60 FPS
+characterModel->updateAnimation(0, deltaTime); // Play the first animation
+
+// Manually transform nodes
+headNode->rotation = glm::rotate(headNode->rotation, glm::radians(15.0f), glm::vec3(0, 1, 0)); // Look to the side
+----
+
+==== レンダリングモデル
+
+[source,cpp]
+----
+void renderModel(Model* model, VkCommandBuffer commandBuffer) {
+    // Traverse all nodes in the model
+    for (auto& node : model->linearNodes) {
+        if (node->mesh.indices.size() > 0) {
+            // Get the global transformation matrix
+            glm::mat4 nodeMatrix = node->getGlobalMatrix();
+
+            // Update uniform buffer with the node's transformation
+            updateUniformBuffer(nodeMatrix);
+
+            // Bind the appropriate material
+            if (node->mesh.materialIndex >= 0) {
+                bindMaterial(model->materials[node->mesh.materialIndex]);
+            }
+
+            // Draw the mesh
+            vkCmdDrawIndexed(commandBuffer,
+                static_cast<uint32_t>(node->mesh.indices.size()),
+                1, 0, 0, 0);
+        }
+    }
+}
+----
+
+=== チュートリアルに戻る
+
+これで、モデル システム API が仮説に基づいてどのように使用されるかがわかりました。
+開発者の観点からは、この機能を実装する時期が来ました。
+次のセクションでは、シーンの実装について説明します。
+エンジンに動力を供給するグラフ、アニメーション システム、およびモデル クラス。
+
+=== シーングラフの実装
+
+次に、シーン グラフ構造の実装を見てみましょう。
+
+[source,cpp]
+----
+// Structure for a node in the scene graph
+struct Node {
+    Node* parent = nullptr;
+    std::vector<Node*> children;
+    Mesh mesh;
+    glm::mat4 matrix = glm::mat4(1.0f);
+
+    // For animation
+    glm::vec3 translation = glm::vec3(0.0f);
+    glm::quat rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    glm::vec3 scale = glm::vec3(1.0f);
+
+    glm::mat4 getLocalMatrix() {
+        return glm::translate(glm::mat4(1.0f), translation) *
+               glm::toMat4(rotation) *
+               glm::scale(glm::mat4(1.0f), scale) *
+               matrix;
+    }
+
+    glm::mat4 getGlobalMatrix() {
+        glm::mat4 m = getLocalMatrix();
+        Node* p = parent;
+        while (p) {
+            m = p->getLocalMatrix() * m;
+            p = p->parent;
+        }
+        return m;
+    }
+};
+----
+
+=== アニメーション構造
+
+アニメーションをサポートするには、追加の構造が必要です。
+
+[source,cpp]
+----
+// Structure for animation keyframes
+struct AnimationChannel {
+    enum PathType { TRANSLATION, ROTATION, SCALE };
+    PathType path;
+    Node* node = nullptr;
+    uint32_t samplerIndex;
+};
+
+// Structure for animation interpolation
+struct AnimationSampler {
+    enum InterpolationType { LINEAR, STEP, CUBICSPLINE };
+    InterpolationType interpolation;
+    std::vector<float> inputs;  // Key frame timestamps
+    std::vector<glm::vec4> outputsVec4;  // Key frame values (for rotations)
+    std::vector<glm::vec3> outputsVec3;  // Key frame values (for translations and scales)
+};
+
+// Structure for animation
+struct Animation {
+    std::string name;
+    std::vector<AnimationSampler> samplers;
+    std::vector<AnimationChannel> channels;
+    float start = std::numeric_limits<float>::max();
+    float end = std::numeric_limits<float>::min();
+    float currentTime = 0.0f;
+};
+----
+
+=== モデルクラス
+
+これで、すべてをまとめた Model クラスを定義できます。
+
+[source,cpp]
+----
+// Structure for a model with nodes, meshes, materials, textures, and animations
+struct Model {
+    std::vector<Node*> nodes;
+    std::vector<Node*> linearNodes;
+    std::vector<Material> materials;
+    std::vector<Animation> animations;
+
+    ~Model() {
+        for (auto node : linearNodes) {
+            delete node;
+        }
+    }
+
+    Node* findNode(const std::string& name) {
+        auto nodeIt = std::ranges::find_if(linearNodes, [&name](auto const& node) {
+            return node->name == name;
+        });
+        return (nodeIt != linearNodes.end()) ? *nodeIt : nullptr;
+    }
+
+    void updateAnimation(uint32_t index, float deltaTime) {
+        assert(!animations.empty() && index < animations.size());
+
+
+
+        Animation& animation = animations[index];
+        animation.currentTime += deltaTime;
+        if (animation.currentTime > animation.end) {
+            animation.currentTime = animation.start;
+        }
+
+        for (auto& channel : animation.channels) {
+            AnimationSampler& sampler = animation.samplers[channel.samplerIndex];
+
+            // Find the current key frame using binary search
+            auto keyFrameIt = std::ranges::lower_bound(sampler.inputs, animation.currentTime);
+            if (keyFrameIt != sampler.inputs.end() && keyFrameIt != sampler.inputs.begin()) {
+                size_t i = std::distance(sampler.inputs.begin(), keyFrameIt) - 1;
+                float t = (animation.currentTime - sampler.inputs[i]) / (sampler.inputs[i + 1] - sampler.inputs[i]);
+
+                    switch (channel.path) {
+                        case AnimationChannel::TRANSLATION: {
+                            glm::vec3 start = sampler.outputsVec3[i];
+                            glm::vec3 end = sampler.outputsVec3[i + 1];
+                            channel.node->translation = glm::mix(start, end, t);
+                            break;
+                        }
+                        case AnimationChannel::ROTATION: {
+                            glm::quat start = glm::quat(sampler.outputsVec4[i].w, sampler.outputsVec4[i].x, sampler.outputsVec4[i].y, sampler.outputsVec4[i].z);
+                            glm::quat end = glm::quat(sampler.outputsVec4[i + 1].w, sampler.outputsVec4[i + 1].x, sampler.outputsVec4[i + 1].y, sampler.outputsVec4[i + 1].z);
+                            channel.node->rotation = glm::slerp(start, end, t);
+                            break;
+                        }
+                        case AnimationChannel::SCALE: {
+                            glm::vec3 start = sampler.outputsVec3[i];
+                            glm::vec3 end = sampler.outputsVec3[i + 1];
+                            channel.node->scale = glm::mix(start, end, t);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+};
+----
+
+=== 次のステップ: glTF ファイルのロード
+
+モデル システムのアーキテクチャを設計し、コア データ構造を実装したので、次のステップは実際に glTF ファイルから 3D モデルをロードすることです。次の章では、tinygltf ライブラリを使用して glTF ファイルを解析し、ロードされたデータをシーン グラフに取り込む方法を検討します。 glTF ファイルからメッシュ、マテリアル、テクスチャ、アニメーションを抽出し、それらをエンジンの内部表現に変換する方法を学びます。
+
+xref:Building_a_Simple_Engine/Loading_Models/02_project_setup.adoc[前: プロジェクトのセットアップ] | xref:Building_a_Simple_Engine/Loading_Models/04_loading_gltf.adoc[次へ: glTF モデルのロード]

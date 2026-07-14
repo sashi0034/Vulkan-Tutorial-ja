@@ -1,0 +1,56 @@
+:pp: {plus}{plus}
+= 直接の CPU からイメージへのアクセス: Host Image Copies の活用
+
+== ホスト上での直接データ移動
+
+**Vulkan 1.4** で最も強力な機能の一つが、ホスト（CPU）上で直接データを動かせることです。これは `vk::Device::copyMemoryToImageEXT` 関数（または RAII ラッパの同等物）で扱います。この関数は生の CPU メモリを取り、GPU 最適イメージへ直接コピーします。
+
+これは大きな生産性向上です。単純で直接的なイメージ更新のために、ステージングバッファ、コマンドプール、サブミッションキューを管理する必要はもうありません。動的テクスチャやスクリーンショットバッファのような CPU 側リソースから GPU 側イメージへデータを移す最も直接的な方法です。
+
+== ホストコピーの実装
+
+この機能を使うには、まず `VK_EXT_host_image_copy` 拡張（現在は Vulkan 1.4 の一部）のサポートを確認する必要があります。確認できたら、次のようにコピーできます。
+
+[,cpp]
+----
+// 1. Prepare the copy info
+auto copyInfo = vk::MemoryToImageCopyEXT{
+    .pHostPointer = cpuData,
+    .memoryRowLength = width,
+    .memoryImageHeight = height,
+    .imageSubresource = { .aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+    .imageExtent = { .width = width, .height = height, .depth = 1 }
+};
+
+auto hostCopyInfo = vk::CopyMemoryToImageInfoEXT{
+    .dstImage = *gpuImage,
+    .dstImageLayout = vk::ImageLayout::eGeneral,
+    .regionCount = 1,
+    .pRegions = &copyInfo
+};
+
+// 2. Perform the copy directly on the CPU
+device.copyMemoryToImageEXT(hostCopyInfo);
+----
+
+== ユースケースと利点
+
+Host Image Copies は、少量のデータを素早く更新したいが、GPU のコマンドプロセッサを待ちたくない場面に理想的です。
+
+-   **動的テクスチャ**: UI 要素、フォントアトラス、小さな動的テクスチャの更新。
+-   **スクリーンショット**: GPU 最適イメージをディスク保存用に CPU へコピーする（逆の `copyImageToMemoryEXT` を使用）。
+-   **デバッグ**: CPU コードから GPU 側リソースの内容を素早く検査する。
+
+主な利点は **低レイテンシ** です。コマンドバッファを記録・サブミットしないため、サブミッションに伴うドライバとハードウェアのオーバーヘッドがすべてなくなります。CPU が単にバイトを移し、それらは GPU ですぐに利用可能になります。
+
+== Simple Engine での可能性
+
+`Simple Engine` では、Host Image Copies を使って **スクリーンショット** システムを最適化できます。現在、スクリーンショット取得は、スワップチェーンイメージをステージングバッファへコピーするコマンドバッファの記録、そのサブミット、そして CPU 側でのフェンス待ちという多段階プロセスです。これは遅く、フレームレートに目立つヒッチを起こし得ます。
+
+`copyImageToMemoryEXT`（Vulkan 1.4 で利用可能）へ移ることで、スクリーンショットコピーを CPU 上で直接行えます。フレームが終わりスワップチェーンイメージが `ePresentSrcKHR` レイアウトになったら、メインスレッドから `copyImageToMemoryEXT` を呼べます。これによりピクセルが GPU メモリから CPU 側スクリーンショットバッファへ直接移り、コマンドサブミッションとフェンス待ちのサイクルを完全に迂回します。ユーザー体験がはるかに滑らかになり、エンジン内のスクリーンショット機能の実装もよりクリーンで直接的になります。
+
+次の節では、これらのバイトが GPU から見えることと、ホスト–デバイスハザードを作らないことを保証するために必要な同期をどう扱うかを見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Host_Image_Copies_Memory_Sync/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Host_Image_Copies_Memory_Sync/03_visibility_flushes.adoc[可視性とフラッシュ]

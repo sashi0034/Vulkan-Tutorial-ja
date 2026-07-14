@@ -1,0 +1,120 @@
+:pp: {plus}{plus}
+
+= Vulkan 1.4 スカラーレイアウト: 密なパッキング
+
+== はじめに
+
+これまでのセクションでは、高い占有率によって GPU の Compute Unit を忙しく保つことに焦点を当ててきました。しかし何千ものスレッドがアクティブでも、**帯域**に足を引っ張られることがあります。
+
+VRAM からフェッチする 1 バイト 1 バイトが貴重です。データの配置が悪いと、使わないバイトまでフェッチしてしまうことがあります。コンピュートアーキテクチャ章の最終セクションでは、Vulkan 1.4 の **スカラーレイアウト** が、GPU プログラミングで古くからある厄介な問題——整列税——をどう解くかを見ます。
+
+== 整列税: std140 と std430
+
+歴史的に、OpenGL と Vulkan は **std140** と **std430**（standard 140/430 レイアウト）と呼ばれる厳格な整列規則でバッファを配置する必要がありました。これらの規則は、4 バイトや 16 バイト境界に完全整列していないデータを読むのが苦手な古いハードウェア向けに設計されていました。
+
+たとえば `std140` では、単純な `vec3`（3 つの float）はしばしば `vec4` のサイズまでパディングされます。つまり `vec3` の配列があると、メモリ帯域の 25% が空のパディングに浪費されていたのです。
+
+[source,slang]
+----
+// std140 の場合:
+struct MyData {
+    float3 position; // 12 バイト + 4 バイトのパディング
+    float radius;    // 4 バイト
+};
+// 合計サイズ: 20 バイト（論理的には 16）
+----
+
+`std430` はスカラーやベクトルの配列についてより密なパッキングを許すことで改善しましたが、入れ子構造の整列については依然として厳格な規則がありました。
+
+== GL_EXT_scalar_block_layout の登場
+
+これを解決するため、**GL_EXT_scalar_block_layout** という新しい拡張が導入されました。この拡張により **スカラーレイアウト** が使え、構造体メンバや配列要素の間のパディングを実質的にすべて取り除けます。
+
+Vulkan 1.4 では、この機能はコア要件になっています。`scalar` レイアウトを使うことで、GPU 上のデータ構造が C{pp} 構造体とバイト単位で完全に一致することを保証できます。
+
+=== なぜ重要なのか？
+
+VRAM を数バイト節約するだけの話ではありません。**キャッシュ効率**の話です。
+
+GPU が VRAM からデータをフェッチするとき、大きな「キャッシュライン」（しばしば 64 または 128 バイト）単位で取ります。データがパディングだらけだと、各キャッシュラインに含まれる「本物の」データが減ります。同じ量の情報を得るためにより多くのメモリフェッチが必要になり、直接性能低下につながります。
+
+=== Slang: 自動パッキング
+
+Slang を使っている場合、ほとんどのケースで手動のレイアウト修飾子を気にする必要すらありません。Vulkan 1.4 をターゲットにするとき、Slang のレイアウトエンジンが `scalar` 規則を処理します。
+
+[source,slang]
+----
+struct MyData {
+    float3 position;
+    float radius;
+};
+
+[[vk::binding(0, 0)]]
+RWStructuredBuffer<MyData> MyBuffer;
+----
+
+Slang の `RWStructuredBuffer` は Vulkan の `Storage Buffer` に対応し、Slang が自然整列をデフォルトとするため、ボイラープレートなしで GLSL の `scalar` レイアウトと同じ結果になります。
+
+=== GLSL: 手動の苦労
+
+Vulkan 1.4 の「勝利」を本当に味わうには、同じ構造体が古い `std430` 規則と現代の `scalar` レイアウトでどう扱われるかを見てみましょう。
+
+[source,glsl]
+----
+// 「古い」やり方（std430）
+struct MyData {
+    vec3 position; // 12 バイト + 4 バイトのパディング（vec3 の配列はさらに悪い！）
+    float radius;  // 4 バイト
+};
+
+layout(std430, binding = 0) buffer MyBuffer {
+    MyData data[];
+};
+----
+
+`std430` では、`MyData` の配列がある場合、各 `vec3` は 16 バイトにパディングされます。CPU 側の単純な `struct { glm::vec3 p; float r; }` と合わせようとすると、GPU が `position` と `radius` の間にその 4 バイトの隙間を期待するため、メモリ破壊が起きがちです。
+
+次に、**scalar** レイアウトを使った Vulkan 1.4 のやり方を見てください。
+
+[source,glsl]
+----
+// 「現代」のやり方（Vulkan 1.4 / GL_EXT_scalar_block_layout）
+#extension GL_EXT_scalar_block_layout : enable
+
+struct MyData {
+    vec3 position; // 12 バイト
+    float radius;  // 4 バイト
+};
+
+layout(scalar, binding = 0) buffer MyBuffer {
+    MyData data[];
+};
+// MyData の合計サイズ: 16 バイト。パディングなし！
+----
+
+明示的に `layout(scalar)` を使うことで、より密なパッキング規則を望むとドライバに伝えます。これにより、手動の `float padding` メンバなしで GLSL コードが標準の C{pp} 構造体と完全に一致します。
+
+=== C{pp} 側の比較
+
+CPU 側で合わせるために、もう手動で `float padding[1]` を追加したり `alignas(16)` を使ったりする必要はありません。構造体を自然に定義できます。
+
+[source,cpp]
+----
+struct MyData {
+    glm::vec3 position;
+    float radius;
+};
+// 合計サイズ: 16 バイト。パディングなし！
+----
+
+Slang のような現代の言語を使っている場合、さらに簡単になります。Slang はより自然な C{pp} 風レイアウトをデフォルトとし、Vulkan 1.4 をターゲットにするときバックエンドがスカラーレイアウトの詳細を自動処理します。
+
+== まとめ
+
+本章では多くの地を踏みました。ワークグループがシリコンへどうマッピングされるか、占有率がメモリフェッチの巨大なレイテンシをどう隠蔽するか、スカラーレイアウトが苦労して使う帯域を無駄にしないようどう保証するかを見てきました。
+
+これらの低レベルなアーキテクチャ詳細を理解することで、「シェーダを書く」段階を超え、「ハードウェアをプログラムする」段階へ進みました。
+
+次の章では、**Vulkan Memory Model** と、何千ものスレッド間でデータを安全に同期する方法を見て、これらの概念をさらに進めます。
+
+xref:Advanced_Vulkan_Compute/02_Compute_Architecture/03_occupancy_and_latency_hiding.adoc[前へ: 占有率とレイテンシ隠蔽] | xref:Advanced_Vulkan_Compute/03_Memory_Models/01_introduction.adoc[次へ: メモリモデルと一貫性]

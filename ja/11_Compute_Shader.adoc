@@ -1,0 +1,807 @@
+:pp: {plus}{plus}
+
+= コンピュートシェーダ
+
+== はじめに
+
+このボーナス章では、コンピュートシェーダを見ていきます。
+これまでの章では、Vulkan パイプラインの伝統的なグラフィックス部分だけを扱ってきました。
+しかし OpenGL のような古い API とは異なり、Vulkan ではコンピュートシェーダのサポートが必須です。
+つまり、ハイエンドのデスクトップ GPU でも低電力の組み込みデバイスでも、利用可能なすべての Vulkan 実装でコンピュートシェーダを使えます。
+
+これにより、アプリケーションがどこで動いていても、グラフィックスプロセッサ上での汎用計算（GPGPU）の世界が開けます。
+GPGPU とは、伝統的には CPU の領域だった一般的な計算を GPU 上で行うことを意味します。
+しかし GPU はますます強力で柔軟になり、CPU の汎用能力を必要としていた多くのワークロードを、今では GPU 上でリアルタイムに実行できます。
+
+GPU のコンピュート能力が使える例としては、画像操作、可視性判定、ポストプロセス、高度なライティング計算、アニメーション、物理（例: パーティクルシステム）などがあります。
+さらに、グラフィックス出力を必要としない非視覚的な計算専用の仕事（数値計算や AI 関連など）にもコンピュートを使えます。
+これは「ヘッドレスコンピュート」と呼ばれます。
+
+== 利点
+
+計算負荷の高い処理を GPU で行うことには、いくつかの利点があります。
+最も明らかなのは、CPU から仕事をオフロードできることです。
+もうひとつは、CPU のメインメモリと GPU のメモリ間でデータを移動する必要がないことです。
+すべてのデータを GPU 上に置いたままにでき、メインメモリからの遅い転送を待つ必要がありません。
+
+これらに加え、GPU は高度に並列化されており、数万の小さなコンピュートユニットを持つものもあります。
+そのため、少数の大きなコンピュートユニットを持つ CPU よりも、高度に並列なワークフローに適していることがよくあります。
+
+== Vulkan パイプライン
+
+コンピュートがパイプラインのグラフィックス部分から完全に分離されていることを知っておくことが重要です。
+これは公式仕様にある次の Vulkan パイプラインのブロック図からも分かります。
+
+image::/images/vulkan_pipeline_block_diagram.png[]
+
+この図では、左側に伝統的なグラフィックス部分のパイプラインがあり、右側にはこのグラフィックスパイプラインに属さないいくつかのステージ（コンピュートシェーダ（ステージ）を含む）があります。
+コンピュートシェーダステージがグラフィックスパイプラインから切り離されているため、都合のよいところで使えます。
+これは、たとえば常に頂点シェーダの変換済み出力に適用されるフラグメントシェーダとは大きく異なります。
+
+図の中央は、たとえばディスクリプタセットもコンピュートで使われることを示しています。
+したがって、ディスクリプタレイアウト、ディスクリプタセット、ディスクリプタについて学んだことは、ここでも同様に当てはまります。
+
+== 例
+
+この章で実装する分かりやすい例は、GPU ベースのパーティクルシステムです。
+このようなシステムは多くのゲームで使われ、対話的なフレームレートで更新する必要がある数千のパーティクルで構成されることがよくあります。
+このようなシステムをレンダリングするには、主に 2 つの部分が必要です。頂点バッファとして渡される頂点と、何らかの式に基づいてそれらを更新する方法です。
+
+「古典的な」CPU ベースのパーティクルシステムでは、パーティクルデータをシステムのメインメモリに格納し、CPU で更新します。
+更新後、次のフレームで更新されたパーティクルを表示できるように、頂点を再び GPU のメモリへ転送する必要があります。
+最も単純な方法は、各フレームで新しいデータで頂点バッファを再作成することです。
+これは非常にコストが高いです。
+実装によっては、CPU から書き込めるように GPU メモリをマップする（デスクトップでは「リサイザブル BAR」、統合 GPU ではユニファイドメモリと呼ばれる）方法や、ホストローカルバッファを使う方法（PCI-E 帯域のため最も遅い方法）もあります。
+しかし、どのバッファ更新方法を選んでも、パーティクルを更新するには常に CPU への「往復」が必要です。
+
+GPU ベースのパーティクルシステムでは、この往復は不要になります。
+頂点は開始時に一度だけ GPU にアップロードされ、すべての更新はコンピュートシェーダを使って GPU のメモリ上で行われます。
+これが速い主な理由のひとつは、GPU とそのローカルメモリ間の帯域がはるかに高いことです。
+CPU ベースのシナリオでは、メインメモリと PCI Express の帯域に制限され、それはしばしば GPU メモリ帯域のほんの一部にすぎません。
+
+専用のコンピュートキューを持つ GPU でこれを行う場合、グラフィックスパイプラインのレンダリング部分と並列にパーティクルを更新できます。
+これは「非同期コンピュート」と呼ばれ、このチュートリアルでは扱わない高度なトピックです。
+
+これがこの章のコードのスクリーンショットです。
+ここに表示されているパーティクルは、CPU とのやりとりなしに、コンピュートシェーダによって GPU 上で直接更新されています。
+
+image::/images/compute_shader_particles.png[]
+
+== データ操作
+
+このチュートリアルでは、プリミティブを渡すための頂点バッファやインデックスバッファ、シェーダにデータを渡すためのユニフォームバッファなど、さまざまなバッファ型についてすでに学んでいます。
+また、テクスチャマッピングのために画像も使いました。
+しかしこれまで、データは常に CPU で書き込み、GPU では読み取りだけを行っていました。
+
+コンピュートシェーダで導入される重要な概念は、バッファから任意に読み取り、*かつ書き込み*できることです。
+そのために、Vulkan は 2 つの専用ストレージ型を提供しています。
+
+=== シェーダストレージバッファオブジェクト（SSBO）
+
+シェーダストレージバッファ（SSBO）は、シェーダがバッファから読み取り、バッファへ書き込むことを可能にします。
+使い方はユニフォームバッファオブジェクトと似ています。
+最大の違いは、他のバッファ型を SSBO にエイリアスできることと、任意に大きくできることです。
+
+GPU ベースのパーティクルシステムに戻ると、コンピュートシェーダで更新（書き込み）され、頂点シェーダで読み取り（描画）される頂点をどう扱うか疑問に思うかもしれません。両方の用途では一見異なるバッファ型が必要に見えるからです。
+
+しかし、そうではありません。
+Vulkan では、バッファと画像に複数の用途を指定できます。
+したがって、パーティクルの頂点バッファを（グラフィックスパスで）頂点バッファとして、かつ（コンピュートパスで）ストレージバッファとして使うには、次の 2 つの用途フラグ付きでバッファを作成するだけです。
+
+[,c++]
+----
+vk::BufferCreateInfo bufferInfo{};
+...
+bufferInfo.usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst;
+...
+
+shaderStorageBuffers[i] = vk::raii::Buffer(*device, bufferInfo);
+----
+
+`bufferInfo.usage` で設定された 2 つのフラグ `vk::BufferUsageFlagBits::eVertexBuffer` と `vk::BufferUsageFlagBits::eStorageBuffer` は、このバッファを 2 つの異なるシナリオ（頂点シェーダでの頂点バッファ、およびストレージバッファ）で使いたいことを実装に伝えます。
+ホストから GPU へデータを転送できるように、ここでは `vk::BufferUsageFlagBits::eTransferDst` フラグも追加していることに注意してください。
+これは重要です。シェーダストレージバッファを GPU メモリのみ（`vk::MemoryPropertyFlagBits::eDeviceLocal`）に置きたいため、ホストからこのバッファへデータを転送する必要があるからです。
+
+同じコードを `createBuffer` ヘルパー関数で書いたものが次です。
+
+[,c++]
+----
+vk::raii::Buffer shaderStorageBufferTemp({});
+vk::raii::DeviceMemory shaderStorageBufferTempMemory({});
+createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal, shaderStorageBufferTemp, shaderStorageBufferTempMemory);
+copyBuffer(stagingBuffer, shaderStorageBufferTemp, bufferSize);
+shaderStorageBuffers.emplace_back(std::move(shaderStorageBufferTemp));
+shaderStorageBuffersMemory.emplace_back(std::move(shaderStorageBufferTempMemory));
+----
+
+このようなバッファにアクセスするための Slang シェーダ宣言は次のようになります。
+
+[,slang]
+----
+struct Particle {
+	float2 position;
+	float2 velocity;
+    float4 color;
+};
+
+struct ParticleSSBO {
+    Particle particles;
+};
+StructuredBuffer<ParticleSSBO> particlesIn;
+RWStructuredBuffer<ParticleSSBO> particlesOut;
+----
+
+この例では、各パーティクルが位置と速度の値を持つ型付き SSBO があります（`Particle` 構造体を参照）。
+SSBO は上限のない StructuredBuffer に置かれるため、無制限の数のパーティクルを含み、particlesIn では読み取り専用バッファです。particlesOut では RWStructuredBuffer に置きます。
+SSBO で要素数を指定しなくてよいことは、たとえばユニフォームバッファに対する利点のひとつです。
+
+コンピュートシェーダでこのようなストレージバッファオブジェクトへ書き込むのは素直で、C{pp} 側でバッファに書き込むのと似ています。
+
+[,slang]
+----
+particlesOut[index].particles.position = particlesIn[index].particles.position + particlesIn[index].particles.velocity.xy * ubo.deltaTime;
+----
+
+=== ストレージ画像
+
+_この章では画像操作は行いません。
+この段落は、コンピュートシェーダが画像操作にも使えることを読者に知らせるためのものです。_
+
+ストレージ画像を使うと、画像から読み取り、画像へ書き込めます。
+典型的な用途は、テクスチャへの画像エフェクトの適用、ポストプロセス（本質的には非常に似ています）、またはミップマップの生成です。
+
+画像についても同様です。
+
+[,c++]
+----
+vk::ImageCreateInfo imageInfo {};
+...
+imageInfo.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage;
+...
+
+textureImage = std::make_unique<vk::raii::SwapchainKHR>( *device, swapChainCreateInfo );
+----
+
+`imageInfo.usage` で設定された 2 つのフラグ `vk::ImageUsageFlagBits::eSampled` と `vk::ImageUsageFlagBits::eStorage` は、この画像を 2 つの異なるシナリオ（フラグメントシェーダでサンプリングされる画像、およびコンピュートシェーダでのストレージ画像）で使いたいことを実装に伝えます。
+
+ストレージ画像の Slang シェーダ宣言は、たとえばフラグメントシェーダで使われるサンプリング画像と似ています。
+
+[,slang]
+----
+[vk::image_format("r32f")] Texture2D<float> inputImage;
+[vk::image_format("r32f")] RWTexture2D<float> outputImage;
+----
+
+ここでのいくつかの違いは、画像フォーマット用の `r32f` のような追加属性、読み取り専用の Texture2D と読み書き可能な RWTexture2D の指定です。
+そして最後に、ストレージ画像を宣言するには `RWTexture2D` 型を使う必要があります。
+
+コンピュートシェーダでのストレージ画像の読み書きは、配列ルックアップ構文で行います。
+
+[,slang]
+----
+float3 pixel = inputImage[int2(gl_GlobalInvocationID.xy)].rgb;
+outputImage[int2(gl_GlobalInvocationID.xy)] = pixel;
+----
+
+== コンピュートキューファミリ
+
+xref:03_Drawing_a_triangle/00_Setup/03_Physical_devices_and_queue_families.adoc[物理デバイスとキューファミリの章]では、キューファミリとグラフィックスキューファミリの選び方についてすでに学びました。
+コンピュートは、キューファミリプロパティのフラグビット `vk::QueueFlagBits::eCompute` を使います。
+したがってコンピュートの仕事をしたい場合は、コンピュートをサポートするキューファミリからキューを取得する必要があります。
+
+なお、Vulkan ではグラフィックス操作をサポートする実装が、グラフィックスとコンピュートの両方をサポートするキューファミリを少なくとも 1 つ持つことが要求されますが、実装が専用のコンピュートキューを提供することも可能です。
+この専用コンピュートキュー（グラフィックスビットを持たないもの）は、非同期コンピュートキューを示唆します。
+ただしこのチュートリアルを初心者向けに保つため、グラフィックスとコンピュートの両方を行えるキューを使います。
+これにより、いくつかの高度な同期メカニズムを扱わずに済みます。
+
+コンピュートサンプルでは、デバイス作成コードを少し変更する必要があります。
+
+[,c++]
+----
+std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice->getQueueFamilyProperties();
+
+// get the first index into queueFamilyProperties which supports graphics and compute
+auto graphicsAndComputeQueueFamilyProperty =
+  std::find_if( queueFamilyProperties.begin(),
+                queueFamilyProperties.end(),
+                []( vk::QueueFamilyProperties const & qfp ) { return (qfp.queueFlags & vk::QueueFlagBits::eGraphics && qfp.queueFlags & vk::QueueFlagBits::eCompute); } );
+graphicsAndComputeIndex = static_cast<uint32_t>( std::distance( queueFamilyProperties.begin(), graphicsAndComputeQueueFamilyProperty ) );
+----
+
+変更されたキューファミリインデックス選択コードは、グラフィックスとコンピュートの両方をサポートするキューファミリを探すようになります。
+
+その後、`createLogicalDevice` でこのキューファミリからコンピュートキューを取得できます。
+
+[,c++]
+----
+computeQueue = std::make_unique<vk::raii::Queue>( *device, graphicsAndComputeIndex, 0 );
+----
+
+== コンピュートシェーダステージ
+
+グラフィックスのサンプルでは、シェーダの読み込みとディスクリプタへのアクセスにさまざまなパイプラインステージを使ってきました。
+コンピュートシェーダは、`vk::ShaderStageFlagBits::eCompute` パイプラインを使うことで同様にアクセスします。
+したがってコンピュートシェーダの読み込みは、頂点シェーダの読み込みとまったく同じですが、シェーダステージが異なります。
+これについては次の段落で詳しく説明します。
+コンピュートはまた、ディスクリプタとパイプライン用の新しいバインディングポイント型 `vk::PipelineBindPoint::eCompute` を導入し、後で使う必要があります。
+
+== コンピュートシェーダの読み込み
+
+アプリケーションでのコンピュートシェーダの読み込みは、他のシェーダの読み込みと同じです。
+実質的な違いは、上記の `vk::ShaderStageFlagBits::eCompute` を使う必要があることだけです。
+
+[,c++]
+----
+auto computeShaderCode = readFile("shaders/slang.spv");
+
+vk::PipelineShaderStageCreateInfo computeShaderStageInfo({}, vk::ShaderStageFlagBits::eCompute, shaderModule, "compMain");
+...
+----
+
+== シェーダストレージバッファの準備
+
+先ほど、シェーダストレージバッファを使って任意のデータをコンピュートシェーダに渡せることを学びました。
+この例では、パーティクルの配列を GPU にアップロードし、GPU のメモリ上で直接操作できるようにします。
+
+xref:03_Drawing_a_triangle/03_Drawing/03_Frames_in_flight.adoc[フレームインフライト]の章では、CPU と GPU を忙しく保つために、フライト中のフレームごとにリソースを複製することについて話しました。
+まず、バッファオブジェクトとその裏にあるデバイスメモリ用のベクトルを宣言します。
+
+[,c++]
+----
+std::vector<vk::raii::Buffer> shaderStorageBuffers;
+std::vector<vk::raii::DeviceMemory> shaderStorageBuffersMemory;
+----
+
+`createShaderStorageBuffers` では、RAII の慣例どおり、すでに作成されているオブジェクトをクリーンアップするためにこれらのベクトルをクリアします。
+
+[,c++]
+----
+shaderStorageBuffers.clear();
+shaderStorageBuffersMemory.clear();
+----
+
+この準備ができたら、初期パーティクル情報を GPU へ移し始められます。
+まずホスト側でパーティクルのベクトルを初期化します。
+
+[,c++]
+----
+// Initialize particles
+std::default_random_engine rndEngine((unsigned)time(nullptr));
+std::uniform_real_distribution<float> rndDist(0.0f, 1.0f);
+
+// Initial particle positions on a circle
+std::vector<Particle> particles(PARTICLE_COUNT);
+for (auto& particle : particles) {
+    float r = 0.25f * sqrtf(rndDist(rndEngine));
+    float theta = rndDist(rndEngine) * 2.0f * 3.14159265358979323846f;
+    float x = r * cosf(theta) * HEIGHT / WIDTH;
+    float y = r * sinf(theta);
+    particle.position = glm::vec2(x, y);
+    particle.velocity = normalize(glm::vec2(x,y)) * 0.00025f;
+    particle.color = glm::vec4(rndDist(rndEngine), rndDist(rndEngine), rndDist(rndEngine), 1.0f);
+}
+----
+
+次に、初期パーティクルプロパティを保持するための xref:04_Vertex_buffers/02_Staging_buffer.adoc[ステージングバッファ]をホストのメモリに作成します。
+
+[,c++]
+----
+    vk::DeviceSize bufferSize = sizeof(Particle) * PARTICLE_COUNT;
+
+    // Create a staging buffer used to upload data to the gpu
+    vk::raii::Buffer stagingBuffer({});
+    vk::raii::DeviceMemory stagingBufferMemory({});
+    createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, stagingBuffer, stagingBufferMemory);
+
+    void* dataStaging = stagingBufferMemory.mapMemory(0, bufferSize);
+    memcpy(dataStaging, particles.data(), (size_t)bufferSize);
+    stagingBufferMemory.unmapMemory();
+----
+
+このステージングバッファをソースとして使い、フレームごとのシェーダストレージバッファを作成し、ステージングバッファからそれぞれへパーティクルプロパティをコピーします。
+
+[,c++]
+----
+    // Copy initial particle data to all storage buffers
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        vk::raii::Buffer shaderStorageBufferTemp({});
+        vk::raii::DeviceMemory shaderStorageBufferTempMemory({});
+        createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal, shaderStorageBufferTemp, shaderStorageBufferTempMemory);
+        copyBuffer(stagingBuffer, shaderStorageBufferTemp, bufferSize);
+        shaderStorageBuffers.emplace_back(std::move(shaderStorageBufferTemp));
+        shaderStorageBuffersMemory.emplace_back(std::move(shaderStorageBufferTempMemory));
+    }
+}
+----
+
+== ディスクリプタ
+
+コンピュート用のディスクリプタ設定は、グラフィックスとほぼ同じです。
+唯一の違いは、コンピュートステージからアクセスできるように、ディスクリプタに `vk::ShaderStageFlagBits::eCompute` を設定する必要があることです。
+
+[,c++]
+----
+ std::array layoutBindings{
+            vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr),
+ };
+...
+----
+
+ここでもシェーダステージを組み合わせられることに注意してください。たとえば、頂点とコンピュートステージで共有するパラメータを持つユニフォームバッファのように、ディスクリプタを両方のステージからアクセス可能にしたい場合は、両方のステージのビットを設定します。
+
+[,c++]
+----
+layoutBindings[0].stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eCompute;
+----
+
+これがサンプルのディスクリプタ設定です。
+レイアウトは次のようになります。
+
+[,c++]
+----
+std::array layoutBindings{
+    vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr),
+    vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr),
+    vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr)
+};
+
+vk::DescriptorSetLayoutCreateInfo layoutInfo({}, layoutBindings.size(), layoutBindings.data());
+computeDescriptorSetLayout = std::make_unique<vk::raii::DescriptorSetLayout>( *device, layoutInfo );
+----
+
+この設定を見ると、レンダリングするパーティクルシステムは 1 つだけなのに、なぜシェーダストレージバッファオブジェクト用のレイアウトバインディングが 2 つあるのか疑問に思うかもしれません。
+これは、パーティクルの位置がデルタタイムに基づいてフレームごとに更新されるためです。
+つまり、各フレームは前フレームのパーティクル位置を知っている必要があり、新しいデルタタイムで更新して自分の SSBO に書き込みます。
+
+image::/images/compute_ssbo_read_write.svg[]
+
+そのために、コンピュートシェーダは前フレームと現フレームの SSBO にアクセスする必要があります。
+これは、ディスクリプタ設定で両方をコンピュートシェーダに渡すことで行われます。
+`storageBufferInfoLastFrame` と `storageBufferInfoCurrentFrame` を参照してください。
+
+[,c++]
+----
+for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+    vk::DescriptorBufferInfo bufferInfo(uniformBuffers[i], 0, sizeof(UniformBufferObject));
+
+    vk::DescriptorBufferInfo storageBufferInfoLastFrame(shaderStorageBuffers[(i - 1) % MAX_FRAMES_IN_FLIGHT], 0, sizeof(Particle) * PARTICLE_COUNT);
+    vk::DescriptorBufferInfo storageBufferInfoCurrentFrame(shaderStorageBuffers[i], 0, sizeof(Particle) * PARTICLE_COUNT);
+    std::array descriptorWrites{
+        vk::WriteDescriptorSet( computeDescriptorSets[i], 0, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &bufferInfo ),
+        vk::WriteDescriptorSet( computeDescriptorSets[i], 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &storageBufferInfoLastFrame),
+        vk::WriteDescriptorSet( computeDescriptorSets[i], 2, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &storageBufferInfoCurrentFrame),
+    };
+    device->updateDescriptorSets(descriptorWrites, {});
+}
+----
+
+ディスクリプタプールからも SSBO 用のディスクリプタ型を要求する必要があることを忘れないでください。
+
+[,c++]
+----
+std::array poolSize {
+    vk::DescriptorPoolSize( vk::DescriptorType::eUniformBuffer, MAX_FRAMES_IN_FLIGHT),
+    vk::DescriptorPoolSize(  vk::DescriptorType::eStorageBuffer, MAX_FRAMES_IN_FLIGHT * 2)
+};
+----
+
+セットが前フレームと現フレームの SSBO を参照するため、プールから要求する `vk::DescriptorType::eStorageBuffer` の数を 2 倍にする必要があります。
+
+== コンピュートパイプライン
+
+コンピュートはグラフィックスパイプラインの一部ではないため、`device->createGraphicsPipeline` は使えません。
+代わりに、コンピュートコマンドを実行するための専用コンピュートパイプラインを `device->createComputePipeline` で作成する必要があります。
+コンピュートパイプラインはラスタライズ状態に触れないため、グラフィックスパイプラインよりはるかに状態が少ないです。
+
+[,c++]
+----
+vk::PipelineLayoutCreateInfo pipelineLayoutInfo({}, 1, &**computeDescriptorSetLayout);
+
+computePipelineLayout = std::make_unique<vk::raii::PipelineLayout>( *device, pipelineLayoutInfo );
+----
+
+必要なのは 1 つのシェーダステージとパイプラインレイアウトだけなので、設定はずっと単純です。
+パイプラインレイアウトはグラフィックスパイプラインと同じように動作します。
+
+[,c++]
+----
+vk::ComputePipelineCreateInfo pipelineInfo({}, computeShaderStageInfo, *computePipelineLayout);
+computePipeline = std::make_unique<vk::raii::Pipeline>(device->createComputePipeline( nullptr, pipelineInfo));
+----
+
+== コンピュート空間
+
+コンピュートシェーダの仕組みと、コンピュートワークロードを GPU に投入する方法に入る前に、2 つの重要なコンピュート概念について話す必要があります。*ワークグループ*と*インボーケーション*です。
+これらは、GPU のコンピュートハードウェアが 3 次元（x、y、z）でコンピュートワークロードを処理する抽象実行モデルを定義します。
+
+*ワークグループ*は、コンピュートワークロードがどのように形成され、GPU のコンピュートハードウェアによって処理されるかを定義します。
+GPU が処理すべきワークアイテムだと考えることができます。
+ワークグループの次元は、ディスパッチコマンドを使ってコマンドバッファ時にアプリケーションが設定します。
+
+そして各ワークグループは、同じコンピュートシェーダを実行する*インボーケーション*の集まりです。
+インボーケーションは潜在的に並列実行でき、その次元はコンピュートシェーダで設定されます。
+単一のワークグループ内のインボーケーションは共有メモリにアクセスできます。
+
+次の画像は、これら 2 つの関係を 3 次元で示しています。
+
+image::/images/compute_space.svg[]
+
+ワークグループの次元数（`computeCommandBuffers[frameIndex]->dispatch` で定義）とインボーケーションの次元数（コンピュートシェーダ内のローカルサイズで定義）は、入力データの構造化の仕方に依存します。
+たとえばこの章のように 1 次元配列を扱う場合は、両方とも x 次元だけを指定すれば十分です。
+
+例として、コンピュートシェーダのローカルサイズが [32, 32, 1] のときにワークグループ数 [64, 1, 1] をディスパッチすると、コンピュートシェーダは 64 × 32 × 32 = 65,536 回呼び出されます。
+
+ワークグループとローカルサイズの最大数は実装ごとに異なることに注意してください。そのため、常に `VkPhysicalDeviceLimits` 内のコンピュート関連の `maxComputeWorkGroupCount`、`maxComputeWorkGroupInvocations`、`maxComputeWorkGroupSize` の制限を確認すべきです。
+
+== コンピュートシェーダ
+
+コンピュートシェーダパイプラインの設定に必要なすべての部分を学んだので、コンピュートシェーダ自体を見ていきましょう。
+GLSL シェーダの使い方（たとえば頂点シェーダやフラグメントシェーダ）について学んだことは、コンピュートシェーダにも当てはまります。
+構文は同じで、アプリケーションとシェーダ間でのデータの渡し方など多くの概念も同じです。
+しかし、いくつか重要な違いがあります。
+
+線形なパーティクル配列を更新する非常に基本的なコンピュートシェーダは、次のようになります。
+
+[,slang]
+----
+struct Particle {
+	float2 position;
+	float2 velocity;
+    float4 color;
+};
+
+struct UniformBuffer {
+    float deltaTime;
+};
+ConstantBuffer<UniformBuffer> ubo;
+
+struct ParticleSSBO {
+    Particle particles;
+};
+StructuredBuffer<ParticleSSBO> particlesIn;
+RWStructuredBuffer<ParticleSSBO> particlesOut;
+
+
+
+[shader("compute")]
+[numthreads(256,1,1)]
+void compMain(uint3 threadId : SV_DispatchThreadID)
+{
+    uint index = threadId.x;
+
+    particlesOut[index].particles.position = particlesIn[index].particles.position + particlesIn[index].particles.velocity.xy * ubo.deltaTime;
+    particlesOut[index].particles.velocity = particlesIn[index].particles.velocity;
+
+    // Flip movement at window border
+    if ((particlesOut[index].particles.position.x <= -1.0) || (particlesOut[index].particles.position.x >= 1.0)) {
+        particlesOut[index].particles.velocity.x = -particlesOut[index].particles.velocity.x;
+    }
+    if ((particlesOut[index].particles.position.y <= -1.0) || (particlesOut[index].particles.position.y >= 1.0)) {
+        particlesOut[index].particles.velocity.y = -particlesOut[index].particles.velocity.y;
+    }
+
+}
+----
+
+シェーダの上部には、シェーダの入力の宣言があります。
+まずバインディング 0 のユニフォームバッファオブジェクトで、これはこのチュートリアルですでに学びました。
+その下に、C{pp} コードの宣言と一致する Particle 構造体を宣言します。
+バインディング 1 は前フレームのパーティクルデータを持つシェーダストレージバッファオブジェクトを参照します（ディスクリプタ設定を参照）。バインディング 2 は現フレームの SSBO を指し、これがこのシェーダで更新するものです。
+
+興味深いのは、コンピュート空間に関連するこのコンピュート専用の宣言です。
+
+[,slang]
+----
+[numthreads(256,1,1)]
+----
+
+これは、現在のワークグループにおけるこのコンピュートシェーダのインボーケーション数を定義します。
+先に述べたように、これはコンピュート空間のローカル部分です。
+線形な 1D パーティクル配列を扱うため、`[numthreads(x,y,z)]` では x 次元の数だけ指定すれば十分です。
+
+`compMain` 関数は前フレームの SSBO から読み取り、更新されたパーティクル位置を現フレームの SSBO に書き込みます。
+他のシェーダ型と同様に、コンピュートシェーダにも独自の組み込み入力変数セットがあります。
+渡された ThreadId は、現在のディスパッチ全体で現在のコンピュートシェーダインボーケーションを一意に識別する変数です。その能力は `SV_DispatchThreadID` アノテーションによって得られます。
+これを使ってパーティクル配列をインデックスします。
+
+== コンピュートコマンドの実行
+
+=== ディスパッチ
+
+いよいよ GPU にコンピュートを実行するよう伝えます。
+これはコマンドバッファ内で `computeCommandBuffers[frameIndex]->dispatch` を呼び出すことで行われます。
+完全に正確ではありませんが、ディスパッチはコンピュートにとって、`commandBuffers[frameIndex]->draw` のような描画呼び出しがグラフィックスにとってであるのと同じようなものです。
+これは最大 3 次元で与えられた数のコンピュートワークアイテムをディスパッチします。
+
+[,c++]
+----
+computeCommandBuffers[frameIndex]->begin({});
+...
+
+computeCommandBuffers[frameIndex]->bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
+computeCommandBuffers[frameIndex]->bindDescriptorSets(vk::PipelineBindPoint::eCompute, *computePipelineLayout, 0, {computeDescriptorSets[frameIndex]}, {});
+
+computeCommandBuffers[frameIndex]->dispatch( PARTICLE_COUNT / 256, 1, 1 );
+
+...
+
+computeCommandBuffers[frameIndex]->end();
+----
+
+`computeCommandBuffers[frameIndex]->dispatch` は、x 次元で `PARTICLE_COUNT / 256` 個のローカルワークグループをディスパッチします。
+パーティクル配列は線形なので、他の 2 次元は 1 のままにし、1 次元のディスパッチになります。
+ではなぜパーティクル数（配列内）を 256 で割るのでしょうか？
+それは前の段落で、ワークグループ内の各コンピュートシェーダが 256 回のインボーケーションを行うと定義したからです。
+したがって 4096 個のパーティクルがある場合、16 個のワークグループをディスパッチし、各ワークグループが 256 回のコンピュートシェーダインボーケーションを実行します。
+この 2 つの数を正しく決めるには、通常ワークロードと実行ハードウェアに応じた調整とプロファイリングが必要です。
+パーティクルサイズが動的で、たとえば常に 256 で割り切れない場合は、コンピュートシェーダの先頭で `gl_GlobalInvocationID` を使い、グローバルインボーケーションインデックスがパーティクル数より大きければ return できます。
+
+またコンピュートパイプラインと同様に、コンピュートコマンドバッファはグラフィックスコマンドバッファよりはるかに状態が少ないです。
+レンダーパスを開始したりビューポートを設定したりする必要はありません。
+
+=== 仕事の投入
+
+サンプルはコンピュートとグラフィックスの両方の操作を行うため、フレームごとにグラフィックスキューとコンピュートキューの両方へ 2 回のサブミットを行います（`drawFrame` 関数を参照）。
+
+[,c++]
+----
+...
+computeQueue->submit(submitInfo, **computeInFlightFences[frameIndex]);
+...
+graphicsQueue->submit(submitInfo, **inFlightFences[frameIndex]);
+----
+
+コンピュートキューへの最初のサブミットがコンピュートシェーダでパーティクル位置を更新し、2 番目のサブミットがその更新されたデータを使ってパーティクルシステムを描画します。
+
+=== グラフィックスとコンピュートの同期
+
+同期は Vulkan の重要な部分であり、グラフィックスと併用してコンピュートを行う場合はなおさらです。
+間違った同期や不十分な同期があると、コンピュートシェーダがパーティクルの更新（書き込み）を終える前に頂点ステージが描画（読み取り）を始める（read-after-write ハザード）、あるいはパイプラインの頂点部分がまだ使っているパーティクルをコンピュートシェーダが更新し始める（write-after-read ハザード）ことが起き得ます。
+
+したがって、グラフィックスとコンピュートの負荷を適切に同期して、そうしたケースが起きないようにする必要があります。
+コンピュートワークロードの投入方法によってやり方は異なりますが、2 つの別々のサブミットを使う今回のケースでは、xref:03_Drawing_a_triangle/03_Drawing/02_Rendering_and_presentation.adoc[セマフォ]と xref:03_Drawing_a_triangle/03_Drawing/02_Rendering_and_presentation.adoc[フェンス]を使い、コンピュートシェーダが頂点の更新を終えるまで頂点シェーダが頂点のフェッチを始めないようにします。
+
+これは必要です。2 つのサブミットが順番に並んでいても、GPU 上でその順序で実行される保証はないからです。
+待機とシグナルのセマフォを追加することで、この実行順序が保証されます。
+
+そこでまず、`createSyncObjects` でコンピュート用の新しい同期プリミティブセットを追加します。
+コンピュートフェンスはグラフィックスフェンスと同様に、シグナル済み状態で作成します。そうしないと、xref:03_Drawing_a_triangle/03_Drawing/02_Rendering_and_presentation.adoc[こちら]で詳しく述べたとおり、最初の描画がフェンスのシグナルを待ち続けてタイムアウトするからです。
+
+[,c++]
+----
+std::vector<std::unique_ptr<vk::raii::Fence>> computeInFlightFences;
+std::vector<std::unique_ptr<vk::raii::Semaphore>> computeFinishedSemaphores;
+...
+computeInFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+computeFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+
+for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+    ...
+    computeFinishedSemaphores[i] = std::make_unique<vk::raii::Semaphore>(*device, vk::SemaphoreCreateInfo());
+    computeInFlightFences[i] = std::make_unique<vk::raii::Fence>(*device, vk::FenceCreateInfo(vk::FenceCreateFlagBits::eSignaled));
+}
+----
+
+これらを使って、コンピュートバッファのサブミットとグラフィックスのサブミットを同期します。
+
+[,c++]
+----
+{
+    // Compute submission
+    while ( vk::Result::eTimeout == device->waitForFences(**computeInFlightFences[frameIndex], vk::True, UINT64_MAX) )
+        ;
+
+    updateUniformBuffer(frameIndex);
+    device->resetFences( **computeInFlightFences[frameIndex] );
+    computeCommandBuffers[frameIndex]->reset();
+    recordComputeCommandBuffer();
+
+    const vk::SubmitInfo submitInfo({}, {}, {**computeCommandBuffers[frameIndex]}, { **computeFinishedSemaphores[frameIndex]});
+    computeQueue->submit(submitInfo, **computeInFlightFences[frameIndex]);
+}
+{
+    // Graphics submission
+    while ( vk::Result::eTimeout == device->waitForFences(**inFlightFences[frameIndex], vk::True, UINT64_MAX))
+...
+
+    device->resetFences(  **inFlightFences[frameIndex] );
+    commandBuffers[frameIndex]->reset();
+    recordCommandBuffer(imageIndex);
+
+    vk::Semaphore waitSemaphores[] = {**presentCompleteSemaphore[frameIndex], **computeFinishedSemaphores[frameIndex]};
+    vk::PipelineStageFlags waitDestinationStageMask[] = { vk::PipelineStageFlagBits::eVertexInput, vk::PipelineStageFlagBits::eColorAttachmentOutput };
+    const vk::SubmitInfo submitInfo( waitSemaphores, waitDestinationStageMask, {**commandBuffers[frameIndex]}, {**renderFinishedSemaphore[frameIndex]} );
+    graphicsQueue->submit(submitInfo, **inFlightFences[frameIndex]);
+----
+
+xref:03_Drawing_a_triangle/03_Drawing/02_Rendering_and_presentation.adoc[セマフォの章]のサンプルと同様に、この設定では待機セマフォを指定していないため、コンピュートシェーダはすぐに実行されます。
+上記でスコープ用の中括弧を使っているのは、コンピュートとグラフィックスのステージの間で、使う RAII 一時変数がクリーンアップされる機会を与えるためです。
+これは問題ありません。`device->waitForFences` コマンドで、コンピュートサブミットの前に現フレームのコンピュートコマンドバッファの実行完了を待っているからです。
+
+一方、グラフィックスのサブミットは、コンピュートバッファがまだ頂点を更新している間に頂点のフェッチを始めないよう、コンピュートの仕事の完了を待つ必要があります。
+そのため現フレームの `computeFinishedSemaphores` を待ち、グラフィックスのサブミットは頂点が消費される `vk::PipelineStageFlagBits::eVertexInput` ステージで待機します。
+
+しかしプレゼンテーションも待つ必要があります。画像が提示されるまでフラグメントシェーダがカラーアタッチメントへ出力しないようにするためです。
+そのため現フレームの `imageAvailableSemaphores` も、`vk::PipelineStageFlagBits::eColorAttachmentOutput` ステージで待ちます。
+
+=== タイムラインセマフォ: 改善された同期メカニズム
+
+上記で説明した同期アプローチは、シグナル済み／未シグナルの単純な状態を持つバイナリセマフォを使います。多くのシナリオではこれで十分ですが、Vulkan はより強力な同期プリミティブ、タイムラインセマフォも提供しています。
+
+タイムラインセマフォは拡張として導入され、後に Vulkan 1.2 でコアに昇格しました。バイナリセマフォとは異なり、タイムラインセマフォは待機・シグナルできる特定の値を持つ 64 ビット符号なし整数カウンタ値を持ちます。これにより、バイナリセマフォより次のような利点があります。
+
+1. *再利用性*: 単一のタイムラインセマフォを複数の同期ポイントに使え、必要なセマフォ数を減らせます。
+2. *ホスト同期*: タイムラインセマフォは、キューにコマンドを投入せずにホスト（CPU）からシグナル・待機できます。
+3. *順序外のシグナル*: 現在待機中の値より高い値へタイムラインセマフォをシグナルでき、より柔軟な同期パターンが可能です。
+4. *複数の保留シグナル*: 一度しか保留シグナルできないバイナリセマフォとは異なり、タイムラインセマフォは複数の保留シグナルを持てます。
+
+パーティクルシステムの例を、バイナリセマフォの代わりにタイムラインセマフォを使うようどう変更するかを見てみましょう。
+
+まず、論理デバイス作成時にタイムラインセマフォ機能を有効にする必要があります。
+
+[,c++]
+----
+vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR timelineSemaphoreFeatures;
+timelineSemaphoreFeatures.timelineSemaphore = vk::True;
+// Chain this to your device creation info
+----
+
+複数のバイナリセマフォを作成する代わりに、単一のタイムラインセマフォを作成します。
+
+[,c++]
+----
+vk::SemaphoreTypeCreateInfo semaphoreType{ .semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0 };
+semaphore = vk::raii::Semaphore(device, {.pNext = &semaphoreType});
+timelineValue = 0;
+----
+
+draw frame 関数では、インクリメントするタイムライン値を使ってコンピュートとグラフィックス間の仕事を調整します。
+
+[,c++]
+----
+// Update timeline value for this frame
+uint64_t computeWaitValue = timelineValue;
+uint64_t computeSignalValue = ++timelineValue;
+uint64_t graphicsWaitValue = computeSignalValue;
+uint64_t graphicsSignalValue = ++timelineValue;
+----
+
+コンピュートのサブミットでは、タイムラインセマフォのサブミット情報構造体を使います。
+
+[,c++]
+----
+vk::TimelineSemaphoreSubmitInfo computeTimelineInfo{
+    .waitSemaphoreValueCount = 1,
+    .pWaitSemaphoreValues = &computeWaitValue,
+    .signalSemaphoreValueCount = 1,
+    .pSignalSemaphoreValues = &computeSignalValue
+};
+
+vk::PipelineStageFlags waitStages[] = {vk::PipelineStageFlagBits::eComputeShader};
+
+vk::SubmitInfo computeSubmitInfo{
+    .pNext = &computeTimelineInfo,
+    .waitSemaphoreCount = 1,
+    .pWaitSemaphores = &*semaphore,
+    .pWaitDstStageMask = waitStages,
+    .commandBufferCount = 1,
+    .pCommandBuffers = &*computeCommandBuffers[frameIndex],
+    .signalSemaphoreCount = 1,
+    .pSignalSemaphores = &*semaphore
+};
+
+computeQueue.submit(computeSubmitInfo, nullptr);
+----
+
+グラフィックスのサブミットも同様です。
+
+[,c++]
+----
+vk::PipelineStageFlags waitStage = vk::PipelineStageFlagBits::eVertexInput;
+vk::TimelineSemaphoreSubmitInfo graphicsTimelineInfo{
+    .waitSemaphoreValueCount = 1,
+    .pWaitSemaphoreValues = &graphicsWaitValue,
+    .signalSemaphoreValueCount = 1,
+    .pSignalSemaphoreValues = &graphicsSignalValue
+};
+
+vk::SubmitInfo graphicsSubmitInfo{
+    .pNext = &graphicsTimelineInfo,
+    .waitSemaphoreCount = 1,
+    .pWaitSemaphores = &*semaphore,
+    .pWaitDstStageMask = &waitStage,
+    .commandBufferCount = 1,
+    .pCommandBuffers = &*commandBuffers[frameIndex],
+    .signalSemaphoreCount = 1,
+    .pSignalSemaphores = &*semaphore
+};
+
+graphicsQueue.submit(graphicsSubmitInfo, nullptr);
+----
+
+プレゼンテーションの前に、グラフィックスの仕事の完了を待ちます。
+
+[,c++]
+----
+vk::SemaphoreWaitInfo waitInfo{
+    .semaphoreCount = 1,
+    .pSemaphores = &*semaphore,
+    .pValues = &graphicsSignalValue
+};
+
+// Wait for graphics to complete before presenting
+auto result = device.waitSemaphores(waitInfo, UINT64_MAX);
+if (result != vk::Result::eSuccess)
+{
+    throw std::runtime_error("failed to wait for semaphore!");
+}
+
+vk::PresentInfoKHR presentInfo{
+    .waitSemaphoreCount = 0, // No binary semaphores needed
+    .pWaitSemaphores = nullptr,
+    .swapchainCount = 1,
+    .pSwapchains = &*swapChain,
+    .pImageIndices = &imageIndex
+};
+----
+
+このタイムラインセマフォのアプローチは、バイナリセマフォ実装より次の利点があります。
+
+1. *リソース管理の単純化*: フライト中のフレームごとに複数のセマフォではなく、単一のセマフォだけで済みます。
+2. *より明示的な同期*: タイムライン値により、どの操作が互いに依存しているかが明確になります。
+3. *オーバーヘッドの削減*: 同期オブジェクトが少ないため、管理のオーバーヘッドが減ります。
+4. *より柔軟な同期パターン*: タイムラインセマフォは、バイナリセマフォでは難しいより複雑な同期シナリオを可能にします。
+
+タイムラインセマフォは、コンピュートの後にグラフィックスというワークフローのように複数の依存操作がある場合や、ホストとデバイス間の同期が必要な場合に特に有用です。より強力で柔軟な同期メカニズムを提供し、コードを単純化しつつ、より複雑な同期パターンを可能にします。
+
+== パーティクルシステムの描画
+
+先ほど、Vulkan のバッファは複数の用途を持てることを学び、パーティクルを含むシェーダストレージバッファを、シェーダストレージバッファビットと頂点バッファビットの両方付きで作成しました。
+これは、前の章で「純粋な」頂点バッファを使ったのと同じように、描画にシェーダストレージバッファを使えることを意味します。
+
+まず、パーティクル構造体に合わせて頂点入力状態を設定します。
+
+[,c++]
+----
+struct Particle {
+    ...
+
+    static std::array<vk::VertexInputAttributeDescription, 2> getAttributeDescriptions() {
+        return {
+            vk::VertexInputAttributeDescription( 0, 0, vk::Format::eR32G32Sfloat, offsetof(Particle, position) ),
+            vk::VertexInputAttributeDescription( 1, 0, vk::Format::eR32G32B32A32Sfloat, offsetof(Particle, color) ),
+        };
+    }
+};
+----
+
+`velocity` はコンピュートシェーダだけが使うため、頂点入力属性には追加しないことに注意してください。
+
+その後、任意の頂点バッファと同じようにバインドして描画します。
+
+[,c++]
+----
+commandBuffers[frameIndex]->bindVertexBuffers(0, { *shaderStorageBuffers[frameIndex] }, {0});
+
+commandBuffers[frameIndex]->draw( PARTICLE_COUNT, 1, 0, 0 );
+----
+
+== まとめ
+
+この章では、CPU から GPU へ仕事をオフロードするためにコンピュートシェーダを使う方法を学びました。
+コンピュートシェーダがなければ、現代のゲームやアプリケーションの多くのエフェクトは不可能か、はるかに遅くなります。
+しかしグラフィックス以上に、コンピュートには多くの用途があり、この章はその一端を示したにすぎません。
+コンピュートシェーダの使い方を知った今、次のような高度なコンピュートトピックを見てみるとよいでしょう。
+
+* 共有メモリ
+* https://github.com/KhronosGroup/Vulkan-Samples/tree/master/samples/performance/async_compute[非同期コンピュート]
+* アトミック操作
+* https://www.khronos.org/blog/vulkan-subgroup-tutorial[サブグループ]
+
+高度なコンピュートサンプルは、https://github.com/KhronosGroup/Vulkan-Samples/tree/master/samples/api[公式 Khronos Vulkan Samples リポジトリ]にいくつかあります。
+
+link:/attachments/31_compute_shader.cpp[C{pp} コード] /
+link:/attachments/31_shader_compute.slang[slang シェーダ] /
+link:/attachments/31_shader_compute.vert[GLSL 頂点シェーダ] /
+link:/attachments/31_shader_compute.frag[GLSL フラグメントシェーダ] /
+link:/attachments/31_shader_compute.comp[GLSL コンピュートシェーダ]

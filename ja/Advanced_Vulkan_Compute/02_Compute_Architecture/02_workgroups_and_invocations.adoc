@@ -1,0 +1,84 @@
+:pp: {plus}{plus}
+
+= ワークグループと呼び出し: 3D 格子
+
+== はじめに
+
+基本のコンピュートチュートリアルでは、単純な 1 次元ディスパッチを使いました。単純な作業には十分ですが、GPU が実際に仕事をどうスケジュールするかは表しません。高性能カーネルを書くには、Vulkan の 3D グリッドシステムが GPU の物理シリコンへどう対応するかを理解する必要があります。
+
+グリッドシステムはテクスチャへのインデックス付けの便利な手段以上のものです。ワークロードがハードウェア全体でどう分割・スケジュールされるかを定義します。
+
+== 3 層の階層
+
+コンピュートディスパッチを定義するとき、単位の階層を扱います。これらの次元を正しく取るのが高性能への第一歩です。
+
+1.  **グローバルディスパッチグリッド**: ワークロード全体で、`vkCmdDispatch(x, y, z)` で定義します。
+2.  **ワークグループ**: グローバルグリッドはワークグループに分割されます。GPU のハードウェアスケジューラがこれらを物理コンピュートユニットへ割り当てます。
+3.  **呼び出し**: 各ワークグループは、シェーダの `local_size` で定義された複数の個別スレッドを含みます。
+
+=== ワークグループの局所性
+
+前のセクションで述べたように、ワークグループは複数の物理 **Compute Unit**（CU、AMD/Intel）や **Streaming Multiprocessor**（SM、NVIDIA）に分割できません。つまり、ワークグループ内のすべての呼び出しは、同じハードウェアブロック上で物理的に実行されます。
+
+この局所性は重要な設計制約です。同じワークグループの呼び出しが **LDS**（Local Data Store）や **groupshared** メモリと呼ばれる高速なローカルメモリを共有できますが、同時にワークグループサイズは単一 CU/SM の物理リソースに制限されます。ワークグループが大きすぎると、GPU は単純にスケジュールできません。
+
+== インデックス付けの数学
+
+Vulkan はグリッド内の位置を知るための組み込み変数をいくつか提供します。Slang では、通常 `SV_DispatchThreadID`、`SV_GroupThreadID`、`SV_GroupID` のようなセマンティクスを使ってエントリポイントのパラメータとして渡します。
+
+典型的なシェーダでの関係を見てみましょう。
+
+[source,slang]
+----
+[numthreads(16, 16, 1)]
+void main(
+    uint3 groupID      : SV_GroupID,           // gl_WorkGroupID
+    uint3 localID      : SV_GroupThreadID,     // gl_LocalInvocationID
+    uint3 globalID     : SV_DispatchThreadID   // gl_GlobalInvocationID
+) {
+    // globalID: グリッド全体におけるこのスレッドの一意なインデックス
+    // 式: globalID = groupID * numthreads + localID
+    uint x = globalID.x;
+    uint y = globalID.y;
+
+    // ピクセル (x, y) を処理
+}
+----
+
+2D または 3D グリッドを使うと、画像処理や物理シミュレーションのような空間的タスクがはるかにすっきりします。1D インデックスを手動計算する代わりに、データ構造に合った `.xy` や `.xyz` 座標を使えます。
+
+== 最適なサイズの選択
+
+よくある誤りは、データに「収まる」という理由だけでワークグループサイズを選ぶことです。たとえば 10x10 画像を処理するとき、(10, 10, 1) のワークグループを選ぶかもしれません。
+
+しかし GPU は呼び出しを 32 または 64 の束——**サブグループ**、**ワープ**（NVIDIA）、**ウェーブフロント**（AMD）——で実行します。ワークグループサイズがハードウェアのネイティブ束サイズの倍数でないと、シリコンが遊んでしまいます。これを**内部断片化**と呼びます。
+
+=== 32/64 の規則
+
+*   **NVIDIA** GPU は通常 **32**（ワープ）の倍数を好みます。
+*   **AMD** GPU は通常 **64**（ウェーブフロント）の倍数を好みますが、現代の RDNA アーキテクチャは 32 も扱えます。
+*   **Intel** GPU は可変サイズ（8、16、32）です。
+*   **モバイル** GPU は最も多様です。Arm Mali と Qualcomm Adreno はサブグループサイズを 4 から 128 のどこでも報告し得、ワークグループあたりの最大呼び出し数は 128 程度まで低いことがあります（デスクトップでは 1024）。ハードコードせず、xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/02_android_compute.adoc[Android 上のコンピュート] で説明するように実行時に問い合わせてください。
+
+多くの*デスクトップ*ワークロードでは、ワークグループサイズ **64** または **256**（例: `16x16` や `8x8x4`）が安全で移植性の高い選択です。ほとんどのハードウェアで **SIMD**（Single Instruction, Multiple Data）レーンを満杯に保てます。モバイルでは、デバイスが報告する `maxComputeWorkGroupInvocations` を尊重し、実際の `subgroupSize` の倍数になる小さめのグループを好みます。
+
+== 仕事のディスパッチ
+
+`vkCmdDispatch(groupCountX, groupCountY, groupCountZ)` を呼ぶとき、`local_size` ブロックが何回繰り返されるかを定義しています。
+
+サイズ `width` x `height` の画像とワークグループサイズ `16x16` があるとき、ディスパッチは次のようになります。
+
+[source,cpp]
+----
+uint32_t groupCountX = (width + 15) / 16;
+uint32_t groupCountY = (height + 15) / 16;
+commandBuffer.dispatch(groupCountX, groupCountY, 1);
+----
+
+「切り上げ」（`(width + 15) / 16`）に注意してください。画像サイズが 16 の完全な倍数でなくても、最後の数ピクセルを取りこぼさないようにします。シェーダ内では境界チェック `if (x < width && y < height)` を使います。
+
+== 次へ
+
+ワークグループのハードウェアへの対応を理解することは、GPU コンピュートの基盤です。しかし仕事をハードウェアへ載せるのは話の一部にすぎません。そのハードウェアを忙しく保つ必要もあります。次のセクションでは **占有率** と、VRAM の巨大なレイテンシをどう隠蔽するかを扱います。
+
+xref:Advanced_Vulkan_Compute/02_Compute_Architecture/01_introduction.adoc[前へ: はじめに] | xref:Advanced_Vulkan_Compute/02_Compute_Architecture/03_occupancy_and_latency_hiding.adoc[次へ: 占有率とレイテンシ隠蔽]

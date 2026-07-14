@@ -1,0 +1,73 @@
+:pp: {plus}{plus}
+= コンピュートバリデーションと GPU 支援デバッグ
+
+コンピュートシェーダのデバッグは悪名高く難しいです。CPU コードと異なり、ブレークポイントを簡単に設定したり、ロジックを一行ずつステップ実行したりできません。ほとんどのエラー——範囲外バッファアクセスなど——は、単純にゴミデータを生むか、最悪の場合、何が悪かったかについてほとんど情報を提供しない「Device Lost」エラーになります。
+
+== GPU-AV
+
+そこで **GPU-AV**（GPU-Assisted Validation）が登場します。標準 Vulkan Validation Layers の一部である GPU-AV は、実行時にシェーダへ少量の診断コードを直接注入することで働きます。この **インスツルメンテーション** により、レイヤはそうでなければ見えないエラーを追跡・報告できます。
+
+=== C++ での GPU-AV の有効化
+GPU-AV はコード変更なしに、Vulkan SDK に同梱される GUI ツール **Vulkan Configurator**（`vkconfig`）でも有効にできます。あるいは、Vulkan インスタンス作成時に `vk::ValidationFeaturesEXT` 構造体を渡してプログラムで設定します。
+
+[source,cpp]
+----
+// ValidationFeaturesEXT 経由で GPU-AV を有効化
+std::vector<vk::ValidationFeatureEnableEXT> enabledFeatures = {
+    vk::ValidationFeatureEnableEXT::eGpuAssisted,
+    vk::ValidationFeatureEnableEXT::eGpuAssistedReserveBindingSlot
+};
+
+vk::ValidationFeaturesEXT validationFeatures {
+    .enabledValidationFeatureCount = static_cast<uint32_t>(enabledFeatures.size()),
+    .pEnabledValidationFeatures = enabledFeatures.data()
+};
+
+vk::InstanceCreateInfo createInfo {
+    .pNext = &validationFeatures,
+    // ... その他のセットアップ ...
+};
+----
+
+=== GPU-AV が検出するもの
+* **範囲外アクセス**: バッファに 50 要素しかないのに `data[100]` から読もうとすると、GPU-AV が捕捉します。
+* **無効ポインタ**: **Buffer Device Address（BDA）** 使用時、null または無効ポインタを参照しているかを GPU-AV が検出できます。
+* **未初期化ディスクリプタ**: シェーダが触るすべてのディスクリプタが正しくバインド・初期化されていることを保証します。
+
+== シェーダ Printf: カーネルの内部を見る
+
+GPU-AV はエラー捕捉に優れますが、変数の値を見たいだけのこともあります。そこで `debugPrintfEXT`（`GL_EXT_debug_printf` 拡張から）が最良の友になります。
+
+=== シェーダ内（Slang）
+Slang は `printf` を直接サポートし、基盤の Vulkan 拡張へマップします。
+
+[source,slang]
+----
+// コンピュートシェーダでの printf の使用
+void computeMain(uint3 globalID : SV_DispatchThreadID) {
+    float some_value = calculate_complex_math(globalID.x);
+
+    if (some_value < 0.0f) {
+        // 出力はアプリケーションのデバッグコールバックに現れる
+        printf("Thread %d: Warning! Negative value detected: %f\n", globalID.x, some_value);
+    }
+}
+----
+
+=== ホストコード側
+`printf` の出力を見るには、次が必要です。
+
+1. デバイスで `VK_KHR_shader_non_semantic_info` 拡張を有効にする。
+2. 標準の **Debug Messenger** コールバックを登録する。シェーダからの出力は、printf 呼び出しとして識別するメッセージ ID 付きの `VkDebugUtilsMessengerCallbackDataEXT` として届きます。
+
+== 出力の解釈
+
+バリデーションエラーや `printf` が起きると、出力は冗長になり得ます。次を探してください。
+
+* **シェーダモジュール**: どのシェーダがメッセージを引き起こしたか。
+* **命令オフセット**: 失敗した特定の SPIR-V 命令。
+* **値**: `printf` ではフォーマット済み文字列。GPU-AV では無効インデックスやポインタアドレスかもしれません。
+
+GPU-AV と `printf` には大きな性能コストがありますが、開発には不可欠です。GPU の「ブラックボックス」を、自信を持って複雑で信頼できるコンピュートパイプラインを構築できる透明な環境に変えます。
+
+xref:Advanced_Vulkan_Compute/11_Diagnostics_and_Refinement/01_introduction.adoc[前へ: はじめに] | xref:Advanced_Vulkan_Compute/11_Diagnostics_and_Refinement/03_assistant_led_optimization.adoc[次へ: AI 支援最適化]

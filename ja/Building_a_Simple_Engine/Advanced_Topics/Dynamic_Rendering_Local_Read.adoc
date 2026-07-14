@@ -1,0 +1,39 @@
+= VK_KHR_dynamic_rendering_local_read — カラーデータをタイルメモリに保つ
+
+Dynamic Rendering では、完全なレンダーパス／サブパスなしで描画できます。`VK_KHR_dynamic_rendering_local_read` 機能は小さくて便利な追加です。対応ハードウェアで、タイル／ローカルメモリ経路経由でアタッチメントからの同一パス読みを許します。
+
+== なぜ重要か
+
+一部のポストライティング効果や resolve 風のステップは、書き込んだ直後のカラーを読みます。この機能があれば、ドライバはその読みを VRAM 往復ではなく高速なオンチップメモリから満たせます。
+
+== 私たちのアプローチ
+
+* 機能があれば有効化し、無い場合でも互換なコードパスを保つ。
+* レイアウト遷移の前にはレンダリングインスタンスを終了する。この機能は任意のバリア誤用を許さない — 通常の Synchronization 2 ルールが適用される。
+
+== 実践的な指針
+
+* 新しい API 面ではなく、最適化として扱う。
+* stage／access マスクを精密に保つ。このサンプルでは明確さのため、遷移をアクティブなレンダリングの外に保つ。
+
+== コードの参照先
+
+* 機能検出と有効化:
+** `renderer_core.cpp`（デバイス機能有効化経路）
+* Dynamic rendering のセットアップ + バリア:
+** `renderer_rendering.cpp`
+** `renderer_pipelines.cpp`
+
+== 今後のアイデア
+
+local-read をより直接的に示したい場合:
+
+* 現在のカラーアタッチメントを読む小さな「同一パス」エフェクトを追加する（例: 単純なローカルコントラストやエッジ強調）。
+* 現在のデバイスで機能が有効かどうかを表示するデバッグ HUD を追加する。
+* 固定カメラパスを使い、タイルベース GPU（モバイル）で local-read あり／なしのパフォーマンスを比較する。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Rendering_Pipeline_Overview.adoc[レンダリングパイプライン概要]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_and_Streaming.adoc[同期とストリーミング]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_2_Frame_Pacing.adoc[フレームペーシング]

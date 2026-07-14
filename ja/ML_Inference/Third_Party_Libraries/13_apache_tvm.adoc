@@ -1,0 +1,159 @@
+:pp: {plus}{plus}
+
+= Apache TVM: エンドツーエンドコンパイラスタック
+
+== 概要
+
+Apache TVM は、高レベルのモデルを Vulkan/OpenCL GPU、CPU（LLVM）、各種アクセラレータ向けの最適化された実行ファイルへ変換する、エンドツーエンドの ML コンパイラスタックです。Relay（グラフ IR）を中心に据え、特定のデバイス向けに自動チューニングできるスケジューリング機構を備えています。コンパイラの動作を細かく制御し、実測できることを重視するなら、グラフレベルとカーネルレベルの両方に調整ツマミが用意されています。
+
+== 必要なツール
+
+最初の一歩は Python です。NumPy、ONNX リーダー、そして TVM 本体が必要です。インストール方法はプラットフォームによって異なります——事前ビルド済みパッケージを使うか、ソースからビルドします。まず Python で動作を確認してから、必要に応じて C/C++ 統合を追加すれば十分です。
+
+== TVM が適切な場面
+
+Vulkan を主軸にした小さなランタイムでの事前コンパイル（AOT）が最優先なら、多くの場合 xref:ML_Inference/Third_Party_Libraries/12_iree.adoc[IREE] のほうが簡単です。TVM を選ぶべきなのは次の場合です。
+
+- 特定の GPU や SoC でデバイス固有の自動チューニングによりさらなる性能を引き出したい
+- 幅広いフレームワークからのインポート（ONNX、TensorFlow、PyTorch の TorchScript）が必要
+- Vulkan と OpenCL という複数の GPU オプションを使い分けたい
+- スケジュールをカスタマイズしたり、新しいカーネルを自分で導入したりする柔軟性が欲しい
+
+== コマンドを打つ前の考え方
+
+Relay がモデルの表現形式です。Relay へインポートし、`target="vulkan"` でビルドすると、TVM がカーネルと小さなランタイムラッパーを生成します。特定の端末や内蔵 GPU でさらに速度が必要な場合は、自動スケジューラが実際の計測結果に基づいてより良いスケジュールを探索し、その結果を使って再ビルドします。まずは正しく動くベースラインを作り、重要な部分だけをチューニングするという順序を守りましょう。
+
+== エンドツーエンドの Vulkan ワークフロー（実践）
+
+TVM を Vulkan で動かす最初の一歩は、ONNX から Relay へのインポート、`target="vulkan"` でのビルド、成果物の保存、TVM ランタイムでの実行です。Python での流れを示します。
+
+[source,python]
+----
+import onnx
+import numpy as np
+import tvm
+from tvm import relay
+from tvm.contrib import graph_executor
+
+# 1) ONNX を読み込み Relay へ変換
+onnx_model = onnx.load("model.onnx")
+input_name = "input"
+shape_dict = {input_name: (1, 3, 224, 224)}  # モデルに合わせて調整
+mod, params = relay.frontend.from_onnx(onnx_model, shape_dict, freeze_params=True)
+
+# 2) Vulkan 向けにビルド
+target = tvm.target.Target("vulkan")
+with tvm.transform.PassContext(opt_level=3):
+    lib = relay.build(mod, target=target, params=params)
+
+# 3) Vulkan デバイスで実行
+dev = tvm.vulkan(0)
+rt_mod = graph_executor.GraphModule(lib["default"](dev))
+
+x = np.random.randn(1, 3, 224, 224).astype("float32")
+rt_mod.set_input(input_name, tvm.nd.array(x, device=dev))
+rt_mod.run()
+out = rt_mod.get_output(0).numpy()
+print(out.shape)
+
+# 4) デプロイ用の成果物をエクスポート（グラフとパラメータを埋め込んだ共有ライブラリ）
+lib.export_library("model_vulkan.so")
+----
+
+== 最適化の前に正しさを確認する
+
+チューニングを始める前に、ゴールデンリファレンスと数値が一致することを確認します。手早い ONNX Runtime によるチェック方法を示します。
+
+[source,python]
+----
+import onnxruntime as ort
+
+sess = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+ref = sess.run(None, {input_name: x.astype(np.float32)})[0]
+
+tv = rt_mod.get_output(0).numpy()
+mae = np.mean(np.abs(tv - ref))
+print("MAE:", mae)
+----
+
+エクスポートした `.so` は、Python や C++ から読み込める自己完結型の成果物です。TVM ランタイムが Vulkan 側の処理をすべて担うため、SPIR-V を自前で書く必要はなく、TVM が生成・発行を代行してくれます。
+
+== 最小限の C++ ランタイム（概略）
+
+C++ での読み込みを高いレベルで概観します。細かいヘルパー関数の名前はバージョンによって変わるので、正確な内容は使っているバージョンの TVM ランタイムのドキュメントで、ヘッダファイルと突き合わせて確認してください。
+
+[source,cpp]
+----
+#include <tvm/runtime/module.h>
+#include <tvm/runtime/packed_func.h>
+
+int main() {
+  tvm::runtime::Module mod = tvm::runtime::Module::LoadFromFile("model_vulkan.so");
+
+  DLDevice dev{kDLVulkan, 0};
+
+  tvm::runtime::Module gmod = mod.GetFunction("default")(dev);
+  tvm::runtime::PackedFunc set_input = gmod.GetFunction("set_input");
+  tvm::runtime::PackedFunc run       = gmod.GetFunction("run");
+  tvm::runtime::PackedFunc get_output= gmod.GetFunction("get_output");
+
+  // 入力 NDArray を割り当てて set_input へ渡す（省略）
+  run();
+  // get_output(0, output);
+  return 0;
+}
+----
+
+フットプリントを最小化したい場合は、AOT エグゼキュータ + C ランタイム（CRT）が選択肢になります——C 関数を直接呼び出す方式で、ビルドは複雑になりますが、組み込み向けに適しています。
+
+== さらなる性能が必要ならチューニングを
+
+ベースラインが正しく動作し計測できていることを確認したら、自動スケジューラ（MetaSchedule/Ansor）が実際のデバイス上で速いスケジュールを探索してくれます。実測値に基づいて探索し、CI ではその結果の記録を再利用できます。
+
+[source,python]
+----
+from tvm import meta_schedule as ms
+
+with tvm.transform.PassContext(opt_level=3):
+    tuned_lib = ms.tune_relay(
+        mod=mod,
+        params=params,
+        target=target,
+        work_dir="tuning_logs",
+        max_trials_global=1000,
+    )
+
+tuned_lib.export_library("model_vulkan_tuned.so")
+----
+
+最も効果が大きいのはモバイルや内蔵 GPU です。デスクトップの単体 GPU ではチューニングなしでも十分に良い結果が出ることが多いです。
+
+== Vulkan アプリケーションへの統合
+
+最も簡単な方法は、TVM にコンパイル済みモジュール用の Vulkan コンテキストを持たせ、境界をホストバッファでやり取りすることです。Vulkan での前処理→TVM への入力コピー→実行→後処理用に結果をコピーして戻す、という流れになります。
+
+より密な相互運用（既存の `VkDevice` をラップする、メモリを共有するなど）は TVM 内部の Vulkan 統合の仕組みに依存します。ハンドルレベルの相互運用は TVM が公開している範囲では限定的です。多くの場合はシンプルなコピーから始め、パイプラインが正しく動くことを確認した後でデータ移動の最適化に取り組むのがよいでしょう。
+
+=== ランタイムについて（避けられない前提）
+
+TVM はコンパイル済みの成果物（共有ライブラリまたは AOT モジュール）を、TVM ランタイム（グラフエグゼキュータまたは AOT/CRT）経由で実行します。Vulkan アプリにおいては ONNX Runtime や TFLite と同様の構図です——TVM ランタイムをリンクし、成果物を読み込み、入力をセットし、実行し、出力を取得します。
+
+TVM の Vulkan バックエンドは最終的に SPIR-V を生成しますが、現状では「スタンドアロンの SPIR-V を取り出して、自前のホストスケジューリングにそのまま組み込む」というクリーンで安定した経路は用意されていません。カーネルだけを取り出して自作エンジンのホスト側で再実装しようとすると、ランタイムが管理している ABI（ディスクリプタセットのレイアウト、バッファのバインド順序、パイプラインのライフタイム、同期など）をすべて再現することになります。実務上は、他のモデルランタイムと同様に、TVM ランタイムをそのまま組み込むのが現実的です。
+
+== Android・組み込み向け
+
+Vulkan であればベンダー間で移植性を保てます。対象の ABI 向けにランタイムをクロスコンパイルし、コンパイル済みモジュールをデプロイし、実機上のランナー（あるいは RPC 経由）で自動スケジューラのチューニングを行います。非常に小さなデバイスでは、AOT + CRT によるフットプリントを検討してください。
+
+== 数値精度とレイアウト
+
+コンパイラ駆動型のアプローチではよくあることですが、レイアウトが性能に大きく影響します。チャンネルを先に置くか後に置くかで性能に大差が出ます。Relay の変換後は、コンパイラが選んだレイアウトと前処理のレイアウトを一致させてください。安全に使えるなら fp16 を有効にして再計測してください。多くのカーネルではメモリトラフィックが支配的な要因です。
+
+== トラブルシューティング
+
+`from_onnx` が失敗する場合: モデルを簡略化する（ONNX シンプリファイアを使う）、パラメータを固定する、すべての入力形状を明示的に指定してください。ランタイムの結果がずれる場合は、ゴールデンリファレンスと層ごとに比較し、最初にずれが生じた箇所を先に修正してから続けてください。
+
+== NNEF との相互運用
+
+TVM で安定している経路は ONNX 経由です。元のモデルが NNEF 形式なら、まず NNEF→ONNX へ変換し、その後は上記の ONNX→Relay→Vulkan という流れになります。NNEF の詳細な章と同じ指針に従い、堅牢さを保ってください。
+
+xref:ML_Inference/Third_Party_Libraries/12_iree.adoc[前へ: IREE] | xref:ML_Inference/Third_Party_Libraries/14_mojo_max.adoc[次へ: Mojo / MAX]

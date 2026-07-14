@@ -1,0 +1,42 @@
+= 分離 Image／Sampler ディスクリプタ — いつ、なぜ
+
+Vulkan では、イメージビューとサンプラーを一緒（combined image sampler）にも、別々にもバインドできます。Combined バインディングは教えやすく保守しやすいです。分離バインディングは柔軟性を与えます（例: 1 つのサンプラーを多くのイメージで再利用; サンプラーステートだけを変更）。
+
+このサンプルでは、ストリーミング、同期、パス構造といった大きなエンジン概念に集中しているあいだ、ディスクリプタモデルを単純に保つため、デフォルトで combined image sampler を使います。
+
+== 私たちのデフォルト
+
+可読性のため、またほとんどのマテリアルが実行時にサンプラーを差し替えないため、このサンプルでは combined image sampler を優先します。
+
+== いつ分けるか
+
+* 多くのテクスチャにわたってサンプラーステート（例: anisotropy の有効／無効）を切り替えたいが、すべてのディスクリプタを更新したくないとき。
+* サンプラーオブジェクトのライブラリ（point／linear／aniso／wrap／clamp）があり、イメージと組み合わせたいとき。
+
+== 実践的な指針
+
+* 教育向けにはレイアウトを小さく安定に保つ。
+* 分離バインディングを導入するなら、寿命ルールを明確に文書化する: イメージとサンプラーは独立に変わり得る。
+
+== コードの参照先
+
+* テクスチャとサンプラーの作成:
+** `renderer_resources.cpp`
+* ディスクリプタレイアウトとバインディング:
+** `renderer_pipelines.cpp`
+* フレームごとの安全な時点でのディスクリプタ更新:
+** `renderer_rendering.cpp`
+
+== 今後のアイデア
+
+分離 image／sampler ディスクリプタを具体的に示したい場合:
+
+* 小さなサンプラー「ライブラリ」（point／linear／aniso、wrap／clamp）を作り、UI からサンプラーインデックスを切り替える。
+* 大きなテクスチャテーブルで共有サンプラーを使い、ストリーミング中のディスクリプタ更新量を減らす。
+* マテリアルごとのサンプラー選択を追加する（例: ピクセルアート看板には nearest）。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Descriptor_Indexing_UpdateAfterBind.adoc[Descriptor Indexing UpdateAfterBind]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Mipmaps_and_LOD.adoc[ミップマップと LOD]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_and_Streaming.adoc[同期とストリーミング]

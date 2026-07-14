@@ -1,0 +1,147 @@
+:pp: {plus}{plus}
+
+= Goose: 自律エージェントとローカル知能
+
+== はじめに: 自律エージェント
+
+JetBrains AI や Visual Studio Copilot のような IDE 統合アシスタントが深いリアルタイムコード提案に焦点を当てる一方、**Goose** は開発ライフサイクルの根本的なシフト——**自律 AI エージェント**——を表します。
+
+本章では、すべてのプラットフォーム向けの **共通地点** を確立します。Linux 上の CLion ユーザー、Windows 上の Visual Studio 開発者、macOS 上の Xcode 専門家のいずれであっても、エージェンティックワークフローはあなたを「コードライター」から「エンジニアリングディレクター」へ変えるユニバーサルブリッジです。
+
+== コア概念: タスク指向エージェント
+
+「伝統的アシスタント」と「AI エージェント」の主な違いは **Agency（主体性）** です。受動的アシスタントは `VkDescriptorPool` 作成のコードスニペットを渡し、あなたがコピー、ペースト、手動修正しなければなりません。対照的に、能動的エージェントは同じディスクリプタプールを `VulkanContext.cpp` に作成し、ビルドを走らせて動くことを保証するようタスクを与えられます。
+
+エージェントはコードを提供するだけでなく、**行動** します。ヘッダを読み、C{pp} を書き、ターミナルを開き、`cmake` を実行し、エラーを分析し、ビルドが通るまで反復します。
+
+前の章ではワークフロー内の統合 AI エージェントの使い方を特定しましたが、本章は他ツールやシステム統合ステップを通常除外する内側のワークフローをカバーします。システム全体のエージェントを持つことで、外部 RenderDoc インスタンスとの深い統合やシステム構成のチューニング支援が可能になります。
+
+== ネイティブエージェントのセットアップ: Goose
+
+Goose はローカルツールと直接動くよう設計されたオープンソース自律エージェントです。「ネイティブに」セットアップするとは、マシン上の本物の開発者として行動する権限を与えることです。
+
+=== 1. インストール
+
+Goose はスタンドアロン CLI ツールとしてインストールするか、ワークスペースに統合できます。
+
+**macOS と Linux 向け:**
+[source,bash]
+----
+curl -fsSL https://block.github.io/goose/install.sh | bash
+----
+
+**Windows 向け:**
+PowerShell インストーラもありますが、Windows で最も制御するには手動インストールを推奨します。
+
+1.  link:https://goose-docs.ai/[goose-docs.ai] へ行き、Goose 実行ファイルをダウンロード。
+2.  フォルダを解凍し、恒久的な場所に置く（例: `C:\Programs\Goose`）。
+3.  簡単アクセスのため `goose.exe` をスタートメニューにピン留め。
+4.  **注意:** 高度な手動設定には `config.yaml` の場所が必要になることがあります。Windows では通常次にあります: `C:\Users\[YourUserName]\AppData\Roaming\Block\goose\config\config.yaml`。
+
+=== 2. Goose に「手」を与える
+
+インストール後、Goose は環境へのアクセスが必要です。プロジェクトのルートディレクトリ内でセッションを開始します。
+
+[source,bash]
+----
+cd /path/to/your/vulkan_project
+goose session
+----
+
+ここから、ファイルシステムの読み取り、シェルコマンド実行、さらには Vulkan 仕様の検索を可能にする **ツール**（Model Context Protocol 経由）を Goose に与えられます。
+
+==== ファイルシステムアクセスの追加（MCP）
+Goose がローカルファイルと確実にやり取りできるよう、カスタム拡張を追加すべきです。
+
+1.  **Node.js をインストール:** link:https://nodejs.org/[nodejs.org] から Windows Installer（.msi）で LTS 版をダウンロード。`node --version` と `npm --version` で確認。
+2.  **Goose で拡張を追加:** **Extensions -> Add Custom Extension** へ行き、フィールドを埋める:
+    *   **Extension Name:** `Filesystem Access`
+    *   **Type:** `STDIO`
+    *   **Description:** `Allows goose to access project files.`
+    *   **Command:** `npx -y @modelcontextprotocol/Filesystem_Access [filepath]`（`[filepath]` をフォワードスラッシュのプロジェクトパスに置き換え、例: `C:/Users/Dev/VulkanProject`）。
+    *   **Timeout:** `300`
+3.  拡張を有効にするため **Goose を再起動**。
+
+== モデル戦略: ハイブリッドクラウドとローカルの役割
+
+エージェントを効果的に動かすため、**ハイブリッドモデル戦略** を推奨します。このアプローチは高レベルのアーキテクチャ「推論」と低レベル・ゼロレイテンシの「実装」のバランスを取ります。
+
+=== 1. クラウドプランナ（高推論）
+
+初期セッションセットアップと複雑な計画には、**Claude 4.6** や **GPT-5.3** のような高推論クラウドモデルを使うべきです。これらのモデルはグラフィックスパイプラインの抽象要件の理解と、行う作業の「契約」作成に優れます。
+
+Goose でクラウドプロバイダを設定するには:
+
+1.  Goose Settings -> Models -> Configure Providers を開く。
+2.  **Cloud:** **Anthropic** を選択。link:https://platform.claude.com/[Claude Console] からの API キーが必要。キーを貼り付けて送信。
+
+=== 2. ローカルランナ（実装スペシャリスト）
+
+高レベル計画が確立されたら、「アクティブな手」を **Ollama** 経由で動くローカルモデルへ切り替えられます。これが「実装」スペシャリスト——高速、無料、安全——です。
+
+**Ollama のセットアップ:**
+
+1.  link:https://ollama.com[ollama.com] からネイティブインストーラをダウンロード。
+2.  **設定:** Ollama 設定で、十分な空きのあるドライブに「Model location」を選ぶ。
+3.  **モデルのダウンロード:** PowerShell を開き、最新スペシャリストを取得する次のコマンドを実行:
++
+[source,bash]
+----
+# Download the 17B model (Llama 4) for low-latency coding
+ollama run llama4
+
+# Download the 30B Qwen model for complex architectural implementation
+# NOTE: qwen3-coder:30b requires 20+ GB of VRAM even at 4-bit quantization.
+# Most consumer GPUs (16 GB or less) will not have sufficient VRAM when a
+# Vulkan application is also running. Use qwen3-coder:14b as a practical
+# alternative on systems with 16 GB or less.
+ollama run qwen3-coder:30b
+
+# Download the 12B Mistral-Nemo model for balanced reasoning and context
+ollama run mistral-nemo
+----
+4.  **Goose に接続:** Goose Settings -> Models -> Configure Providers で **Ollama** を見つけ、configure をクリック。ドロップダウンから希望のモデル（例: `qwen3-coder:14b`）を選択。
+
+=== 3. ハイブリッドワークフローの実装
+
+実世界のセッションでは、プロファイルを切り替えるか特定ターゲットでセッションを開始することでこれらのモデルを活用します。**計画フェーズ** ではクラウドモデルでセッションを始め、現在の `VulkanContext` を分析してシャドウマッピングのような機能の複数ステップ計画を草案するよう頼みます。計画ができたら、ローカル Ollama プロファイルへ切り替えて **実装フェーズ** へ移り、必要なボイラープレートコードを実装するよう Goose にその計画に従わせます。
+
+このワークフローは、大量実装フェーズ中に VRAM を Vulkan アプリ用に保ちつつ、重要な設計フェーズではクラウドモデルの高推論能力を使うことを保証します。
+
+==== セキュリティと権限（VS Code）
+VS Code 内で Goose や他の AI エージェント（Claude Code など）を使う場合、すべてのコマンドで許可を求められることがあります。より自律的（だがリスクが高い）ワークフローを有効にするには:
+1.  `Ctrl + ,` で Settings を開く。
+2.  `permissions` を検索。
+3.  AI 拡張について、**Initial Permission Mode** を `bypassPermissions` に設定。
+4.  **Allow Dangerously Skip Permissions** を有効化。
+*注意:* AI が確認なしでスクリプト実行とファイル変更を行えるため、制御された環境（VM やコンテナなど）でのみ行ってください。
+
+== ハードウェア要件: VRAM 予算
+
+AI 支援 Vulkan 開発の最大の課題は **VRAM 競合** です。Vulkan アプリとローカル AI モデルの両方が GPU メモリを必要とします。
+
+=== VRAM 予算式
+
+ローカルエージェントを始める前に、「VRAM 監査」を行わなければなりません。VRAM 16GB の典型的な開発者マシンでは、Vulkan アプリが約 4.5GB（1440p の現代 deferred レンダラ）を使い、OS と IDE オーバーヘッドが約 1.5GB を消費することがあります。これで AI モデル用に約 10GB が残ります（`16 - (4.5 + 1.5) = 10GB`）。
+
+=== 量子化戦略
+
+モデルのメモリフットプリントを減らすため **量子化**（圧縮）を使います。Ollama はこれを自動処理しますが、トレードオフを意識すべきです。**4-bit（Q4_K_M）** 量子化がしばしば「スイートスポット」で、75% 小さく、推論の損失は約 5% のみです。**8-bit（Q8_0）** へ上げるとより高精度な推論が得られますが、VRAM は大幅に増えます。
+
+NOTE: 4-bit 量子化でも、`qwen3-coder:30b` は約 20 GB の VRAM を必要とします——ほとんどのコンシューマグラフィックスカードが提供する以上です。Vulkan アプリを同時実行する 16 GB GPU では予算を超えます。16 GB VRAM 予算に余裕を持って収まる実用代替として `qwen3-coder:14b`（Q4_K_M で約 9 GB）を使ってください。
+
+GPU の VRAM が尽きると、システムは **TDR（Timeout Detection and Recovery）** をトリガし、AI と Vulkan レンダラの両方をクラッシュさせることがあります。常に 1–2GB の「安全マージン」を残してください。
+
+== 意思決定フレームワーク: IDE-AI 対 Goose
+
+ツール間で決めるとき、「インナーループ」タスク——オートコンプリート、コード説明、現在ファイルの構文エラー修正——には **IDE アシスタント**（JetBrains AI や Copilot など）を使います。新しい `PostProcess` クラスの追加や、生ポインタからスマートポインタへのエンジン全体リファクタのような幅広い変更を含む「アウターループ」タスクには **Goose** へ切り替えます。
+
+== まとめ: 共通地点への到達
+
+これで **共通地点** に到達しました。CLion、Visual Studio、Xcode のいずれから来ても、コードベースに対して行動できるネイティブエージェント（Goose）、特化コーディングアシスタントを動かすローカルモデル（Ollama）、Vulkan アプリのニーズを尊重する VRAM 予算を手にしています。
+
+この統一環境こそ、**協調エンジニアリング** の本格的な仕事が始まる場所です。続く章では、このセットアップをすべての Vulkan 開発演習のベースラインとして扱います。
+
+次は環境パズルの最後のピース——**コンテキストブリッジ（MCP）**——を見ます。
+
+xref:AI_Assisted_Vulkan/02_environment_setup/01_introduction.adoc[前へ: 環境のはじめに] |  xref:AI_Assisted_Vulkan/02_environment_setup/06_mcp_context_bridge.adoc[次へ: コンテキストブリッジ（MCP）]

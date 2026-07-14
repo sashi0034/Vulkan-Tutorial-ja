@@ -1,0 +1,191 @@
+= ライティングモデル
+
+この節では、実装詳細より概念の理解に焦点を当て、コンピュータグラフィックスで使われるさまざまなライティングモデルを探ります。異なるライティングモデルが光と表面の相互作用をどうシミュレートするか、利点と限界、各手法をいつ使うかを議論します。
+
+この章では Physically Based Rendering（PBR）とその他のライティングモデルを紹介します。ここで扱う概念は、マテリアルシステムに metallic-roughness ワークフローの PBR を使う glTF を扱う Loading_Models の章など、後の章で適用されます。PBR を含む異なるライティングモデルの背後にある理論を理解することで、glTF モデルが提供するマテリアルプロパティをより良く活用し、レンダリング能力を拡張できます。
+
+== 光と表面の相互作用の理解
+
+具体的なライティングモデルに入る前に、現実世界で光が表面とどう相互作用するかを理解することが重要です。
+
+* *反射*: 光が表面で跳ね返る
+* *吸収*: 光が表面に吸収され熱に変換される
+* *透過*: 光が表面を通過する（透明マテリアル）
+* *散乱*: 光がマテリアル内でさまざまな方向に散乱する
+
+これらの相互作用の起き方は、マテリアルプロパティと光の特性に依存します。
+
+=== 反射の種類
+
+反射には主に 2 種類あります。
+
+* *拡散反射*: 光が多くの方向に散乱し、マットな外観を作る
+* *鏡面反射*: 光が特定の方向に反射し、ハイライトを作る
+
+現実世界のマテリアルの多くは、拡散反射と鏡面反射の組み合わせを示します。
+
+== ライティングモデルの進化
+
+コンピュータグラフィックスのライティングモデルは時間とともに大きく進化し、それぞれが光と表面の相互作用のシミュレートに独自のアプローチを持ちます。
+
+=== 初期のライティングモデル
+
+==== フラットシェーディング
+
+最も単純なライティングモデルで、各ポリゴンは法線と光方向に基づく単一の色が割り当てられます。ポリゴンの縁が見えるファセット状の外観になります。
+
+* *利点*: 計算が非常に速い
+* *欠点*: 非現実的な外観、見えるポリゴン縁
+* *使うとき*: 非常に低性能なデバイスや、様式化されたレンダリング
+
+==== Gouraud シェーディング
+
+フラットシェーディングの改善で、ライティングは *頂点ごとに一度計算* され、ポリゴン全体に補間されます。この頂点ごとのアプローチはピクセルごとの計算より大幅に速いですが、ポリゴン中央に現れるべき鏡面ハイライトはどの頂点にも存在しないため完全に欠けることがあります。
+
+* *利点*: フラットより滑らかな外観で、比較的速い
+* *欠点*: 頂点レベル計算のため鏡面ハイライトを正確に表現できない
+* *使うとき*: Phong シェーディングが高すぎる低性能デバイス
+
+==== Phong ライティングモデル
+
+1975 年に Bui Tuong Phong が開発した、最も広く使われた伝統的ライティングモデルの一つです。*ピクセルごとのシェーディング*（Phong Shading）と使うと、法線がポリゴン全体に補間され、すべてのピクセルでライティングが計算され、Gouraud の頂点ごとアプローチよりはるかに正確な鏡面ハイライトが得られます。モデルは 3 つのコンポーネントでライティングを計算します。
+
+* *Ambient*: 間接照明をシミュレートする一定の光レベル
+* *Diffuse*: 全方向に散乱する光（Lambert の余弦法則）
+* *Specular*: 光沢ハイライト（反射ベクトルと視線ベクトルのべき乗関数）
+
+特徴:
+
+* *利点*: 多くのマテリアルで妥当なリアリズム、直感的なパラメータ、ピクセルごとシェーディングで正確な鏡面ハイライト
+* *欠点*: 物理的に正確ではない、特定のライティング条件下で人工的に見えることがある
+* *使うとき*: PBR が高すぎる単純なリアルタイムアプリケーション
+
+Phong ライティングモデルの詳細は link:https://en.wikipedia.org/wiki/Phong_reflection_model[Wikipedia の記事] を参照してください。
+
+==== Blinn-Phong モデル
+
+Jim Blinn による Phong モデルの変形で、反射ベクトルの代わりに光方向と視線方向のハーフウェイベクトルを使い、計算をより効率的にします。
+
+* *利点*: Phong より速く、似た視覚結果
+* *欠点*: 依然として物理的に正確ではない
+* *使うとき*: Phong のより効率的な代替として
+
+Blinn-Phong の詳細は link:https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_reflection_model[Wikipedia の記事] または link:https://developer.nvidia.com/gpugems/gpugems/part-i-natural-effects/chapter-5-implementing-improved-perlin-noise[GPU Gems の章] を参照してください。
+
+=== 高度なライティングモデル
+
+==== Cook-Torrance モデル
+
+1982 年に Robert Cook と Kenneth Torrance が開発した、より物理ベースのモデルです。表面の粗さをモデル化するためにマイクロファセット理論を使い、より正確な鏡面項を含みます。
+
+* *利点*: Phong や Blinn-Phong より物理的に正確
+* *欠点*: 実装と計算がより複雑
+* *使うとき*: よりリアルなマテリアルが必要だがフル PBR が高すぎるとき
+
+詳細はオリジナルの link:https://graphics.pixar.com/library/ReflectanceModel/paper.pdf[Cook-Torrance 論文] を参照してください。
+
+==== Oren-Nayar モデル
+
+拡散反射におけるマイクロファセットの粗さを考慮する Lambertian 拡散モデルの拡張で、布、コンクリート、砂のような粗い表面により適します。
+
+* *利点*: 粗い表面のよりリアルな拡散反射
+* *欠点*: Lambertian 拡散より高価
+* *使うとき*: 拡散の粗さが重要なマテリアル
+
+オリジナルの link:https://www1.cs.columbia.edu/CAVE/publications/pdfs/Oren_SIGGRAPH94.pdf[Oren-Nayar 論文] で詳しく学べます。
+
+==== Physically Based Rendering（PBR）
+
+PBR は過去 10 年のリアルタイムグラフィックスにおける最も重要な進歩の一つです。以前の場当たり的なシェーディングモデルと異なり、PBR は物理学の原理に基づき光が表面とどう相互作用するかをシミュレートすることを目指します。
+
+PBR の主要原則には次があります。
+
+* *エネルギー保存*: 表面は受け取った光より多くの光を反射できない
+* *マイクロファセット理論*: 表面は向きの異なる無数の小さな鏡の集まりとしてモデル化される
+* *フレネル効果*: 反射率は視線角度によって変わる
+* *Metallic-Roughness ワークフロー*: マテリアルは base color、metalness、roughness で定義される
+
+PBR を使う際の考慮点:
+
+* *利点*: 異なるライティング条件下でも一貫したリアルな結果、アーティスト向けの直感的パラメータ
+* *欠点*: より複雑で計算コストが高い
+* *使うとき*: リアリズムが重要なモダンなゲームやアプリケーション
+
+PBR の包括的な情報は link:https://www.pbr-book.org/[Physically Based Rendering の本] を参照してください。
+
+image::images/PBR_ray_shadows.png[PBR materials with ray-traced shadows - demonstrating metallic surfaces, roughness variation, and realistic shadow rendering]
+
+== glTF におけるライティングモデル
+
+glTF 形式は metallic-roughness ワークフローの PBR を使い、次の主要パラメータでマテリアルを定義します。
+
+* *Base Color*: 表面のアルベドまたは拡散色
+* *Metallic*: 表面がどれだけ「金属らしい」か（0.0 = 非金属、1.0 = 金属）
+* *Roughness*: 表面がどれだけ滑らか／粗いか（0.0 = 鏡面、1.0 = 粗い）
+
+このワークフローはアーティストにとって直感的で、リアルタイムレンダリングに効率的です。glTF 仕様は、異なるレンダリングエンジン間で使える PBR マテリアルを定義する標準化された方法を提供します。
+
+glTF の PBR 実装の詳細は link:https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#materials[glTF 2.0 仕様] を参照してください。
+
+== ライトの種類
+
+異なるライティングモデルは、さまざまな種類の光源と組み合わせて使えます。
+
+1. *ポイントライト*: 単一点から全方向に光が放射される。
+2. *ディレクショナルライト*: 非常に遠い光源（太陽など）から来るように、光線が平行。
+3. *スポットライト*: 点から円錐状に光が放射される。
+4. *エリアライト*: 表面領域から光が放射される。
+5. *イメージベースドライティング（IBL）*: 環境マップから光を導き、大域照明をシミュレートする。
+
+各ライト型は、光方向、減衰、その他のプロパティについて固有の計算を必要とします。
+
+== 高度なライティング技法
+
+基本的なライティングモデルを超えて、レンダリングのリアリズムを高める高度な技法がいくつかあります。
+
+=== 大域照明
+
+大域照明（GI）は、表面間で光がどう跳ね返るかをシミュレートし、間接照明効果を作ります。技法には次があります。
+
+* *ラジオシティ*: 表面間の拡散光転送を計算
+* *パストレーシング*: シーンを通る光路を追跡
+* *フォトンマッピング*: 空間データ構造に光情報を格納
+
+詳細は link:https://developer.download.nvidia.com/books/HTML/gpugems2/chapters/gpugems2_chapter12.html[ラジオシティに関する GPU Gems の章] を参照してください。
+
+=== サブサーフェススキャタリング
+
+サブサーフェススキャタリング（SSS）は、肌、ワックス、大理石のような半透明マテリアル内で光がどう侵入・散乱するかをシミュレートします。
+
+詳細は link:https://developer.nvidia.com/gpugems/gpugems/part-iii-materials/chapter-16-real-time-approximations-subsurface-scattering[サブサーフェススキャタリングに関する GPU Gems の章] を参照してください。
+
+=== アンビエントオクルージョン
+
+アンビエントオクルージョン（AO）は、表面点が受け取る環境光の量を近似し、角や溝を暗くします。
+
+詳細は link:https://developer.download.nvidia.com/books/HTML/gpugems/gpugems_ch17.html[アンビエントオクルージョンに関する GPU Gems の章] を参照してください。
+
+== 適切なライティングモデルの選択
+
+アプリケーションにどのライティングモデルを使うかを決めるとき、次を検討してください。
+
+1. *ハードウェア制約*: より複雑なモデルはより多くの処理能力を必要とする
+2. *視覚要件*: マテリアルはどれだけリアルに見える必要があるか？
+3. *アーティストワークフロー*: 一部のモデルはアーティストが扱いやすい
+4. *一貫性*: PBR は異なるライティング条件下でより一貫した結果を提供する
+
+本エンジンでは、リアリズム・パフォーマンス・アーティストフレンドリーなパラメータの良いバランスを提供する、glTF 形式の PBR 実装を活用します。
+
+== 参考文献
+
+ライティングモデルの理解を深めるための有用なリソースです。
+
+* link:https://www.pbr-book.org/[Physically Based Rendering: From Theory to Implementation] — PBR の決定版の本
+* link:https://learnopengl.com/PBR/Theory[LearnOpenGL PBR Tutorial] — PBR 概念への親しみやすい入門
+* link:https://google.github.io/filament/Filament.html[Filament Material System] — Google のリアルタイム PBR レンダリングエンジンのドキュメント
+* link:https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#materials[glTF 2.0 Material Specification] — glTF での PBR 実装の詳細
+* link:https://developer.nvidia.com/gpugems/gpugems/part-iii-materials[GPU Gems: Materials] — 高度なマテリアルレンダリングに関する記事集
+
+次の節では、マテリアルプロパティをシェーダーへ効率的に渡すプッシュ定数の使い方を探ります。
+
+xref:Building_a_Simple_Engine/Lighting_Materials/01_introduction.adoc[前へ: はじめに] | xref:Building_a_Simple_Engine/Lighting_Materials/03_push_constants.adoc[次へ: プッシュ定数]

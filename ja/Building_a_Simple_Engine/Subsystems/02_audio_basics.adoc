@@ -1,0 +1,243 @@
+:pp: {plus}{plus}
+
+= サブシステム: オーディオの基礎
+:doctype: book
+:sectnums:
+:sectnumlevels: 4
+:toc: left
+:icons: font
+:source-highlighter: highlightjs
+:source-language: c++
+
+== オーディオシステムの基礎
+
+Vulkan がオーディオ処理をどのように強化できるかを説明する前に、エンジンの基本的なオーディオ システムを実装して基盤を確立しましょう。これにより、後で Vulkan コンピューティング機能を使用して拡張できるフレームワークが得られます。
+
+=== オーディオシステムのアーキテクチャ
+
+一般的なゲーム オーディオ システムは、いくつかの主要なコンポーネントで構成されます。
+
+* *オーディオ エンジン*: オーディオの再生、ミキシング、エフェクト処理を管理するコア コンポーネント。
+* *サウンド リソース*: オーディオ ファイルがメモリにロードされ、再生の準備が整います。
+* *オーディオ チャネル*: オーディオが流れる論理パス。多くの場合、タイプ (音楽、効果音、ダイアログなど) ごとにグループ化されます。
+* *空間オーディオ*: リスナーを基準にして 3D 空間内でサウンドを配置するシステム。
+* *エフェクト処理*: リバーブ、エコー、イコライゼーションなどのエフェクトをオーディオ ストリームに適用します。
+
+エンジンの設計と一致する最新の C++ アプローチを使用して、これらの基本をカバーするシンプルなオーディオ システムを実装してみましょう。
+
+=== 基本的なオーディオ システムの実装
+
+まず、オーディオ システムのコア クラスを定義します。
+
+[source,cpp]
+----
+// Audio.h
+#pragma once
+
+#include <string>
+#include <unordered_map>
+#include <memory>
+#include <vector>
+#include <glm/glm.hpp>
+
+namespace Engine {
+namespace Audio {
+
+class AudioClip {
+public:
+    AudioClip(const std::string& filename);
+    ~AudioClip();
+
+    // Get raw audio data
+    const float* GetData() const { return m_Data.data(); }
+    size_t GetSampleCount() const { return m_Data.size(); }
+    int GetChannelCount() const { return m_ChannelCount; }
+    int GetSampleRate() const { return m_SampleRate; }
+
+private:
+    std::vector<float> m_Data;
+    int m_ChannelCount;
+    int m_SampleRate;
+};
+
+class AudioSource {
+public:
+    AudioSource();
+    ~AudioSource();
+
+    void SetClip(std::shared_ptr<AudioClip> clip) { m_Clip = clip; }
+    void SetPosition(const glm::vec3& position) { m_Position = position; }
+    void SetVolume(float volume) { m_Volume = volume; }
+    void SetLooping(bool looping) { m_Looping = looping; }
+
+    void Play();
+    void Stop();
+    void Pause();
+
+    bool IsPlaying() const { return m_IsPlaying; }
+
+    const glm::vec3& GetPosition() const { return m_Position; }
+    float GetVolume() const { return m_Volume; }
+
+private:
+    std::shared_ptr<AudioClip> m_Clip;
+    glm::vec3 m_Position = glm::vec3(0.0f);
+    float m_Volume = 1.0f;
+    bool m_Looping = false;
+    bool m_IsPlaying = false;
+
+    // Implementation-specific playback state
+    size_t m_CurrentSample = 0;
+};
+
+class AudioListener {
+public:
+    void SetPosition(const glm::vec3& position) { m_Position = position; }
+    void SetOrientation(const glm::vec3& forward, const glm::vec3& up) {
+        m_Forward = forward;
+        m_Up = up;
+    }
+
+    const glm::vec3& GetPosition() const { return m_Position; }
+    const glm::vec3& GetForward() const { return m_Forward; }
+    const glm::vec3& GetUp() const { return m_Up; }
+
+private:
+    glm::vec3 m_Position = glm::vec3(0.0f);
+    glm::vec3 m_Forward = glm::vec3(0.0f, 0.0f, -1.0f);
+    glm::vec3 m_Up = glm::vec3(0.0f, 1.0f, 0.0f);
+};
+
+class AudioSystem {
+public:
+    AudioSystem();
+    ~AudioSystem();
+
+    void Initialize();
+    void Shutdown();
+
+    // Update audio system (call once per frame)
+    void Update(float deltaTime);
+
+    // Resource management
+    std::shared_ptr<AudioClip> LoadClip(const std::string& name, const std::string& filename);
+    std::shared_ptr<AudioClip> GetClip(const std::string& name);
+
+    // Source management
+    std::shared_ptr<AudioSource> CreateSource();
+    void DestroySource(std::shared_ptr<AudioSource> source);
+
+    // Listener (typically attached to camera)
+    AudioListener& GetListener() { return m_Listener; }
+
+private:
+    std::unordered_map<std::string, std::shared_ptr<AudioClip>> m_Clips;
+    std::vector<std::shared_ptr<AudioSource>> m_Sources;
+    AudioListener m_Listener;
+
+    // Implementation-specific audio backend state
+    void* m_AudioBackend = nullptr;
+};
+
+} // namespace Audio
+} // namespace Engine
+----
+
+この基本構造は、空間的な位置を指定してオーディオ ファイルをロードおよび再生するための基盤を提供します。実際の実装では、OpenAL、FMOD、Wwise などのオーディオ ライブラリと統合して、低レベルのオーディオ再生を処理します。
+
+=== エンジンとの統合
+
+オーディオ システムをエンジンの残りの部分と統合するには、それをエンジンのメイン クラスに追加します。
+
+[source,cpp]
+----
+// Engine.h
+#include "Audio.h"
+
+namespace Engine {
+
+class Engine {
+public:
+    // ... existing engine code ...
+
+    Audio::AudioSystem& GetAudioSystem() { return m_AudioSystem; }
+
+private:
+    // ... existing engine members ...
+
+    Audio::AudioSystem m_AudioSystem;
+};
+
+} // namespace Engine
+----
+
+そして、エンジンの始動時に初期化します。
+
+[source,cpp]
+----
+// Engine.cpp
+void Engine::Initialize() {
+    // ... existing initialization code ...
+
+    m_AudioSystem.Initialize();
+}
+
+void Engine::Shutdown() {
+    m_AudioSystem.Shutdown();
+
+    // ... existing shutdown code ...
+}
+----
+
+=== 基本的な使用例
+
+このオーディオ システムをゲームで使用する方法は次のとおりです。
+
+[source,cpp]
+----
+// Game code
+void Game::LoadResources() {
+    // Load audio clips
+    auto explosionSound = m_Engine.GetAudioSystem().LoadClip("explosion", "sounds/explosion.wav");
+    auto backgroundMusic = m_Engine.GetAudioSystem().LoadClip("music", "sounds/background.ogg");
+
+    // Create and configure audio sources
+    m_MusicSource = m_Engine.GetAudioSystem().CreateSource();
+    m_MusicSource->SetClip(backgroundMusic);
+    m_MusicSource->SetLooping(true);
+    m_MusicSource->SetVolume(0.5f);
+    m_MusicSource->Play();
+}
+
+void Game::OnExplosion(const glm::vec3& position) {
+    // Create a temporary source for the explosion sound
+    auto source = m_Engine.GetAudioSystem().CreateSource();
+    source->SetClip(m_Engine.GetAudioSystem().GetClip("explosion"));
+    source->SetPosition(position);
+    source->Play();
+
+    // In a real implementation, you'd need to manage the lifetime of this source
+}
+
+void Game::Update(float deltaTime) {
+    // Update listener position and orientation based on camera
+    auto& listener = m_Engine.GetAudioSystem().GetListener();
+    listener.SetPosition(m_Camera.GetPosition());
+    listener.SetOrientation(m_Camera.GetForward(), m_Camera.GetUp());
+
+    // Update audio system
+    m_Engine.GetAudioSystem().Update(deltaTime);
+}
+----
+
+=== 基本的なオーディオ システムの制限
+
+この基本的なオーディオ システムは、ゲームでサウンドを再生するために不可欠な機能を提供しますが、いくつかの制限があります。
+
+1. *制限された空間オーディオ*: 基本的な距離ベースの減衰では、音が 3D 空間でどのように伝播するかを正確にモデル化しません。
+2. *CPU 集中型の処理*: エフェクトと 3D オーディオの計算は、大量の CPU リソースを消費する可能性があります。
+3. *制限されたスケーラビリティ*: 数百または数千の音源を処理すると、パフォーマンスのボトルネックになる可能性があります。
+
+次のセクションでは、Vulkan コンピューティング シェーダーがオーディオ処理を GPU にオフロードすることで、特に頭部関連伝達関数 (HRTF) を通じてよりリアルな空間オーディオを実装することで、これらの制限にどのように対処できるかを検討します。
+
+xref:Building_a_Simple_Engine/Subsystems/01_introduction.adoc[前へ: はじめに] | xref:Building_a_Simple_Engine/Subsystems/03_vulkan_audio.adoc[次へ: オーディオ処理用の Vulkan]

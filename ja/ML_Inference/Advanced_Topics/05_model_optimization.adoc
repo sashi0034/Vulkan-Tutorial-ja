@@ -1,0 +1,174 @@
+= モデル最適化技法: コードを超えて
+:pp: ++
+:stem: latexmath
+
+カーネルを最適化し、INT8 に量子化し、メモリヒープを管理しました。しかし推論はまだ遅い。問題は実装ではなく **モデル自体** です。
+
+Model Zoo からダウンロードするモデルは **精度** のために学習され、最終予測に寄与しない冗長演算とアーキテクチャ「デッドウェイト」で満ちていることが多い。本章では **演算子融合**、**知識蒸留**、**Winograd 変換** などの技法でニューラルネットワークを「書き換える」方法を学びます。
+
+== 実用経路: ライブラリレベルグラフ最適化
+
+ONNX Runtime 使用時、この「書き換え」の多くは自動発生。ただしプロとしてこれら変換を制御・検証する方法を知る必要があります。
+
+=== 1. グラフ最適化レベル
+ONNX Runtime には 3 レベルの最適化:
+
+*   **Basic**: 定数畳み込み、冗長ノード除去。
+*   **Extended**: 単純シーケンス融合（例: `Conv + ReLU` -> `FusedConv`）。
+*   **All**: 複雑ベンダー固有融合（例: Transformer 向け Attention ブロック全体融合）。
+
+[source,cpp]
+----
+Ort::SessionOptions options;
+// Level ORT_ENABLE_ALL is recommended for production.
+options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+// You can also 'Export' the optimized model to see what it did!
+options.SetOptimizedModelFilePath(L"models/optimized_model.onnx");
+----
+
+=== 2. ONNX Simplifier
+PyTorch からのグラフが複雑すぎて ONNX Runtime 内部オプティマイザが混乱することがあります。
+
+*   **ツール**: `onnx-simplifier`（Python）。
+*   **コマンド**: `python -m onnxsim model.onnx model_sim.onnx`
+*   **理由**: モデル内すべての定数部分式を事前計算し、多くの場合ノード数を 30〜50% 削減。
+
+== 戦略 1: 演算子融合（帯域セーバー）
+
+高性能 ML ではニューラルネットワークを **計算グラフ** として扱う。各ノードは演算（畳み込みなど）、各エッジはテンソル。最適化は **グラフ書き換え**——5 演算のシーケンスが同一結果を出す単一演算に置き換え可能であることを数学的に証明。
+
+素朴ネットワークでは各レイヤが別 Vulkan カーネル。**畳み込み latexmath:[\to] BatchNorm latexmath:[\to] ReLU**。
+GPU は畳み込み出力を VRAM に書き、BatchNorm 用に読み戻し、再書き込み、ReLU 用に再読み取り。通常メモリ帯域バウンドのため災難。
+
+**解決**: 融合。BatchNorm と Bias パラメータを畳み込み重みに「畳み込む」。
+
+=== 畳み込みの数学
+畳み込み結果 latexmath:[z = W \ast x + b] に対し BatchNorm は:
+[latexmath]
+++++
+y = \gamma \left( \frac{z - \mu}{\sqrt{\sigma^2 + \epsilon}} \right) + \beta
+++++
+
+latexmath:[z] を代入し、新「融合」重み latexmath:[W_{fused}] と融合バイアス latexmath:[b_{fused}] を導出:
+[latexmath]
+++++
+W_{fused} = W \cdot \frac{\gamma}{\sqrt{\sigma^2 + \epsilon}}
+++++
+[latexmath]
+++++
+b_{fused} = (b - \mu) \cdot \frac{\gamma}{\sqrt{\sigma^2 + \epsilon}} + \beta
+++++
+
+**結果**: 3 カーネル起動と 6 VRAM アクセスから **1 カーネル起動と 2 VRAM アクセス** へ。精度損失ゼロで latexmath:[3\times] 無料高速化。畳み込みは「エクスポート時」に一度畳み込み、シェーダは標準畳み込みのみ見る。
+
+== 戦略 2: 構造化刈り込み（脂肪のトリミング）
+
+刈り込みはネットワークから「重要でない」重みを除去しサイズと複雑さを削減。**非構造化刈り込み**（ランダムゼロ）は研究で人気だが、**構造化刈り込み** のみが一般ハードウェアで高速化を提供。
+
+個別重みではなく **フィルタ全体**（行列の行）または **チャネル全体** を除去。
+
+=== 感度分析: 「デッドウェイト」の狩り
+どのフィルタが「重要」か？
+
+1.  **キャリブレーション**: 検証データセットでモデル実行。
+2.  **エネルギー計算**: 各レイヤ各フィルタの絶対活性化の和（latexmath:[L1] ノルム）を計算。
+3.  **分布の「テール」**: 全フィルタエネルギーをプロット。通常少数「スーパースター」とほとんど発火しない長い「テール」。
+4.  **刈り込み**: 下位 20% フィルタと次レイヤ対応入力を物理除去。
+
+**成果**: レイヤで 50% フィルタ刈り込みなら行列は半分幅・半分高。**あらゆる** ハードウェアで latexmath:[2\times] 速い——半分の数学。
+
+== 戦略 3: 知識蒸留（教師と生徒）
+
+ResNet-152 のようなモデルはどれだけ最適化してもリアルタイムに大きすぎる場合、**知識蒸留** を使用。
+
+1.  **教師**: 巨大、遅い、高精度モデル（「ゴールドスタンダード」）。
+2.  **生徒**: 小さく速いモデル（例: MobileNetV2）。
+
+学習中、生徒に正しいラベル（犬/猫）だけでなく教師の **ソフト確率** を模倣させる。**Temperature** パラメータ latexmath:[\tau] で確率を「平滑化」し生徒が「ニュアンス」を見られる（例: 教師がこの犬を 10% 猫に見た理由）。
+
+[latexmath]
+++++
+\mathcal{L}_{distill} = \tau^2 \cdot KL\left( \text{Softmax}\left(\frac{Z_{teacher}}{\tau}\right), \text{Softmax}\left(\frac{Z_{student}}{\tau}\right) \right)
+++++
+
+**結果**: 生徒モデルは単独学習より高精度——教師の深い特徴表現を「継承」。100 倍少ないパラメータで同じパターンを見つけるよう学習。
+
+== 戦略 4: Winograd 変換（代数トリック）
+
+最も一般的な畳み込み——**3x3 カーネル**——には **Winograd latexmath:[F(2,3)] 変換** を使用。NVIDIA cuDNN や ARM Compute Library が記録的速度を達成する方法。
+
+.Winograd Transform Pipeline
+image::images/ML_Inference/Advanced_Topics/winograd_flow.svg[Diagram showing the flow of data through Winograd transformation and element-wise multiplication, 800]
+
+*   **従来 Conv**: 出力ピクセルあたり 9 乗算。
+*   **Winograd Conv**: 入力と重みを「Winograd 空間」に変換、要素ごと乗算、逆変換。
+
+[latexmath]
+++++
+Y = A^T [ (GgG^T) \odot (B^T x B) ] A
+++++
+
+latexmath:[G]、latexmath:[B]、latexmath:[A] は固定変換行列。3x3 フィルタで 4x4 入力タイルから 2x2 出力タイルを生成する latexmath:[F(2,3)] の変換行列:
+
+[latexmath]
+++++
+B^T = \begin{bmatrix} 1 & 0 & -1 & 0 \\ 0 & 1 & 1 & 0 \\ 0 & -1 & 1 & 0 \\ 0 & 1 & 0 & -1 \end{bmatrix} , \quad G = \begin{bmatrix} 1 & 0 & 0 \\ 1/2 & 1/2 & 1/2 \\ 1/2 & -1/2 & 1/2 \\ 0 & 0 & 1 \end{bmatrix} , \quad A^T = \begin{bmatrix} 1 & 1 & 1 & 0 \\ 0 & 1 & -1 & -1 \end{bmatrix}
+++++
+
+=== なぜ Winograd？
+Winograd はコストを **乗算**（高コスト・高電力）から **加算**（安価）へシフト。乗算数 9 から 4 へ。latexmath:[2.25\times] 理論高速化。
+
+=== ハンズオン: Winograd 変換（C++）
+シェーダで Winograd を使うには **重み** をオフライン変換。BatchNorm 畳み込みは値を変えるが、Winograd 重み変換は **次元** を変える。
+
+[source,cpp]
+----
+// Transforming a 3x3 filter 'g' into a 4x4 Winograd filter 'GgG^T'
+void transformWeightToWinograd(const float* g, float* out4x4) {
+    const float G[4][3] = {
+        { 1.0f,  0.0f,  0.0f},
+        { 0.5f,  0.5f,  0.5f},
+        { 0.5f, -0.5f,  0.5f},
+        { 0.0f,  0.0f,  1.0f}
+    };
+    // 1. Perform G * g
+    // 2. Perform (G * g) * G^T
+    // Result is a 4x4 matrix ready for Hadamard product in the shader.
+}
+----
+
+== 戦略 5: 動的形状最適化
+
+多くの実アプリでは入力サイズが不明です。ユーザーがポートレートまたはランドスケープ写真をアップロード。標準エンジンはしばしば大正方形（1024x1024 など）に「パディング」——非常に無駄。
+
+*   **問題**: 1024x1024 パディングバッファ内に 224x224 画像をレンダリングすると「ゼロ」ピクセルに latexmath:[20\times] 計算力を浪費。
+*   **解決**: **バケッティング**。
+    1.  3〜4 標準アスペクト比定義（1:1、16:9、9:16 など）。
+    2.  各バケット向けに 3〜4 別 Vulkan コンピュートパイプラインを事前コンパイル。
+    3.  ランタイムでユーザー画像に「最もタイトなフィット」バケットを選択。
+
+== 戦略 6: GAP + FC 融合（分類器ヘッド）
+
+分類器最終レイヤでは **Global Average Pool（GAP）** の後 **Fully Connected（FC）** レイヤ。
+
+*   **GAP**: latexmath:[7 \times 7 \times 1024] テンソルを latexmath:[1 \times 1 \times 1024] ベクトルに平均。
+*   **FC**: そのベクトルを latexmath:[1024 \times 1000] 重み行列で乗算。
+
+2 カーネルの代わりに **融合** 可能。FC カーネルスレッドが重みロード時に **共有メモリ** で latexmath:[7 \times 7] 空間タイルの平均も実行。中間 1024 要素ベクトルを VRAM に保存する必要を完全排除。
+
+== まとめ: 最適化ロードマップ
+
+モデル最適化は **グラフをシリコンに合わせて書き換える** こと。
+
+1.  **実用経路**: `onnx-simplifier` 使用、`ORT_ENABLE_ALL` 設定。
+2.  **融合**: エクスポート時 BatchNorm と Bias を畳み込みに畳み込み。
+3.  **刈り込み**: 感度分析で発火しないフィルタを除去。
+4.  **蒸留**: 「小さい」モデル精度不足なら蒸留。
+5.  **変換**: コンピュートバウンドなら 3x3 カーネル向け Winograd 実装。
+
+ML 推論の高度なトピックを習得しました。量子化、特定ベンダーチューニング、複雑メモリプール管理、ネットワークアーキテクチャ書き換えができます。
+
+最終セクションでは、これらすべてのスキルを最も困難な環境——**組み込みアプリケーション**——に適用します。
+
+xref:ML_Inference/Advanced_Topics/04_memory_management.adoc[前へ: 高度なメモリ管理] | xref:ML_Inference/Embedded_Applications/01_introduction.adoc[次へ: 組み込みアプリケーション]

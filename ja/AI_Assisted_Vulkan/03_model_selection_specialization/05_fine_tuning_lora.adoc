@@ -1,0 +1,149 @@
+:pp: {plus}{plus}
+
+= エンジン向けファインチューニング: スタイルの「聖杯」
+
+== はじめに: 「デジタルシニア」
+
+グラフィックスチームに新しい採用者がいるところを想像してください。彼らは優秀な C{pp} プログラマで、Vulkan 仕様を暗記しています。しかし初日に生の `vkCreateBuffer` 呼び出しと頂点データに `std::vector` を書き始めます。あなたのエンジンはしかし **Vulkan Memory Allocator（VMA）** と性能向けカスタム `FixedArray` 型を使います。次の 1 週間を、彼らのスタイルをエンジンのアーキテクチャ法則に合わせる「訂正」に費やすことになります。
+
+これが、**Qwen 3-Coder** のような最良のベースモデルでさえ直面する同じ課題です。彼らは Vulkan を知っていますが、*あなたの* Vulkan を知りません。これを解決するため **ファインチューニング**、特に **Low-Rank Adaptation（LoRA）** と呼ばれる技法を使います。
+
+== コア概念: 「スタイルパッチ」
+
+伝統的なファインチューニングはモデルの何十億ものパラメータすべてを再学習する必要があり——数千ドルのコストと巨大 GPU クラスタを要するプロセスです。**LoRA** は、ベースモデルの上に乗る重みの小さな「パッチ」（通常モデルサイズの 1% 未満）だけを学習することでゲームを変えます。このセットアップは、C{pp} と Vulkan 1.3 仕様の一般理解を提供する **ベースモデル** の幅広い知識と、エンジン固有の命名規約、抽象化、「アーキテクチャ法則」を注入する **LoRA アダプタ** の特化した声を組み合わせます。
+
+== Teacher-Student パイプライン: クラウド駆動特化
+
+汎用 17B または 12B モデルを **特化 SLM** へ変えるには、高品質な「指示-応答」データセットが必要です。小さなチームが何千ものペアを手動で書くのは非現実的です。代わりに、高推論クラウド LLM（**Claude 4.6** や **GPT-5.3** など）を使い、エンジンのソースコードから学習データを合成して「教え」ます。
+
+これが **Teacher-Student** パラダイムです。
+
+1.  **キュレーション**: エンジンのコアヘッダとアーキテクチャドキュメントを抽出。
+2.  **指示合成（クラウド）**: これらのファイルをクラウドモデルに与え、技術的な「Instruction/Response」ペアを生成するようタスクを与える。クラウドモデルは巨大な推論能力を持つため、API を「理解」し、その理解をテストする複雑な質問を作成できる。
+3.  **ローカル再学習**: この「クラウド生成教科書」を使いローカルモデルをファインチューニング。
+
+**「特化 SLM」の利点**
+クラウドモデルを「教師」として使うことで、ローカル 17B モデルはスニペットを暗記するだけではなく、エンジンの **論理** を学びます。カスタム同期プリミティブやメモリアロケータの正確な使い方を知る特化ツールになり、一般 Vulkan 知識だけのはるかに大きなモデルをしばしば上回ります。
+
+== なぜ LoRA か？（「VMA」問題）
+
+あらゆる大規模エンジンには独自の「Vulkan 方言」があります。あるエンジンは `vmaCreateBuffer` を使い、別のエンジンは Android の `AHardwareBuffer` に基づくカスタムサブ割り当てスキームを使い、また別のエンジンは `vk::raii` C{pp} ラッパに頼ります。
+
+LoRA なしでは、これらの好みを AI に思い出させるため常に **RAG** や手動プロンプトを使わなければなりません。
+
+== 実世界体験: 「スタイルパッチ」の学習
+
+LoRA を学習するのにスーパーコンピュータは必要ありません。単一のハイエンド GPU（RTX 3090 や 4090 など）で、17B モデル（**Llama 4** など）向けの LoRA を 1 時間未満で学習できます。
+
+**ワークフロー:**
+
+1.  **データセット収集:** エンジンリポジトリから「Header/Implementation」ペアを抽出する単純なスクリプトを実行。例えば、`PipelineBuilder.hpp` とそれを使う複雑な `main.cpp` をペアにする。
+2.  **学習ループ:** **Unsloth** のようなツールでモデルを「教える」。モデルが汎用 `VkGraphicsPipelineCreateInfo` の提案を止め、エンジンの `GraphicsPipelineBuilder` を提案し始めるにつれ、「Loss」曲線が下がるのを見る。
+3.  **結果:** この小さな（50MB）アダプタを IDE（Ollama または LM Studio 経由）に読み込む。新しいレンダーパスを打ち始めると、AI は追加プロンプトなしでエンジン固有の同期ラッパを自動的に使う。
+
+== 実践チュートリアル: LoRA アダプタの学習
+
+グラフィックスエンジン向けに **Llama 4** のような 17B SLM（Small Language Model）を特化するには、データセットをキュレートし学習ループを実行する次のパイプラインに従ってください。
+
+=== ステップ 1: 合成データセットのキュレート
+**Instruction-Response ペア** の「合成教科書」が必要です。高推論クラウドモデル（Claude 4.6/GPT-5.3）を使い、エンジンのソースコードからこれを生成します。
+
+**「教師」プロンプト:**
+[source,text]
+----
+I am uploading our core engine headers (Renderer.hpp, Buffer.hpp)
+and three sample apps. Generate 50 technical 'Instruction/Response'
+pairs in JSONL format that teach a model how to:
+1. Initialize our 'GraphicsPipelineBuilder' for a depth-only pass.
+2. Correct the usage of 'vmaCreateBuffer' for a staging buffer.
+3. Implement our custom 'ImageMemoryBarrier' logic for layout transitions.
+----
+
+=== ステップ 2: 学習用フォーマット（JSONL）
+データが標準学習形式に従うことを保証します。`train.jsonl` の各行は次のように見えるべきです。
+
+[source,json]
+----
+{"instruction": "Create a vertex buffer using our VMA wrapper.", "input": "Target: 1024 bytes, Usage: VERTEX_BUFFER_BIT", "output": "Buffer::Builder(device).setSize(1024).setUsage(VMA_MEMORY_USAGE_GPU_ONLY).build();"}
+----
+
+=== ステップ 3: Unsloth による学習ループ
+少なくとも 24GB の VRAM を持つ Linux マシン（例: RTX 3090/4090）で **Unsloth** ライブラリを使います。
+
+[source,python]
+----
+from unsloth import FastLanguageModel
+import torch
+
+# 1. Load the base model
+model, tokenizer = FastLanguageModel.from_pretrained("unsloth/llama-4-8b-bnb-4bit")
+
+# 2. Add LoRA adapters
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16, # Rank (higher = more 'memory' but larger file)
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"],
+    lora_alpha = 16,
+    lora_dropout = 0,
+)
+
+# 3. Start training (pointing to your jsonl file)
+# [Insert standard Unsloth trainer setup here]
+model.save_pretrained_gguf("vulkan_expert_lora", tokenizer, quantization_method = "q4_k_m")
+----
+
+学習ループを実行すると、「Loss」値が下がるのを見ます——モデルがエンジンの API を学習している数学的証明です。このプロセスは RTX 4090 でおおよそ 30 から 60 分かかります。
+
+== SLM の特化: ジェネラリストからエキスパートへ
+
+特化開発の最も強力な側面の一つは、**Small Language Models（SLM）**——通常 17B から 30B パラメータ範囲——が、ゲームエンジンの特定ドメインで 400B+ パラメータの「巨大」モデルを上回れることです。LoRA の「スタイルパッチ」と RAG インデックスの「地上真理」を組み合わせることで、SLM は一般 C{pp} パターンを覚えようと内部パラメータを浪費せず、エンジン固有方言で提供した論理に推論の 100% を集中できます。
+
+チーム環境では、学習したばかりの LoRA を含めエンジンを深く「知る」単一の高性能 SLM を望み、すべての開発者に大幅な VRAM 犠牲を強制したくないことがよくあります。共有推論サーバをセットアップするには、まずホストマシン（十分な VRAM を持つもの）を **Ollama** で設定します。`ollama serve` を実行する前に `OLLAMA_HOST` 環境変数を `0.0.0.0` に設定し、サービスを明示的に公開しなければなりません。最後に、**Qwen 3-Coder（30B）** のような能力のあるベースを pull して特化モデルを準備します。
+
+チームのすべての開発者は次に、ローカル **Goose** インスタンスをリモートサーバを使うよう設定します。このセットアップの美しさは **Local-Agent/Remote-Model** 分割です。Goose エージェントはローカルファイルとツールへの直接アクセスを持つ開発者のマシンに留まりますが、重い推論の「思考」は共有サーバへオフロードします。OpenAI API が AI 通信の業界標準になったため、リモート Ollama サーバと話すのに Goose の `openai` プロバイダを使います。Goose 設定——Unix 系では `~/.config/goose/config.yaml`、Windows では `%APPDATA%\goose\config.yaml`——を開き、ホストマシンの IP アドレスを使いリモートサーバをエンドポイントとして扱うプロバイダエントリを追加します。
+
+[source,yaml]
+----
+models:
+  shared-vulkan-expert:
+    provider: openai
+    base_url: "http://<SERVER_IP_ADDRESS>:11434/v1"
+    model: "qwen3-coder:30b"
+    api_key: "not-needed"
+----
+
+**なぜこれが効くか:** Goose にタスクを与えると、まずローカルツールでローカルファイルを「読み」ます。次にそれらのファイルスニペットをパッケージし、ネットワーク経由で共有サーバへ送ります。サーバが応答を生成しマシンへ返し、ローカル Goose エージェントがコードをディスクへ書きます。ローカル GPU の VRAM を 1 バイトも使わずに 30B モデルの力を得ます。
+
+チーム全体で一貫性を保証するには、技術マニュアルとエンジン仕様を Git で追跡される共有ディレクトリに置き、RAG ソースを標準化しなければなりません。同期された「知識ボルト」を維持するため、Goose に常にまずこのディレクトリをインデックスするよう指示してください。
+
+**実世界体験: チーム監査**
+この共有構成では、開発者が新しい同期バグに遭遇したら次のように言えます。*「Goose、共有の `docs/sync_patterns.md` とリモート 30B モデルを照会して、現在のパイプラインバリアを監査して。」*
+
+RAG 取得はローカルで起きるため、エージェントは開発者の正確なコード行を見ます。推論は共有サーバで起きるため、開発者の Vulkan フレームレートをゼロに落とさずに巨大モデルの「推論深度」を持ちます。
+
+`config.yaml` を変更したら、単純な診断を実行して Goose が共有サーバと正しく話していることを検証します。まず利用可能モデルを列挙して 'shared-vulkan-expert' が見えることを確認し、次にその特定モデルでセッションを開始します。
+
+[source,bash]
+----
+# List available models to ensure the 'shared-vulkan-expert' is visible
+goose models
+
+# Start a session using the shared expert
+goose session --model shared-vulkan-expert
+----
+
+接続が成功したら、複雑なグラフィックス問題を Goose にタスクとして与えられます。モデルが共有サーバで動いているため、AI が複雑な 100 行シェーダを推論しても、ローカルシステムの VRAM 使用は安定したままです。
+
+== RAG 対 LoRA: どちらをいつ使うか？
+
+これら 2 つの技法の選択は目標に依存します。サードパーティライブラリマニュアル、プロジェクト固有要件、エンジンの現在のタスクリストなど、しばしば変わる事実には **RAG** を使います。エンジンの「魂」——命名規約、メモリ管理哲学、特定 C{pp} 抽象化——を含む深い構造要素の教育には **LoRA** を使います。
+
+== まとめ: 統合エンジニア
+
+LoRA によるファインチューニングは、真にパーソナライズされた AI アシスタント作成の最終ステップです。「汎用」プログラマと **特定チームのシニアエンジニア** のギャップを埋めます。
+
+セクション 3 の完了により、包括的な特化環境を確立しました。ベースモデルを選び、持続可能な VRAM 予算を計算し、RAG と MCP 経由で地上真理知識を統合し、LoRA でエンジン固有スタイルを注入し、結果をチーム向け共有推論ホストへデプロイしました。
+
+アシスタントは今や完全に特化されています。次のセクションでは、**マルチモーダル AI** とその Shadow Acne や Z-fighting のような視覚グラフィックスバグを診断する能力を探りながら、アシスタントに視覚推論能力を与えます。
+
+次へ: xref:AI_Assisted_Vulkan/04_multimodal_ai/01_introduction.adoc[マルチモーダル AI: 視覚推論の能力]

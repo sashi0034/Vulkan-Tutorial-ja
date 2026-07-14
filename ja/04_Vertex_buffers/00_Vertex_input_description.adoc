@@ -1,0 +1,187 @@
+:pp: {plus}{plus}
+
+= 頂点入力の記述
+
+== はじめに
+
+次の数章では、頂点シェーダにハードコードされていた頂点データを、メモリ上の頂点バッファに置き換えます。
+まずは CPU から見えるバッファを作成し、`memcpy` で頂点データを直接コピーする最も簡単な方法から始め、その後でステージングバッファを使って高性能なメモリへ頂点データをコピーする方法を見ていきます。
+
+== 頂点シェーダ
+
+まず、頂点シェーダからシェーダコード自体に含まれている頂点データを取り除きます。
+頂点シェーダは、適切な順序で struct に宣言された頂点バッファからの入力を受け取ります。
+
+[,slang]
+----
+struct VSInput {
+    float2 inPosition;
+    float3 inColor;
+};
+
+struct VSOutput
+{
+    float4 pos : SV_Position;
+    float3 color;
+};
+
+[shader("vertex")]
+VSOutput vertMain(VSInput input) {
+    VSOutput output;
+    output.pos = float4(input.inPosition, 0.0, 1.0);
+    output.color = input.inColor;
+    return output;
+}
+
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+    return float4(vertIn.color, 1.0);
+}
+----
+
+`inPosition` と `inColor` 変数は _頂点属性_ です。
+これらは、以前 2 つの配列で頂点ごとに位置と色を手動で指定したのと同様に、頂点バッファ内で頂点ごとに指定されるプロパティです。
+
+== 頂点データ
+
+頂点データをシェーダコードからプログラム側の配列へ移します。
+まず、ベクトルや行列といった線形代数関連の型を提供する GLM ライブラリをインクルードします。
+これらの型を使って位置と色のベクトルを指定します。
+
+[,c++]
+----
+#include <glm/glm.hpp>
+----
+
+頂点シェーダで使う 2 つの属性を持つ新しい構造体 `Vertex` を作成します。
+
+[,c++]
+----
+struct Vertex
+{
+    glm::vec2 pos;
+    glm::vec3 color;
+};
+----
+
+GLM は、シェーダ言語で使われるベクトル型と正確に一致する C{pp} 型を便利に提供してくれます。
+
+[,c++]
+----
+const std::vector<Vertex> vertices = {
+    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
+};
+----
+
+今度は `Vertex` 構造体を使って頂点データの配列を指定します。
+以前とまったく同じ位置と色の値を使っていますが、1 つの頂点配列にまとめられています。
+これを頂点属性の _インターリーブ_ と呼びます。
+
+== バインディングの記述
+
+次のステップは、このデータ形式が GPU メモリにアップロードされたあと、頂点シェーダへどう渡すかを Vulkan に伝えることです。
+この情報を伝えるには 2 種類の構造体が必要です。
+
+最初の構造体は `vk::VertexInputBindingDescription` で、正しいデータで埋めるためのメンバ関数を `Vertex` 構造体に追加します。
+
+[,c++]
+----
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    static vk::VertexInputBindingDescription getBindingDescription()
+    {
+      return {.binding = 0, .stride = sizeof(Vertex), .inputRate = vk::VertexInputRate::eVertex};
+    }
+};
+----
+
+頂点バインディングは、頂点を処理するあいだメモリからどのレートでデータを読み込むかを記述します。
+データエントリ間のバイト数と、各頂点の後に次のエントリへ進むか、各インスタンスの後に進むかを指定します。
+
+頂点ごとのデータはすべて 1 つの配列にまとまっているので、バインディングは 1 つだけです。
+`binding` パラメータはバインディング配列内のインデックスを指定します。
+`stride` パラメータは 1 エントリから次のエントリまでのバイト数を指定し、`inputRate` パラメータは次のいずれかの値を取ります。
+
+* `vk::VertexInputRate::eVertex`  : 各頂点の後に次のデータエントリへ進む
+* `vk::VertexInputRate::eInstance`: 各インスタンスの後に次のデータエントリへ進む
+
+インスタンス描画は使わないので、頂点ごとのデータのままにします。
+
+== 属性の記述
+
+頂点入力の扱い方を記述する 2 つ目の構造体は `vk::VertexInputAttributeDescription` です。
+これらの構造体を埋めるためのヘルパー関数を、もう 1 つ `Vertex` に追加します。
+
+[,c++]
+----
+#include <array>
+
+...
+
+    static std::array<vk::VertexInputAttributeDescription, 2> getAttributeDescriptions()
+    {
+      return {{{.location = 0, .binding = 0, .format = vk::Format::eR32G32Sfloat, .offset = offsetof(Vertex, pos)},
+               {.location = 1, .binding = 0, .format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, color)}}};
+    }
+}
+----
+
+関数のプロトタイプが示すとおり、この構造体は 2 つになります。
+属性記述構造体は、バインディング記述から来る頂点データのまとまりから、頂点属性をどう取り出すかを記述します。
+位置と色の 2 つの属性があるので、属性記述構造体も 2 つ必要です。
+
+`location` パラメータは、頂点シェーダ内の入力の `location` ディレクティブを参照します。
+location `0` の頂点シェーダ入力は位置で、32 ビット浮動小数点コンポーネントを 2 つ持ちます。
+`binding` パラメータは、頂点ごとのデータがどのバインディングから来るかを Vulkan に伝えます。
+
+`format` パラメータは属性のデータ型を記述します。
+やや紛らわしいですが、フォーマットは色フォーマットと同じ列挙型で指定します。
+次のシェーダ型とフォーマットがよく一緒に使われます。
+
+* `float` : `vk::Format::eR32Sfloat`
+* `float2`: `vk::Format::eR32G32Sfloat`
+* `float3`: `vk::Format::eR32G32B32Sfloat`
+* `float4`: `vk::Format::eR32G32B32A32Sfloat`
+
+ご覧のとおり、シェーダのデータ型のコンポーネント数と色チャンネル数が一致するフォーマットを使うべきです。
+シェーダのコンポーネント数より多いチャンネルを使うこともできますが、余分なチャンネルは黙って破棄されます。
+チャンネル数がコンポーネント数より少ない場合、BGA コンポーネントにはデフォルト値 `(0, 0, 1)` が使われます。
+色の型（`Sfloat`、`Uint`、`Sint`）とビット幅も、シェーダ入力の型と一致させる必要があります。
+次の例を参照してください。
+
+* `int2`  : `vk::Format::eR32G32Sint`、32 ビット符号付き整数の 2 コンポーネントベクトル
+* `uint4` : `vk::Format::eR32G32B32A32Uint`、32 ビット符号なし整数の 4 コンポーネントベクトル
+* `double`: `vk::Format::eR64Sfloat`、倍精度（64 ビット）浮動小数点
+
+`format` パラメータは属性データのバイトサイズを暗黙的に定義し、`offset` パラメータは頂点ごとのデータの先頭から何バイト目を読むかを指定します。
+バインディングは一度に 1 つの `Vertex` を読み込み、位置属性（`pos`）はこの構造体の先頭から `0` バイトのオフセットにあります。
+これは `offsetof` マクロで自動的に計算されます。
+
+色属性もほぼ同じ方法で記述します。
+
+== パイプラインの頂点入力
+
+この形式の頂点データを受け入れるよう、`createGraphicsPipeline` 内の構造体を参照してグラフィックスパイプラインを設定する必要があります。
+`vertexInputInfo` 構造体を見つけて、2 つの記述を参照するよう変更します。
+
+[,c++]
+----
+auto                                     bindingDescription    = Vertex::getBindingDescription();
+auto                                     attributeDescriptions = Vertex::getAttributeDescriptions();
+vk::PipelineVertexInputStateCreateInfo   vertexInputInfo{.vertexBindingDescriptionCount   = 1,
+                                                         .pVertexBindingDescriptions      = &bindingDescription,
+                                                         .vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size()),
+                                                         .pVertexAttributeDescriptions    = attributeDescriptions.data()};
+----
+
+パイプラインは、`vertices` コンテナの形式の頂点データを受け入れ、頂点シェーダへ渡せるようになりました。
+xref:./01_Vertex_buffer_creation.adoc[次のステップ] は、頂点バッファを作成して頂点データを移し、GPU がアクセスできるようにすることです。
+
+link:/attachments/19_vertex_buffer.cpp[C{pp} code] /
+link:/attachments/19_shader_vertexbuffer.slang[slang shader] /
+link:/attachments/19_shader_vertexbuffer.vert[GLSL Vertex shader] /
+link:/attachments/19_shader_vertexbuffer.frag[GLSL Fragment shader]

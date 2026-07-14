@@ -1,0 +1,143 @@
+= 性能プロファイル: ルーフラインをマスターする
+:pp: ++
+:stem: latexmath
+
+Vulkan ML 実装は正しい——出力は PyTorch と浮動小数許容内で一致します。次は高速化したい。しかしどこから始めるか？
+
+測定なしの最適化は **当て推量** です。ReLU 活性化を数日手チューニングしても総実行時間の 1% 未満かもしれません。一方、畳み込みカーネルのメモリレイアウト問題が GPU 帯域幅の 80% を静かに無駄にしているかもしれません。
+
+本章では GPU の「ブラックボックス」を見通す方法を学びます。基本タイミングから深いハードウェアプロファイルへ、**ルーフラインモデル** でコードが遅い理由と現実的にどれだけ速くなり得るかを理解します。
+
+== 性能の心構え: 3 つのボトルネック
+
+現代 GPU では演算はほぼ「タダ」です。本当のコストは **データ移動** です。典型 GPU は VRAM から float 1 つ取得する時間に数千回の加算ができます。
+
+ML カーネルをプロファイルするとき、3 レジームのいずれかを探します。
+
+1.  **メモリバウンド**: コンピュートユニットがアイドルでメモリバスが飽和。重みや活性化が VRAM から届くのを待っている。
+2.  **コンピュートバウンド**: 演算が多すぎ（例: 巨大 7×7 畳み込み）てメモリバスが *あなた* を待っている。
+3.  **レイテンシバウンド**: メモリアクセスコストを隠す十分なスレッドを起動していない。バスは満杯でなくても個々のスレッドがデータ待ちでストール。
+
+プロファイルはどのレジームかを教えます。メモリバウンドなら、より複雑な活性化のような演算追加は文字通りタダです。コンピュートバウンドなら、アルゴリズム簡略化か高速ハードウェア命令が必要です。
+
+== プロファイルの準備
+
+重いツールの前に、正確な測定のため環境を整えます。
+
+*   **Release モード**: Debug ビルドをプロファイルしない。Debug は余分な同期や GPU 性能に重要なコンパイラ最適化無効化を含むことが多い。
+*   **GPU「ウォームアップ」**: 最初の数回推論はシェーダコンパイル、メモリ割り当て、ドライバオーバーヘッドで常に遅い。タイミング前に 10–20 回実行する。
+*   **固定クロック**: プロ向けベンチマークでは `nvidia-smi -lgc` などで GPU クロックを固定。「サーマルスロットリング」による非決定的結果を防ぐ。
+
+== ツール 1: Vulkan タイムスタンプクエリ（ストップウォッチ）
+
+最も基本的なプロファイルは Vulkan 組み込みの **タイムスタンプクエリ** です。コマンドバッファ内の任意 2 点間の GPU サイクル数を正確に測れます。
+
+=== タイムスタンプの実装
+タイムスタンプには **クエリプール** が必要です。
+
+[source,cpp]
+----
+// 1. Create a Query Pool
+vk::QueryPoolCreateInfo poolInfo{
+    .queryType = vk::QueryType::eTimestamp,
+    .queryCount = 2 // One for start, one for end
+};
+auto queryPool = device.createQueryPool(poolInfo);
+
+// 2. Record the timestamps in your command buffer
+cmd.resetQueryPool(queryPool, 0, 2);
+
+// We use 'eBottomOfPipe' to ensure the work is actually FINISHED
+cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, queryPool, 0);
+
+// ... Dispatch your compute shader ...
+
+cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, queryPool, 1);
+
+// 3. Retrieve the results after the fence wait
+uint64_t results[2];
+device.getQueryPoolResults(queryPool, 0, 2, sizeof(results), results,
+                           sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+
+// 4. Convert cycles to milliseconds
+// 'timestampPeriod' is from VkPhysicalDeviceLimits
+float ms = (results[1] - results[0]) * physicalDeviceLimits.timestampPeriod / 1e6f;
+----
+
+**利点**: オーバーヘッドが極めて低い。リアルタイム「性能 HUD」や CI ログでの各レイヤコスト記録に残せます。
+
+== ツール 2: ルーフラインモデル（地図）
+
+カーネルが「十分速い」かどうかは **ルーフラインモデル** で判断します。性能（GFLOPS）を **演算強度**（バイトあたり演算数）に対してプロットします。
+
+=== 数学的基礎
+すべての GPU には 2 つの物理限界があります。
+1.  **ピークコンピュート**: 秒あたり浮動小数演算の最大数（GFLOPS）。
+2.  **ピーク帯域幅**: 秒あたりメモリから読める最大バイト数（GB/s）。
+
+[latexmath]
+++++
+\text{Arithmetic Intensity} (I) = \frac{\text{Total FLOPs}}{\text{Total Bytes Transferred}}
+++++
+
+「ルーフライン」は次で定義されます。
+[latexmath]
+++++
+\text{Attainable Performance} = \min(\text{Peak Compute}, \text{Peak Bandwidth} \times I)
+++++
+
+=== ケーススタディ: 3×3 畳み込み
+224×224×64 テンソル上の 3×3 畳み込みを想像してください。
+
+*   **FLOPs**: latexmath:[224 \times 224 \times 64 \times (3 \times 3 \times 64 \times 2) \approx 3.6 \text{ Billion FLOPs}]
+*   **Bytes**: 重み、入力読み込み、出力書き込み latexmath:[\approx 50 \text{ Megabytes}]
+*   **強度**: latexmath:[3.6 \text{ GB} / 50 \text{ MB} \approx 72 \text{ FLOPs/Byte}]
+
+ピークメモリ帯域幅 **500 GB/s** の GPU では、このカーネルの「理論上限」は:
+[latexmath]
+++++
+500 \text{ GB/s} \times 72 \text{ FLOPs/Byte} = 36,000 \text{ GFLOPS (36 TFLOPS)}
+++++
+
+GPU のピークコンピュートが **15 TFLOPS** だけなら **コンピュートバウンド** です。メモリ最適化だけでは速くなりません。FP16 や Tensor Core など高速数学で「屋根」を上げる必要があります。
+
+== ツール 3: NVIDIA Nsight Compute（顕微鏡）
+
+タイムスタンプがカーネルが遅い *こと* を教え、Nsight Compute は *理由* を教えます。ハードウェア内部カウンタの深い分析を提供します。
+
+=== 注目すべき主要指標:
+*   **DRAM スループット**: > 80% なら **メモリバウンド**。データ再利用（タイリング）が必要。
+*   **コンピュート（SM）スループット**: > 80% なら **コンピュートバウンド**。
+*   **オキュパンシ**: GPU の「スレッドスロット」の何 % が埋まっているか。
+    *   **低オキュパンシ（< 20%）**: 通常、シェーダがレジスタや共有メモリを使いすぎ。メモリレイテンシを隠す十分なスレッドを起動できない。
+    *   **高オキュパンシ（> 50%）**: 良い。GPU が仕事で「飽和」している。
+
+== Vulkan ML の一般的なボトルネック
+
+=== 1. 非合并メモリアクセス
+**Warp**（32 スレッド）がメモリを読むとき、**連続 128 バイトブロック** を読みたい。スレッド 0 が index 0、スレッド 1 が index 1000 を読むと GPU は 2 回の別メモリトランザクションが必要。
+
+*   **修正**: `pixelIdx` 計算で隣接スレッドが隣接アドレスを読むようにする。コンピュートでは **NCHW** が **NHWC** より速いことが多い理由です。
+
+=== 2. レジスタプレッシャー
+各 GPU コンピュートユニットには固定数の **レジスタ**（最速メモリ）があります。シェーダがスレッドあたり 128 レジスタを使うと 256 スレッドしか走れないかもしれません。64 レジスタに減らせば 512 スレッド。
+
+*   **修正**: GLSL 内の巨大配列を避ける。コンパイラに変数管理を任せる。
+
+=== 3. Warp 分岐
+シェーダ内 `if` で warp の半分が一方、半分が他方に行くと、GPU は warp 全体で **両方のパスを順次** 実行する。
+
+*   **修正**: シェーダを「フラット」に。可能なら `if` の代わりに `clamp()` や `max()` を使う。
+
+== まとめ: データ駆動最適化
+
+性能プロファイルは「闇で突っ込む」と外科的精密工学の差です。ここで述べたツールと指標により、最適化を予測可能なプロセスに変えます。
+
+*   タイムスタンプで **測定** し、最も遅いレイヤを見つける。
+*   Nsight や RGP で **分析** し、ハードウェアボトルネックを特定する。
+*   演算強度を **計算** し、理論上限を見る。
+*   時間の 80% を占めるコードの 20% にだけ **集中** する。
+
+次章ではこれらの洞察を **最適化技法** に適用し、遅いシェーダを高性能 ML エンジンに変えるパターンを学びます。
+
+xref:ML_Inference/Debugging_and_Performance/03_verifying_correctness.adoc[前へ: 正しさの検証] | xref:ML_Inference/Debugging_and_Performance/05_optimization_techniques.adoc[次へ: 最適化技法]

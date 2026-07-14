@@ -1,0 +1,68 @@
+:pp: {plus}{plus}
+= 表示時刻予測
+
+安定した没入感のある空間体験の鍵は、ユーザーが実際にフレームを見る未来の時点にエンジンの内部状態を揃えることです。ここで `XrFrameState` の `predictedDisplayTime` が登場します。このタイムスタンプを 2 つの重要なタスクに使わなければなりません。**ユーザーの頭（ビュー）の位置特定** と **シミュレーション（物理とアニメーション）の計算** です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+予測表示時刻を正しく利用することは、XR アプリケーションの必須要件です。シミュレーションとレンダリングをこのタイムスタンプに揃えないと、「スウィム」と乗り物酔いにつながります。
+
+== 1. ユーザーの位置特定（`xrLocateViews`）
+
+ビューを描画するとき、ユーザーの眼がどこにあるかを正確に知る必要があります。「現在」の頭のポーズを使うと、フレームが遅れて見えます。`xrLocateViews` を使い、未来の `displayTime` におけるユーザーのポーズを予測するようランタイムに尋ねます。
+
+[source,cpp]
+----
+// Predicting where the user will be at the moment of display
+XrViewLocateInfo viewLocateInfo{
+    .type = XR_TYPE_VIEW_LOCATE_INFO,
+    .viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+    .displayTime = frameState.predictedDisplayTime,
+    .space = xrAppSpace
+};
+
+XrViewState viewState{XR_TYPE_VIEW_STATE};
+uint32_t viewCountOutput;
+std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
+xrLocateViews(xrSession, &viewLocateInfo, &viewState, viewCount, &viewCountOutput, views.data());
+----
+
+結果の `XrView` 配列は予測された **Pose** と **FOV** を含みます。FOV は変わり得ることに注意——一部のヘッドセットはフォーカスに基づきシフトする動的レンズを使うため、これらの値で投影行列を *毎フレーム* 更新しなければなりません。
+
+== 2. シミュレーション整合: 物理の同期
+
+予測しなければならないのはカメラだけではありません。世界シミュレーション全体（物理、アニメーション、パーティクルシステム）を `predictedDisplayTime` に揃えなければなりません。
+
+ビュー予測と異なるデルタタイム（固定 60Hz 更新など）をシミュレーションに使うと、世界のオブジェクトがユーザーの頭の動きに対して「ジッター」して見えます。エンジンでは、現在フレームと前フレームの予測の差に基づきシミュレーションのデルタタイムを計算します。
+
+[source,cpp]
+----
+double deltaTime = static_cast<double>(currentPredictedTime - lastPredictedTime) / 1e9; // Convert nanoseconds to seconds
+engine.update(deltaTime);
+----
+
+== 発展: GPU 時間と物理ポーズの相関
+
+ランタイムが最善の推測ポーズを提供する一方、Vulkan では整合をさらに洗練できます。
+
+*   **GPU 実行時間の相関**: GPU 側の実行時間を OpenXR システムクロックと相関させられます。頂点シェーダーがシーン変換に要する正確な時間を測定でき、「動的複雑度」スケーリングによりエンジンのレンダー時間を予測表示ウィンドウ内に完璧に保てます。
+*   **物理対応ポーズ調整**: ユーザーの頭が仮想の壁を突き抜けそうな場合、Vulkan の **コンピュートシェーダー** でリアルタイムの「ポーズクランプ」を行い、最終レンダーパス前にエンジンの物理データに基づき OpenXR 予測を調整できます。
+
+== クロックドリフトの危険
+
+XR 開発でよくある過ちは、シミュレーション駆動に `std::chrono::now()` や `glfwGetTime()` を使うことです。これらのクロックは XR ランタイムの心拍から切り離されています。
+
+*   **システムクロック**: 現実世界の壁時計時間を測る。
+*   **XR クロック**: ヘッドセットハードウェアのディスプレイストローブを測る。
+
+同時に始まっても、やがて **ドリフト** します。30 分のプレイ後、物理エンジンがディスプレイの実際のリフレッシュサイクルより 5ms 先行または遅延しているかもしれません。このドリフトが、`predictedDisplayTime` を一貫して使わないとデバッグ不可能な「ランダム」なスタッタやヒッチを引き起こします。
+
+TIP: 時間予測の詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#xrLocateViews[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+== 次のステップ: レイテンシの最小化
+
+フレームループが正しくペースされ、シミュレーションが未来に揃った今、高品質な空間体験の基盤が整いました。次章では **レイトラッチング** と、**タイムラインセマフォ** が「スウィム」の最後のマイクロ秒をどう削れるかを探ります。
+
+xref:OpenXR_Vulkan_Spatial_Computing/05_Predictive_Frame_Loop/02_xr_lifecycle.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/05_Predictive_Frame_Loop/04_incorporating_into_the_engine.adoc[次へ]

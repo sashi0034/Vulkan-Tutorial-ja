@@ -1,0 +1,99 @@
+:pp: {plus}{plus}
+= スループットの最大化: オーバーラップ候補の特定
+
+== GPU の「穴」を見つける
+
+GPU スループットを最大化するには、コマンドバッファの単純な線形実行を超えて考える必要があります。**レイテンシ束縛**（メモリや固定機能ユニットの待ちに多くの時間を費やす）のワークロードを見つけ、**コンピュート束縛**（GPU の演算ユニットを大きく使う）のワークロードと組み合わせたいのです。
+
+典型例が **シャドウパス** です。GPU が頂点処理とシャドウ用のデプスオンリージオメトリのラスタライズで忙しい間、コンピュートやシェーディングユニットの多くはアイドルです。これは、物理シミュレーションやオクルージョンカリングパスなどの非同期コンピュートタスクで埋められる完璧な「穴」です。
+
+== Simple Engine のケーススタディ: 物理とオーディオコンピュート
+
+`Simple Engine` には、非同期コンピュートの有力候補である二つの主要システムがあります。**物理システム**（`physics_system.cpp`）と **オーディオ HRTF システム**（`audio_system.cpp`）です。
+
+`PhysicsSystem` は、GPU 加速コンピュートシェーダ（`shaders/physics.slang`）で積分や衝突検出などの複雑なシミュレーションを行います。同様に `AudioSystem` は、コンピュートシェーダ（`shaders/hrtf.slang`）で GPU 上のオーディオ空間化（Head-Related Transfer Function）を処理します。
+
+現在、どちらのシステムも **逐次的でブロッキング** なパターンに従っています。例えば物理シミュレーションは GPU にサブミットされ、CPU はすぐにフェンスでストールします。
+
+[,cpp]
+----
+// Sequential Physics Dispatch (Current Engine)
+physicsSystem->Update(deltaTime); // Internally calls SimulatePhysicsOnGPU
+
+// Inside PhysicsSystem::SimulatePhysicsOnGPU:
+// 1. Submit compute commands to computeQueue
+// 2. ReadbackGPUPhysicsData: blocks on a fence (CPU STALL!)
+----
+
+この CPU 側のストールは、オーバーラップの機会を逃しています。スループットを最大化するには、エンジンの専用 **コンピュートキュー**（`renderer->GetComputeQueue()` 経由で取得）を使い、この流れを非同期に再設計できます。フレームの早い段階でこれらのタスクをサブミットし、データが本当に必要なときだけ同期することで、グラフィックスとコンピュートのハードウェアユニットの両方をフルに占有できます。
+
+物理とオーディオに加え、エンジンの **Forward+ レンダリング** パス（`ForwardPlus_Rendering.adoc` 参照）もオーバーラップの有力候補です。Forward+ コンピュートパス（`forward_plus_cull.slang`）は、画面上の各タイル用のライトリストを構築します。このコンピュートパスは効果的な Z カリングのために *現在* のフレームのデプスバッファを必要としますが、ジオメトリパス全体の完了を待つ必要はありません。
+
+**タイムラインセマフォ** を使えば、コンピュートキューに **デプスプリパス** が完了するまでだけ待つよう伝えられます。グラフィックスキューがメインの **不透明ジオメトリ** レンダリングを続ける間、コンピュートキューは同じピクセル用のライトカリングを同時に行え、コンピュート負荷の高いライト割り当てとラスタ負荷の高いジオメトリ処理を完璧にオーバーラップできます。
+
+== 依存アーキテクチャ
+
+これらのワークロードをオーバーラップさせる鍵は、依存関係の設計方法です。すべてに単一のグローバルタイムラインを使うと、意図せずボトルネックを作ることがあります。代わりに、GPU の各主要「エンジン」ごとに複数のタイムラインセマフォを使い、本当に必要なときだけ協調させるべきです。
+
+例えば、グラフィックスキューは自身のタイムライン上で「ジオメトリ完了」の値をシグナルできます。コンピュートキューはその値を待ってから作業を始めつつ、ジオメトリに依存しない他のタスクを同時に続けられます。
+
+[,cpp]
+----
+// Compute queue waiting for graphics geometry completion
+auto computeWaitInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *graphicsTimeline,
+    .value = geometryFrameValue,
+    .stageMask = vk::PipelineStageFlagBits2::eComputeShader
+};
+
+auto computeSubmit = vk::SubmitInfo2{
+    .waitSemaphoreInfoCount = 1,
+    .pWaitSemaphoreInfos = &computeWaitInfo,
+    // ...
+};
+
+computeQueue.submit2(computeSubmit);
+----
+
+== オーバーラップのためのサブミット
+
+複数のキューがあるだけでは足りません。ハードウェアが実際に並列化できる形で作業をサブミットする必要があります。ほとんどの現代ハードウェアでは、これは「バックグラウンド」のコンピュート作業を専用の非同期コンピュートキューへサブミットすることを意味します。
+
+=== 専用キューの特定
+
+Vulkan では、キューは **キューファミリー** にグループ化されます。真に非同期なコンピュートキューを得るには、`vk::QueueFlagBits::eCompute` をサポートするが `vk::QueueFlagBits::eGraphics` をサポート *しない* キューファミリーを探すべきです。これにより、グラフィックスユニットと同じフロントエンドコマンドプロセッサを共有しない、コンピュート専用のパスがハードウェアにあることが保証されます。
+
+エンジンでこれらの専用ファミリーを特定する方法です。
+
+[,cpp]
+----
+uint32_t computeQueueFamilyIndex = std::numeric_limits<uint32_t>::max();
+auto queueFamilies = physicalDevice.getQueueFamilyProperties();
+
+for (uint32_t i = 0; i < queueFamilies.size(); ++i) {
+    // Look for a family that has compute but NOT graphics for true async
+    if ((queueFamilies[i].queueFlags & vk::QueueFlagBits::eCompute) &&
+        !(queueFamilies[i].queueFlags & vk::QueueFlagBits::eGraphics)) {
+        computeQueueFamilyIndex = i;
+        break;
+    }
+}
+
+// Fallback: if no dedicated compute family exists, use any that supports compute
+if (computeQueueFamilyIndex == std::numeric_limits<uint32_t>::max()) {
+    for (uint32_t i = 0; i < queueFamilies.size(); ++i) {
+        if (queueFamilies[i].queueFlags & vk::QueueFlagBits::eCompute) {
+            computeQueueFamilyIndex = i;
+            break;
+        }
+    }
+}
+----
+
+これらの専用キューを使い、メイングラフィックスループからコンピュート作業のサブミッションを分離することで、ドライバがそれらを並行してスケジュールできるようになります。グラフィックスキューが一時的にストールしている（例: ディスプレイ待ちやキャッシュフラッシュ）場合、コンピュートキューが介入してハードウェアを忙しく保てます。
+
+次の節では、このパターンの具体的な実装——非同期ポストプロセス——を見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Async_Compute_Overlap/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Async_Compute_Overlap/03_async_post_processing.adoc[非同期ポストプロセス]

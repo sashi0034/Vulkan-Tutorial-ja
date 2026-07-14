@@ -1,0 +1,222 @@
+:pp: {plus}{plus}
+= 一度スキンしてどこでも使う
+
+== 成果
+
+前二節で、レストポーズ頂点バッファをアニメーション頂点バッファへ変換し、結果を専用の出力 SSBO に格納するコンピュートスキニングパイプラインを構築しました。いよいよその投資の成果を回収します。
+
+**"Skin Once, Use Everywhere"** の前提は、アニメーション頂点データを必要とするすべてのシステムが同じ出力バッファから読むべきだということです。ラスタライザとレイトレーサーで別々のスキニングパスを走らせません。T ポーズ幾何で物理衝突を近似しません。一度スキンすれば、誰もが同じ正しいアニメーションメッシュを得ます。本節では、それぞれの利用者をどう接続するかを説明します。
+
+== 利用者 1: ラスタライザ
+
+出力頂点バッファはすでに `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT` フラグで作成されているため、これが最も単純に接続できる利用者です。Vulkan の観点では、ただの頂点バッファです。ラスタライザはコンピュートシェーダーが書いたものかどうかを知らず、気にもしません。
+
+変更は最小限です。スキニングされたメッシュの描画呼び出しでレストポーズ頂点バッファをバインドする代わりに、出力頂点バッファをバインドします。
+
+[source,cpp]
+----
+void draw_skinned_mesh(
+    VkCommandBuffer cmd,
+    const SkinComputeResources& skin,
+    VkBuffer index_buffer,
+    uint32_t index_count)
+{
+    // The key change: bind the COMPUTE OUTPUT buffer as the vertex source,
+    // not the original rest-pose vertex buffer.
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &skin.output_vertex_buffer, &offset);
+    vkCmdBindIndexBuffer(cmd, index_buffer, 0, VK_INDEX_TYPE_UINT32);
+
+    // Draw as normal - the rasterizer will read animated positions and normals
+    vkCmdDrawIndexed(cmd, index_count, 1, 0, 0, 0);
+}
+----
+
+重要な注意点があります。**インデックスバッファ** は変わりません。メッシュのトポロジ—どの頂点がどの三角形を形成するか—はキャラクターがアニメーションしても変わりません。変わるのは頂点位置・法線・接線だけです。インデックスバッファは常にレストポーズ頂点レイアウトを参照し、頂点順序を同一に保ったため、出力バッファの構造に直接対応します。
+
+スキニングされたメッシュ用の頂点シェーダーも単純になります。スキニング数学を行う必要がなくなります。バッファからすでにアニメーション済みの位置と法線を読み、クリップ空間変換に進むだけです。
+
+[source,slang]
+----
+// skinned_mesh.vert.slang
+// The vertex shader for skinned meshes does NO skinning itself.
+// The compute shader already did the work.
+// Field order matches OutputVertex in renderer_advanced_types.h:
+// position, normal, texcoord, tangent.
+struct VertexInput {
+    float3 position  : POSITION;
+    float3 normal    : NORMAL;
+    float2 texcoord  : TEXCOORD0;
+    float4 tangent   : TANGENT;
+};
+
+struct VertexOutput {
+    float4 clip_pos  : SV_Position;
+    float3 world_pos : TEXCOORD1;
+    float3 normal    : TEXCOORD2;
+    float2 texcoord  : TEXCOORD0;
+};
+
+cbuffer CameraUBO {
+    float4x4 view;
+    float4x4 projection;
+};
+
+[shader("vertex")]
+VertexOutput main(VertexInput input)
+{
+    VertexOutput output;
+    // The position is already in world space — compute shader handled the animation.
+    output.clip_pos  = mul(projection, mul(view, float4(input.position, 1.0)));
+    output.world_pos = input.position;
+    output.normal    = input.normal;
+    output.texcoord  = input.texcoord;
+    return output;
+}
+----
+
+== 利用者 2: レイトレーシング加速構造
+
+Vulkan のレイトレーシングには二段階の加速構造階層が必要です。**Bottom-Level Acceleration Structure（BLAS）** は実際のジオメトリ—特定メッシュの三角形—を格納します。**Top-Level Acceleration Structure（TLAS）** は BLAS のインスタンスを各々変換行列付きで格納し、レイトレーシングシェーダーが実際にトラバースするものです。
+
+静的ジオメトリでは BLAS を一度構築して二度と触りません。アニメーションするスキニングジオメトリでは頂点位置が毎フレーム変わるため、BLAS も毎フレーム更新が必要です。
+
+Vulkan は **BLAS 更新**（**BLAS refit** とも呼ばれる）でこれをサポートします。refit は加速構造の高速なインプレース更新で、ゼロから再構築せず BVH（Bounding Volume Hierarchy）ツリーを再三角分割します。refit は完全再構築より大幅に速く（通常 5〜10 倍）、スキニングジオメトリのフレームごとの更新に適しています。
+
+共有バッファでこれを機能させる鍵は単純です。BLAS のジオメトリを指定するとき、レストポーズバッファではなくコンピュートシェーダーの出力バッファを指します。
+
+[source,cpp]
+----
+// Called at initialization: create the initial BLAS pointing at our output buffer.
+// The BLAS uses our output buffer as its geometry source.
+VkAccelerationStructureGeometryKHR geometry{};
+geometry.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+
+auto& triangles = geometry.geometry.triangles;
+triangles.sType          = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+triangles.vertexFormat   = VK_FORMAT_R32G32B32_SFLOAT;
+triangles.vertexStride   = sizeof(OutputVertex); // Stride of our output vertex layout
+
+// The crucial line: use the output vertex buffer's device address as the geometry source
+triangles.vertexData.deviceAddress = get_buffer_device_address(device, skin.output_vertex_buffer);
+triangles.maxVertex      = skin.vertex_count - 1;
+triangles.indexType      = VK_INDEX_TYPE_UINT32;
+triangles.indexData.deviceAddress = get_buffer_device_address(device, skin.index_buffer);
+----
+
+次に毎フレーム—コンピュートスキニングのディスパッチとそのパイプラインバリアの後—BLAS refit を発行します。
+
+[source,cpp]
+----
+// Called every frame, after the skinning barrier
+void update_blas(
+    VkCommandBuffer cmd,
+    VkAccelerationStructureKHR blas,
+    const VkAccelerationStructureBuildGeometryInfoKHR& build_info_template,
+    uint32_t primitive_count)
+{
+    VkAccelerationStructureBuildGeometryInfoKHR build_info = build_info_template;
+
+    // Specify UPDATE mode (not BUILD) — this is the "refit" operation
+    build_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+    build_info.srcAccelerationStructure = blas; // Refit in-place
+    build_info.dstAccelerationStructure = blas;
+
+    VkAccelerationStructureBuildRangeInfoKHR range_info{};
+    range_info.primitiveCount = primitive_count; // Number of triangles
+
+    const VkAccelerationStructureBuildRangeInfoKHR* p_range_info = &range_info;
+    vkCmdBuildAccelerationStructuresKHR(cmd, 1, &build_info, &p_range_info);
+}
+----
+
+refit が完了すると、BLAS には更新されたジオメトリが含まれ、このフレーム中のレイトレーシングクエリはアニメーションしたメッシュと正しく交差します。キャラクターの影、反射、アンビエントオクルージョンはすべて T ポーズではなくアニメーションしたポーズに応答します。
+
+重要な注意点があります。BLAS refit はトポロジが変わらず、フレーム間で頂点位置が劇的に動かないときに最も効果的です。滑らかなスケルタルアニメーションに最適です。布シミュレーションや非常に速いアクションのように頂点が大きく動くアニメーションでは、完全 BLAS 再構築の方がレイトトラバーサル性能が良くなることがありますが、追加の再構築時間というコストがあります。
+
+== 利用者 3: 物理システム統合
+
+物理システムはおそらくスキニング頂点バッファの最も微妙な利用者です。ラスタライザやレイトレーサー—GPU バッファを直接アドレスできる—とは異なり、ほとんどの物理エンジン（Bullet、Jolt、PhysX）は CPU 側ライブラリです。衝突と力を CPU 上で完全に計算し、GPU メモリへ直接アクセスできません。
+
+これが緊張を生みます。アニメーション頂点データは GPU にあり、物理エンジンは CPU 上で必要とします。
+
+これを解決する二つのアプローチがあり、正しい選択はユースケース次第です。
+
+=== アプローチ 1: ボーンプロキシコライダー（推奨）
+
+キャラクターのラグドールやほとんどのゲームプレイ物理では、メッシュ頂点バッファ全体を読み戻す必要はなく、高価です。代わりに、スケルトンの特定ボーンに簡略化された **コリジョン形状**—カプセル、ボックス、球—をアタッチします。前章の「Physics Syncing」節でこのパターンをすでに確立しています。
+
+このアプローチでは、GPU から実際のメッシュ頂点を読む必要はありません。物理システムはボーンプロキシで動作し、スケルトンのジョイント変換によって駆動されます。それらの変換はすでに CPU 上にあります（ジョイント行列計算ステップで計算済み）。GPU 上のメッシュスキニングは純粋に視覚的—キャラクターを *正しく見せる* ものです。
+
+これはキャラクター物理ユースケースの 95% に適したアプローチです。安価で堅牢、アーティストがコリジョンジオメトリを直接制御できます。
+
+=== アプローチ 2: メッシュ精度の物理クエリ（上級）
+
+ときどき、ボーンプロキシでは提供できない物理精度が必要です。例には次があります。
+
+- **布やソフトボディシミュレーション** で物理エンジンがすべての頂点位置を知る必要がある場合
+- キャラクターのマントがジオメトリと相互作用するような、非常に詳細なオブジェクトの **メッシュ精度コリジョン**
+- 特定メッシュ領域が衝突したときに発火する **物理ベースのサウンドトリガー**
+
+これらの場合、出力頂点バッファの一部または全部を GPU から CPU に読み戻す必要があります。これは **ステージングバッファ** と GPU から CPU へのメモリ転送で行います。
+
+[source,cpp]
+----
+// Only do this if you truly need mesh-accurate CPU-side physics.
+// This is expensive: it stalls the GPU pipeline and involves a memory copy.
+void readback_vertices_to_physics(
+    VkCommandBuffer cmd,
+    VkBuffer output_vertex_buffer,
+    VkBuffer staging_buffer,  // CPU-visible (host-coherent) staging buffer
+    uint32_t vertex_count,
+    std::vector<PhysicsVertex>& physics_verts_out)
+{
+    VkBufferCopy copy_region{};
+    copy_region.srcOffset = 0;
+    copy_region.dstOffset = 0;
+    copy_region.size = vertex_count * sizeof(OutputVertex);
+
+    // Copy from GPU-local output buffer to CPU-accessible staging buffer
+    vkCmdCopyBuffer(cmd, output_vertex_buffer, staging_buffer, 1, &copy_region);
+
+    // After the command buffer executes and fences signal, map the staging buffer
+    // and copy the data into the physics system's vertex array.
+    // (This part happens after vkQueueSubmit and fence wait)
+}
+----
+
+このアプローチはレイテンシを追加します。*このフレーム* で計算されたデータを、*次フレーム* のシミュレーションに影響する物理へ読み込んでいます。ほとんどのゲームでは、この 1 フレームの遅れは許容でき見えません。タイミングが厳しい非常に速いゲームプレイでは、このレイテンシを避けるアーキテクチャが必要かもしれません。
+
+== まとめて: データフロー
+
+構築したデータフローを一度立ち止まって確認する価値があります。
+
+....
+[glTF File on Disk]
+         |
+         | (load at startup)
+         v
+[CPU: Rest-Pose Vertices]  ──upload──>  [GPU: Input Vertex Buffer]
+[CPU: Inverse Bind Matrices]            (never changes again)
+         |
+    (each frame)
+         |
+[CPU: Animation Update]
+[CPU: Scene Graph Update]
+[CPU: Compute Joint Matrices]  ──upload──>  [GPU: Joint Matrix Buffer]
+                                             (updated each frame)
+         |
+    (GPU Compute Dispatch)
+         v
+         [GPU: Output Vertex Buffer]  (animated, correct, up to date)
+        /           |              \
+       v            v               v
+[Rasterizer]  [Ray Tracing BLAS]  [Physics Readback (if needed)]
+....
+
+レンダリングとシミュレーションスタックのすべての部分が、単一の権威あるアニメーション頂点データソースから読みます。キャラクターの腕が上がっていれば、影、反射、コリジョン、ラスタライズされた画像すべてが腕が上がった状態を示します。不整合も二重計算も T ポーズアーティファクトもありません。
+
+次節では、アニメーション自体の品質に注目します。これまで線形キーフレーム補間を仮定してきましたが、これは単純な一方で機械的な動きを生みます。滑らかで自然な曲線のための三次スプライン補間を実装し、複数アニメーションクリップ間のブレンド—アニメーションから物理駆動ラグドールへの重要な遷移を含む—能力を追加します。
+
+xref:Advanced_glTF/Skeletal_Compute_Skinning/03_compute_skinning.adoc[前へ: コンピュートスキニングパイプライン] | xref:Advanced_glTF/Skeletal_Compute_Skinning/05_interpolation_blending.adoc[次へ: 補間とブレンド]

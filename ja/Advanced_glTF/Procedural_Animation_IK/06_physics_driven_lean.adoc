@@ -1,0 +1,163 @@
+:pp: {plus}{plus}
+= 物理駆動プロシージャルリーン
+
+== キャラクターがリーンする理由
+
+三人称アクションゲームで最もよく見る視覚的アーティファクト—何を見れば分かるプレイヤーなら誰でも—は、コーナーを完璧に垂直な姿勢のまま走り回るキャラクターです。現実では、人（質量を持つ物体）が方向転換すると慣性が外側へ押し、それを打ち消すために内側へリーンします。急カーブに大きくリーンする自転車。前傾した短距離走者の全身。音に鋭く振り向く兵士。いずれも「運動量」と「重さ」として読み取れる特徴的な胴体の傾きを伴います。
+
+このリーンが欠けると、キャラクターは無重量に感じられます。抵抗する世界を移動するのではなく、レール上を滑るように見えます。加速・減速・旋回中—特にそのとき—に、物理から導いたわずかな傾きを加えると、質量と存在感が劇的に向上します。
+
+良いニュースは、完全な物理シミュレーションは不要なことです。リーン角はキャラクターの現在速度ベクトルとその変化率の関数であり、どちらも物理シミュレーション出力（キャラクターコントローラがあればそこ）から計算できます。そのリーンを脊椎ジョイントへのプロシージャル回転として、ベースアニメーションの上にレイヤーできます。
+
+== リーンの物理
+
+計算の前に、リーンが実際に何かを理解しましょう。キャラクターが前進加速すると、慣性が速度変化に抵抗します。キャラクターの参照系からは後方への力のように感じ—走るとき前傾し、急ブレーキではわずかに後傾する理由です。リーン角は水平加速度と垂直重力加速度の比で決まります。
+
+`lean_angle = atan2(horizontal_acceleration, gravity)`
+
+標準重力（9.8 m/s²）の惑星で 5 m/s² 加速するキャラクターでは、リーン角はおよそ `atan2(5, 9.8) ≈ 27 度` です。短距離走者に見える相当なリーンで、積極的加速では重心を足の上に保つために大きな前傾が必要であることを反映します。
+
+旋回では物理がやや異なります。円運動すると向心加速度が旋回中心へ引きます。打ち消すリーンは次のとおりです。
+
+`lean_angle = atan2(v² / r, gravity)`
+
+ここで `v` は速度、`r` は旋回半径です。同じ速度ではきつい旋回ほど多くのリーンが必要で、速い旋回ほど遅い旋回より多くのリーンが必要な理由です。
+
+実際には、キャラクターの速度履歴から加速度ベクトルと向心加速度を計算し、単一の「実効重力」ベクトルにまとめ、脊椎をそのベクトルに揃えて傾けます。
+
+== リーンベクトルの計算
+
+キャラクターの速度と、直前フレームからの速度変化（加速度）が必要です。物理エンジンを使うなら、キャラクターコントローラの剛体から両方取得できます。キネマティックキャラクターコントローラ（直接動かすタイプ）なら、前フレーム速度を追跡して自分で差分を計算する必要があります。
+
+[source,cpp]
+----
+struct CharacterMotionState {
+    glm::vec3 velocity;           // Current world-space velocity
+    glm::vec3 previous_velocity;  // Velocity from last frame
+    glm::vec3 smoothed_lean_vec;  // Low-pass filtered lean direction
+};
+
+// Compute the "effective downward" direction that the character perceives
+// due to their motion. The spine should align perpendicular to this direction.
+glm::vec3 compute_lean_vector(
+    const CharacterMotionState& motion,
+    float                       gravity,     // Positive value (e.g. 9.8)
+    float                       delta_time,
+    float                       lean_strength) // Scale factor; 1.0 = physically accurate
+{
+    // Linear acceleration from velocity change
+    glm::vec3 accel = (motion.velocity - motion.previous_velocity) / delta_time;
+
+    // For lean, we care about the horizontal component of acceleration.
+    // Vertical acceleration (e.g., falling) should not tilt the spine.
+    glm::vec3 horizontal_accel(accel.x, 0, accel.z);
+
+    // The effective gravity that the character "feels" in their reference frame
+    // is the sum of real gravity (downward) and the reaction to their acceleration
+    // (opposite to their acceleration direction).
+    // We negate horizontal_accel because lean opposes the acceleration direction.
+    glm::vec3 effective_gravity(
+        -horizontal_accel.x * lean_strength,
+        -gravity,
+        -horizontal_accel.z * lean_strength
+    );
+
+    return glm::normalize(effective_gravity);
+}
+----
+
+`lean_strength` はチューニングノブです。1.0 は物理的に正確なリーン角ですが、ゲームキャラクターには極端すぎることがあります（27 度のリーンは全力疾走のアスリートでは自然でも、剣を振るキャラクターでは誇張に見えるかもしれません）。0.3〜0.7 前後がゲームキャラクターではよく見えます—倒れそうに見えず、重さと運動量を伝える程度です。
+
+== 脊椎へのリーン適用
+
+リーンベクトルが計算できたら、脊椎回転として適用します。脊椎の「上」軸（胴体が向く方向）は実効重力ベクトルの負と揃うべき—すなわち、知覚される重力引きと逆方向へ胴体を傾けます。
+
+ルックアットチェーンと同様、脊椎ジョイント全体にリーンを分配します。各ジョイントが総傾き角の分数を担い、下脊椎ほど上より多く寄与します（リーンは腰から始まり脊椎を上へ伝わります）。
+
+[source,cpp]
+----
+struct LeanController {
+    std::vector<uint32_t> spine_joints;   // Ordered from pelvis to upper spine
+    std::vector<float>    joint_weights;  // Per-joint share (should sum to 1)
+    glm::vec3 local_up_axis;             // The joint's "up" in local space
+    float     max_lean_degrees;          // Safety cap on total lean
+    float     smoothing_speed;           // How quickly lean responds to velocity changes
+};
+
+void apply_physics_lean(
+    std::vector<Node>&          nodes,
+    const LeanController&       controller,
+    const CharacterMotionState& motion,
+    float                       gravity,
+    float                       delta_time,
+    float                       lean_strength,
+    glm::vec3&                  smoothed_lean_vec) // persistent state
+{
+    // Compute the raw lean vector from this frame's physics data
+    glm::vec3 raw_lean_vec = compute_lean_vector(motion, gravity, delta_time, lean_strength);
+
+    // Smooth it over time to prevent jittery lean from noisy acceleration data
+    float t = glm::clamp(controller.smoothing_speed * delta_time, 0.0f, 1.0f);
+    smoothed_lean_vec = glm::normalize(glm::mix(smoothed_lean_vec, raw_lean_vec, t));
+
+    // The world "up" direction
+    const glm::vec3 world_up(0, 1, 0);
+
+    // The lean angle is the angle between world_up and the smoothed lean vector
+    float lean_angle = std::acos(glm::clamp(glm::dot(smoothed_lean_vec, -world_up), -1.0f, 1.0f));
+    if (lean_angle < glm::radians(0.5f)) return; // Less than half a degree; skip
+
+    // Clamp to the maximum allowed lean
+    lean_angle = std::min(lean_angle, glm::radians(controller.max_lean_degrees));
+
+    // The axis around which we lean is perpendicular to both world_up and the lean vector
+    glm::vec3 lean_axis = glm::cross(-world_up, smoothed_lean_vec);
+    if (glm::length(lean_axis) < 1e-6f) return; // No lean direction; moving straight up/down
+    lean_axis = glm::normalize(lean_axis);
+
+    // Distribute the lean across the spine joints
+    for (size_t i = 0; i < controller.spine_joints.size(); ++i) {
+        uint32_t joint_idx   = controller.spine_joints[i];
+        float    joint_angle = lean_angle * controller.joint_weights[i];
+        if (joint_angle < 1e-5f) continue;
+
+        Node& joint = nodes[joint_idx];
+        glm::quat world_correction = glm::angleAxis(joint_angle, lean_axis);
+        glm::quat new_world_rot    = world_correction * joint.get_world_rotation();
+
+        glm::quat parent_world_rot = (joint.parent_index != INVALID_NODE_INDEX)
+            ? nodes[joint.parent_index].get_world_rotation()
+            : glm::quat(1, 0, 0, 0);
+
+        joint.local_rotation = glm::inverse(parent_world_rot) * new_world_rot;
+        joint.mark_dirty();
+        update_world_matrices_subtree(nodes, joint_idx);
+    }
+}
+----
+
+== リーンとルックアット・IK の組み合わせ
+
+ここまでで、脊椎と頭ジョイントをすべて変更する 3 つのプロシージャルレイヤーがあります。足置き IK（骨盤高さと脚チェーン調整）、ルックアット（首と頭の回転）、物理駆動リーン（脊椎の傾き）です。3 つは干渉なく共存する必要があります。
+
+鍵は **適用順序** です。シーングラフへのプロシージャル補正は順次適用され、各レイヤーは前の結果の上に構築されます。典型的なヒューマノイドでは正しい順序は次のとおりです。
+
+1. **ベースアニメーションを再生する。** キーフレームデータからすべてのジョイントローカル回転を設定します。シーングラフはアニメーションポーズを反映します。
+
+2. **ワールド行列を伝播する。** Dirty Flag 更新を実行し、すべてのノードのワールド行列を計算します。
+
+3. **足置き IK を適用する。** 骨盤の平行移動と脚チェーン回転を調整します。足位置が地形に対して正しくなります。
+
+4. **再度ワールド行列を伝播する。** 脚補正で脚の子孫のワールド行列が変わったため、続行前に新しいワールド行列が必要です。
+
+5. **物理駆動リーンを適用する。** 脊椎ジョイントを傾けます。リーンはアニメーションと足補正の上に適用されます。
+
+6. **再度ワールド行列を伝播する。**
+
+7. **ルックアットを適用する。** 首と頭を回転します。ルックアットを最後に適用すると、脊椎のリーン調整後の向きに応答できます—実際の首が体が傾いたときにそうするように。
+
+8. **最終ワールド行列伝播。** シーングラフはスキニングコンピュートシェーダの準備が整います。
+
+毎フレーム複数回ワールド行列を伝播するのは高コストに見えるかもしれません。実際、約 60 ジョイントのヒューマノイドでは、各伝播はジョイントあたり少数の行列乗算—マイクロ秒単位で容易です。総コストは、その後のドローコールやコンピュートディスパッチに比べて無視できます。
+
+xref:Advanced_glTF/Procedural_Animation_IK/05_look_at.adoc[前へ: ルックアットコントローラ] | xref:Advanced_glTF/Procedural_Animation_IK/07_conclusion.adoc[次へ: まとめ]

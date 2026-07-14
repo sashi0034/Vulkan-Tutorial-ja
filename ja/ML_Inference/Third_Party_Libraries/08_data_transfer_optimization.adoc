@@ -1,0 +1,623 @@
+:pp: {plus}{plus}
+
+= データ転送の最適化
+
+== 導入
+
+Vulkan と ML 推論ライブラリ間 GPU リソース共有をセットアップ。メモリ共有、同期動作、GPU 上推論。しかしプロファイルするとデータ転送が依然ボトルネック——フレームあたり 3–4ms データ移動、または GPU 利用率低（転送完了待ち）。ゼロコピー共有の約束が期待性能を deliver していない現実。
+
+現実: shared メモリでもデータ転送は matter。CPU-GPU 間コピーはなくなったが、GPU 内異部位間移動、形式変換、レイアウト管理、実行コンテキスト間調整は残る。これらにコストがあり、リアルタイム性能のため最適化 essential。
+
+本章では ML 推論パイプラインのデータ転送最適化技法。転送自体最小化、非同期転送キューで計算と overlap、必要時メモリマッピング、バッチで overhead amortize。データ移動を可能な限り速く効率的に、パイプラインから各 ms 性能を squeeze。
+
+== 転送ボトルネックの理解
+
+最適化前に時間がどこにかかるか。Vulkan-ML パイプラインの転送は複数成分、各々性能特性異なる。
+
+=== 転送の種類
+
+*GPU-GPU 転送* — 同一 GPU 内メモリ領域間。render target→compute バッファ、レイアウト変換。DMA エンジン使用、相対的速い（GPU により 10–50 GB/s）だが時間と帯域消費。
+
+*形式変換* — データ形式変換。BGRA→RGB、圧縮テクスチャ unpack、float32→float16 等。compute シェーダ必要、未最適化だと expensive。
+
+*レイアウト遷移* — メモリ配置変更。Vulkan image optimal tiling、ML は linear 必要 often。遷移はデータ再配置 copy。
+
+*同期 overhead* — パイプラインバリア、セマフォ wait、キュー submit 各 overhead。実転送速くても同期点はレイテンシ追加。
+
+*CPU-GPU 転送* — 避けられない場合（重み upload、結果 readback、動的データ）。最も遅い。PCIe 帯域限界（PCIe 3.0 x16 16 GB/s、4.0 32 GB/s）、レイテンシ高。
+
+=== 転送性能の計測
+
+計測なき最適化なし。GPU プロファイリングツール:
+
+*RenderDoc* — フレーム capture、タイムライン。draw と compute dispatch 間ギャップ——転送/同期 overhead  often。
+
+*NVIDIA Nsight Graphics* — メモリ帯域、転送時間、同期 stall 詳細。
+
+*AMD Radeon GPU Profiler* — AMD 向け同様。
+
+*Vulkan タイムスタンプクエリ* — コマンドバッファに挿入し GPU 上各操作時間正確計測。
+
+監視メトリクス:
+
+- *転送時間* — 各 copy/レイアウト遷移時間
+- *メモリ帯域利用率* — GPU 帯域飽和か headroom か
+- *同期 stall* — 同期待ち時間
+- *GPU 利用率* — 計算 busy か転送待ち idle か
+
+ボトルネック特定後 targeted 最適化。
+
+== 戦略 1: 転送の最小化
+
+最速転送はしない転送。転送方法最適化前に必要か問う。
+
+=== インプレース操作
+
+ML 推論がコピーなしレンダリ image 上直接可能か。物体検出で Vulkan 出力 format/layout が ML 期待と同なら転送不要かも。
+
+careful 計画:
+
+*形式一致* — ML が RGB、Vulkan BGRA ならモデル BGRA 対応学習/変換検討。再学習 costly だがフレーム毎変換排除なら worth。
+
+*レイアウト一致* — 可能なら render target linear tiling。optimal よりレンダリ遅いがレイアウト遷移排除で net 速い場合も。
+
+*解像度一致* — ML 512×512、1920×1080 レンダリなら downsample 必要。512×512 直接オフスクリーンレンダリなら downsample 排除。
+
+柔軟性 vs 性能トレードオフ。完璧一致はレンダリパイプライン制約だが性能 critical なら often worth。
+
+=== 共有メモリ領域
+
+転送必要でも Vulkan と ML 両方アクセス可能 shared 領域に保持。前章 GPU リソース共有——設計は sharing 中心。
+
+避ける:
+1. Vulkan のみ texture レンダリ
+2. shared バッファへ copy
+3. ML が shared 読み取り
+
+代わり:
+1. shared texture へ直接レンダリ
+2. ML が shared 読み取り
+
+中間 copy 排除で時間と帯域節約。
+
+=== 永続バッファ
+
+あまり変わらないデータ（重み、ルックアップ、設定）は shared に一度割り当て保持。毎フレーム re-upload しない。
+
+自明に見えて accidental re-upload しやすい。推論毎新 ONNX Runtime セッションなら毎回重み re-upload。セッション一度作成再利用。
+
+=== 遅延転送
+
+実際必要時のみ。5 フレーム毎推論なら推論なしフレームは転送しない。
+
+dirty フラグ: 変更時 dirty、ML 必要かつ dirty 時のみ転送。カメラパラメータ、シーンメタデータなど低頻度変更データに useful。
+
+== 戦略 2: 非同期転送キュー
+
+モダン GPU は DMA 専用エンジン——グラフィックス/コンピュートと別。Vulkan transfer キューでレンダリ/コンピュートと overlap、転送レイテンシ hide。
+
+=== キューファミリ理解
+
+*グラフィックス* — graphics、compute、transfer。最も versatile、最も contested。
+
+*コンピュート* — compute、transfer。
+
+*転送* — transfer のみ。専用 DMA、graphics/compute と並行。
+
+全デバイス dedicated transfer キューではないが多く modern GPU は。デバイス選択時確認:
+
+[source,cpp]
+----
+auto queueFamilies = physicalDevice.getQueueFamilyProperties();
+
+int transferQueueFamily = -1;
+for (int i = 0; i < queueFamilies.size(); i++) {
+    // transfer サポート、graphics 非サポート（専用転送キュー）
+    if ((queueFamilies[i].queueFlags & vk::QueueFlagBits::eTransfer) &&
+        !(queueFamilies[i].queueFlags & vk::QueueFlagBits::eGraphics)) {
+        transferQueueFamily = i;
+        break;
+    }
+}
+
+if (transferQueueFamily != -1) {
+    // 専用転送キューあり
+}
+----
+
+=== 計算と転送の overlap
+
+鍵は他作業と overlap。GPU レンダリ/ML 推論中、transfer キューが次フレームデータ移動。
+
+同期転送 typical フレーム:
+1. フレーム N レンダリ（5ms）
+2. ML 用データ転送（2ms）
+3. ML 推論（8ms）
+合計 15ms
+
+非同期:
+1. フレーム N+1 転送開始（非ブロック）
+2. フレーム N レンダリ（5ms）
+3. 転送完了待ち（well overlap なら <1ms）
+4. ML 推論（8ms）
+合計 ~13ms
+
+レンダリと overlap して転送時間の大半 hide。
+
+=== 実装パターン
+
+[source,cpp]
+----
+// フレーム N: N+1 転送開始
+vk::raii::CommandBuffer transferCmd = beginTransferCommandBuffer();
+transferCmd.copyImage(sourceImage, ..., destImage, ...);
+transferCmd.end();
+
+vk::SubmitInfo transferSubmit{
+    .commandBufferCount = 1,
+    .pCommandBuffers = &*transferCmd,
+    .signalSemaphoreCount = 1,
+    .pSignalSemaphores = &*transferCompleteSemaphore
+};
+
+transferQueue.submit(transferSubmit);
+
+// フレーム N: レンダリ（転送と並行）
+vk::raii::CommandBuffer renderCmd = beginRenderCommandBuffer();
+// ... レンダリング ...
+renderCmd.end();
+
+vk::SubmitInfo renderSubmit{
+    .commandBufferCount = 1,
+    .pCommandBuffers = &*renderCmd,
+    .signalSemaphoreCount = 1,
+    .pSignalSemaphores = &*renderCompleteSemaphore
+};
+
+graphicsQueue.submit(renderSubmit);
+
+// フレーム N: ML 推論（転送とレンダリ両方待ち）
+vk::raii::CommandBuffer computeCmd = beginComputeCommandBuffer();
+// ... ML 推論 ...
+computeCmd.end();
+
+std::array<vk::Semaphore, 2> waitSemaphores = {*transferCompleteSemaphore, *renderCompleteSemaphore};
+std::array<vk::PipelineStageFlags, 2> waitStages = {
+    vk::PipelineStageFlagBits::eTransfer,
+    vk::PipelineStageFlagBits::eComputeShader
+};
+
+vk::SubmitInfo computeSubmit{
+    .waitSemaphoreCount = 2,
+    .pWaitSemaphores = waitSemaphores.data(),
+    .pWaitDstStageMask = waitStages.data(),
+    .commandBufferCount = 1,
+    .pCommandBuffers = &*computeCmd
+};
+
+computeQueue.submit(computeSubmit);
+----
+
+転送とレンダリ並行。compute は両完了後開始。転送がレンダリ前に終われば転送レイテンシ完全 hide。
+
+=== キュー所有権移譲
+
+複数キューでは shared リソースの queue ownership transfer 必要。異なる queue family アクセス時 Vulkan は明示移譲要求。
+
+[source,cpp]
+----
+// transfer キューから所有権解放
+vk::ImageMemoryBarrier releaseBarrier{
+    .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+    .dstAccessMask = {},
+    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .srcQueueFamilyIndex = transferQueueFamily,
+    .dstQueueFamilyIndex = computeQueueFamily,
+    .image = *sharedImage,
+    .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+};
+
+transferCmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eTransfer,
+    vk::PipelineStageFlagBits::eBottomOfPipe,
+    {}, {}, {}, releaseBarrier);
+
+// compute キューで所有権取得
+vk::ImageMemoryBarrier acquireBarrier{
+    .srcAccessMask = {},
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .srcQueueFamilyIndex = transferQueueFamily,
+    .dstQueueFamilyIndex = computeQueueFamily,
+    .image = *sharedImage,
+    .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+};
+
+computeCmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eTopOfPipe,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {}, {}, {}, acquireBarrier);
+----
+
+キューファミリ間 correct 同期と可視性。
+
+== 戦略 3: メモリマッピングとステージング
+
+CPU-GPU 転送避けられない場合——新重み upload、推論結果 CPU 処理、毎フレーム動的データ——転送方法最適化。
+
+=== ステージングバッファ
+
+CPU から device-local へ直接転送しない。ステージングバッファ使用:
+
+[source,cpp]
+----
+// host-visible メモリのステージングバッファ
+vk::BufferCreateInfo stagingInfo{
+    .size = dataSize,
+    .usage = vk::BufferUsageFlagBits::eTransferSrc
+};
+
+vk::raii::Buffer stagingBuffer(device, stagingInfo);
+
+auto memReqs = stagingBuffer.getMemoryRequirements();
+vk::MemoryAllocateInfo allocInfo{
+    .allocationSize = memReqs.size,
+    .memoryTypeIndex = findMemoryType(
+        memReqs.memoryTypeBits,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+};
+
+vk::raii::DeviceMemory stagingMemory(device, allocInfo);
+stagingBuffer.bindMemory(*stagingMemory, 0);
+
+// マップしてコピー
+void* mapped = stagingMemory.mapMemory(0, dataSize);
+memcpy(mapped, sourceData, dataSize);
+stagingMemory.unmapMemory();
+
+// ステージングから device-local へ
+vk::raii::CommandBuffer cmd = beginTransferCommandBuffer();
+vk::BufferCopy copyRegion{0, 0, dataSize};
+cmd.copyBuffer(*stagingBuffer, *deviceBuffer, copyRegion);
+cmd.end();
+
+transferQueue.submit(submitInfo);
+----
+
+host-visible device-local（存在すれば）often 専用 device-local より遅い。host-visible 経由 staging 後 device-local copy が usually 全体 faster。
+
+=== 永続マッピング
+
+頻繁更新バッファは毎フレーム map/unmap せず永続マップ:
+
+[source,cpp]
+----
+// 永続マップバッファ
+vk::raii::Buffer frequentUpdateBuffer;
+vk::raii::DeviceMemory frequentUpdateMemory;
+// ... 作成 ...
+
+// 初期化時一度マップ
+void* persistentMapping = frequentUpdateMemory.mapMemory(0, vk::WholeSize);
+
+// 各フレーム mapped ポインタへ書き込みのみ
+memcpy(persistentMapping, newData, dataSize);
+
+// 可視性確保（HOST_COHERENT 以外）
+vk::MappedMemoryRange range{
+    .memory = *frequentUpdateMemory,
+    .offset = 0,
+    .size = vk::WholeSize
+};
+device.flushMappedMemoryRanges(range);
+----
+
+map/unmap overhead 排除——小頻繁更新で significant。
+
+=== Write-Combined メモリ
+
+一部プラットフォーム staging に write-combined。CPU が書き込み batch、順次書き込み throughput 向上:
+
+[source,cpp]
+----
+allocInfo.memoryTypeIndex = findMemoryType(
+    memReqs.memoryTypeBits,
+    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+    vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+// write-combined は順次書き込み速い、読み取り遅い
+// upload（transfer src）のみ、download には使わない
+----
+
+大順次書き込み 2–4x 高速化 possible、読み取り much 遅い。
+
+=== 読み戻し最適化
+
+GPU から readback（推論結果、デバッグ）時転送量最小化:
+
+*精度削減* — float32 結果だが 8bit 十分なら GPU 上 uint8 変換。4x サイズ削減。
+
+*圧縮* — 大 readback は GPU 上圧縮（RLE、delta 等 compute 実装）。
+
+*GPU 上集約* — 統計/意思決定のため readback なら GPU 上で可能な限り集約。1000 値 readback で max 探すより GPU max 1 値 readback。
+
+== 戦略 4: バッチング
+
+バッチで overhead amortize。1 画像ずつではなく 4/8/16 まとめ。submit、同期等 per-item overhead を全 item で分割。
+
+=== バッチサイズ選択
+
+大バッチ throughput↑ レイテンシ↑。最適はアプリ依存:
+
+*リアルタイム*（ゲーム、AR/VR）— 小バッチ（1–4）レイテンシ最小。応答性優先。
+
+*オフライン*（動画分析、バッチレンダリ）— 大バッチ（16–64）スループット最大。
+
+*インタラクティブ*（写真編集）— 中バッチ（4–8）バランス。
+
+バッチサイズ実験、レイテンシとスループット計測。
+
+=== バッチ用メモリレイアウト
+
+バッチ時レイアウト重要。ML は通常 batch-first（NCHW）。正しい配置:
+
+[source,cpp]
+----
+// 非効率: 画像ごと別バッファ
+vk::raii::Buffer image1Buffer, image2Buffer, image3Buffer, image4Buffer;
+// 各 [C, H, W]
+
+// 効率: バッチ次元単一バッファ
+vk::raii::Buffer batchBuffer;
+// [N, C, H, W] N=4、全画像連続
+----
+
+連続レイアウト GPU アクセス効率、ディスクリプタバインド数削減。
+
+=== 動的バッチング
+
+可変ワークロード: フルバッチまたはタイムアウトまで蓄積後処理。
+
+[source,cpp]
+----
+std::vector<InputData> batchQueue;
+const size_t maxBatchSize = 8;
+const auto maxWaitTime = std::chrono::milliseconds(10);
+auto batchStartTime = std::chrono::steady_clock::now();
+
+void queueInference(InputData input) {
+    batchQueue.push_back(input);
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - batchStartTime);
+
+    if (batchQueue.size() >= maxBatchSize || elapsed >= maxWaitTime) {
+        runBatchInference(batchQueue);
+        batchQueue.clear();
+        batchStartTime = now;
+    }
+}
+----
+
+タイムアウトでレイテンシ上限、フルバッチでスループット。
+
+== 戦略 5: 形式変換最適化
+
+形式変換 often 不可避——Vulkan 一形式、ML 別形式。コスト最小化。
+
+=== Compute シェーダ変換
+
+CPU やライブラリ関数より compute シェーダ:
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D inputImage; // BGRA
+layout(binding = 1, rgba8) writeonly uniform image2D outputImage; // RGB
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    vec4 bgra = texelFetch(inputImage, pos, 0);
+
+    // BGRA を RGB に swizzle
+    vec3 rgb = bgra.bgr;
+
+    imageStore(outputImage, pos, vec4(rgb, 1.0));
+}
+----
+
+GPU 上並列。1920×1080 でモダン GPU <1ms。
+
+=== 融合操作
+
+形式変換と他操作を結合しメモリ traffic 削減:
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D inputImage;
+layout(binding = 1, r32f) writeonly uniform image2D outputImage;
+
+layout(push_constant) uniform PushConstants {
+    vec3 mean;
+    vec3 std;
+} pc;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    vec4 bgra = texelFetch(inputImage, pos, 0);
+
+    vec3 rgb = bgra.bgr;
+    vec3 normalized = (rgb - pc.mean) / pc.std;
+    float gray = dot(normalized, vec3(0.299, 0.587, 0.114));
+
+    imageStore(outputImage, pos, vec4(gray, 0, 0, 0));
+}
+----
+
+1 シェーダで形式変換、正規化、グレースケール——別 pass 3 回と中間バッファ 3 つを排除。
+
+=== テクスチャ圧縮
+
+ML が圧縮テクスチャ対応なら利用。BC、ASTC、ETC2 で帯域削減:
+
+- BC1 (DXT1): RGB 6:1
+- BC3 (DXT5): RGBA 4:1
+- BC4: 単チャネル 2:1
+- ASTC: 可変比率、高品質
+
+トレードオフ: サンプリング時 decompress で compute コスト。帯域 bound なら usually win。compute bound なら not always。
+
+== 戦略 6: パイプライン最適化
+
+全体構造が転送効率に影響。個別転送だけでなくパイプライン全体最適化。
+
+=== 複数フレーム pipelining
+
+複数 in-flight でレイテンシ hide:
+
+Frame 0: レンダリ → 転送 → 推論
+Frame 1:          レンダリ → 転送 → 推論
+Frame 2:                   レンダリ → 転送 → 推論
+
+各段階が他フレーム他段階と並行。GPU 利用率最大、転送レイテンシ hide。
+
+実装はフレーム干渉防止の careful 同期:
+
+[source,cpp]
+----
+const int maxFramesInFlight = 3;
+std::array<vk::raii::Semaphore, maxFramesInFlight> renderCompleteSemaphores;
+std::array<vk::raii::Semaphore, maxFramesInFlight> transferCompleteSemaphores;
+std::array<vk::raii::Semaphore, maxFramesInFlight> inferenceCompleteSemaphores;
+std::array<vk::raii::Fence, maxFramesInFlight> frameFences;
+
+int currentFrame = 0;
+
+void renderFrame() {
+    auto result = device.waitForFences(*frameFences[currentFrame], VK_TRUE, UINT64_MAX);
+    device.resetFences(*frameFences[currentFrame]);
+
+    submitRenderCommands(renderCompleteSemaphores[currentFrame]);
+
+    submitTransferCommands(
+        renderCompleteSemaphores[currentFrame],
+        transferCompleteSemaphores[currentFrame]);
+
+    submitInferenceCommands(
+        transferCompleteSemaphores[currentFrame],
+        inferenceCompleteSemaphores[currentFrame],
+        frameFences[currentFrame]);
+
+    currentFrame = (currentFrame + 1) % maxFramesInFlight;
+}
+----
+
+=== 遅延同期
+
+必要以上に同期しない。5 フレーム毎推論なら結果不要フレームで推論完了待ちしない:
+
+[source,cpp]
+----
+void renderFrame(int frameNumber) {
+    submitRenderCommands();
+
+    if (frameNumber % 5 == 0) {
+        submitTransferCommands();
+        submitInferenceCommands();
+
+        auto result = device.waitForFences(*inferenceFence, VK_TRUE, UINT64_MAX);
+        processInferenceResults();
+    }
+
+    // 推論待ちせずレンダリ継続
+}
+----
+
+レンダリ full speed、推論はバックグラウンド非同期。
+
+=== メモリエイリアシング
+
+パイプライン段階ごとに異用途でメモリ再利用。転送のみ大 intermediate バッファと推論のみ別バッファを同一メモリブロックに alias:
+
+[source,cpp]
+----
+vk::raii::DeviceMemory sharedMemory(device, allocInfo);
+
+vk::raii::Buffer transferBuffer(device, transferBufferInfo);
+transferBuffer.bindMemory(*sharedMemory, 0);
+
+vk::raii::Buffer inferenceBuffer(device, inferenceBufferInfo);
+inferenceBuffer.bindMemory(*sharedMemory, 0);
+
+// 転送段階 transferBuffer、推論段階 inferenceBuffer
+// 同メモリ、総割り当て削減
+----
+
+メモリ削減、キャッシュ効率 possible。同時使用しない careful 同期必要。
+
+== 実践的考慮
+
+データ転送最適化は反復プロセス。
+
+=== まずプロファイル、次に最適化
+
+ボトルネック推測しない。プロファイル:
+
+- どの転送が最も時間/頻度
+- 帯域利用率
+- 同期 stall 箇所
+
+最大ボトルネック first。5ms 操作 50% 改善は 0.5ms 操作 90% より価値。
+
+=== プラットフォーム差
+
+*デスクトップ GPU* — 高帯域（500+ GB/s）、専用転送エンジン、良好 async transfer。
+
+*モバイル GPU* — 低帯域（20–50 GB/s）、統一メモリ、異なる最適化。
+
+*統合 GPU* — システムメモリ共有、離散 GPU と異特性。
+
+ターゲットでテスト、ユーザー向け重要プラットフォーム最適化。
+
+=== フォールバック
+
+全最適化が全 HW で動作しない:
+
+- 専用転送キューなし→グラフィックスキュー
+- 外部メモリ非対応→明示 copy
+- async compute なし→同期推論
+
+graceful 劣化で everywhere 動作。
+
+=== 転送問題デバッグ
+
+遅い/不正確時:
+
+*validation layer* — 同期エラー、不正バリア。
+
+*GPU capture* — RenderDoc/Nsight。
+
+*帯域計算* — 転送サイズ/時間 vs GPU spec。500 GB/s GPU で 10 GB/s なら問題。
+
+*段階的テスト* — 単純転送から複雑さ追加。
+
+== まとめ
+
+データ転送最適化は Vulkan アプリリアルタイム ML 推論に essential。GPU リソース共有でも GPU-GPU copy、形式変換、レイアウト遷移、同期 overhead が積算。
+
+主要戦略: インプレース/shared で転送最小化; 非同期転送キュー overlap; staging/永続マップで CPU-GPU 最適化; バッチで overhead amortize; compute/fusion で形式変換最適化; パイプライン並列最大化。
+
+プロファイルでボトルネック特定、プラットフォーム tuning、フォールバック。結果は効率データ移動、GPU 利用率最大、レイテンシ最小。
+
+最適化転送でゲーム、AR/VR、インタラクティブツール等 demanding アプリのリアルタイム ML 推論が achievable。本章技法が高性能 ML 統合グラフィックスアプリの基盤。
+
+xref:ML_Inference/Third_Party_Libraries/07_gpu_resource_sharing.adoc[前へ: GPU リソース共有] | xref:ML_Inference/Third_Party_Libraries/09_practical_examples.adoc[次へ: 実践例]

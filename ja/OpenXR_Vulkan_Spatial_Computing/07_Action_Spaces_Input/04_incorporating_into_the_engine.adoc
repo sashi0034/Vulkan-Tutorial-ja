@@ -1,0 +1,46 @@
+:pp: {plus}{plus}
+= エンジンへの組み込み
+
+OpenXR のアクションシステムでは、生ボタンのポーリング（`glfwGetMouseButton` など）から離れ、`engine.cpp` で抽象的な意図ベース入力システムへ移る必要があります。実装例は link:../../../attachments/openxr_engine/xr_context.cpp[xr_context.cpp] と link:../../../attachments/openxr_engine/engine.cpp[engine.cpp] にあります。
+
+== エンジンでのアクションマッピング
+
+`engine.cpp` では、OpenXR アクションを処理するよう `Update` ロジックを更新します。「ThrowBall」のために特定のマウスボタンをチェックする代わりに、「Grab」アクションをチェックします。
+
+[source,cpp]
+----
+// engine.cpp
+void Engine::Update(XrTime predictedTime) {
+    if (renderer->IsXrMode()) {
+        auto& xrContext = renderer->GetXrContext();
+
+        // 1. Poll OpenXR action states (Grab, Teleport, etc.)
+        xrContext.pollActions();
+
+        if (xrContext.isActionActive("Grab")) {
+            // 2. Retrieve the spatial pose of the controller (Action Space)
+            XrPosef handPose = xrContext.getActionPose("GrabPose");
+
+            // 3. Convert the XR pose into our engine's 4x4 matrix
+            glm::mat4 handMatrix = xrPoseToMatrix(handPose);
+
+            // Spawn the ball at the controller's exact spatial location
+            ThrowBallFromHand(handMatrix);
+        }
+    } else {
+        // Standard desktop mouse input
+        if (platform->GetMouseButton(1)) {
+            ThrowBall(mouseX, mouseY);
+        }
+    }
+
+    // Standard physics/entity update
+    Update(deltaTimeMs);
+}
+----
+
+== なぜこれらの変更か？
+
+入力を物理ハードウェア（特定コントローラのトリガーなど）から切り離すことで、エンジンを最初からクロスプラットフォームにします。ユーザーが Oculus Touch コントローラを使っていても Valve Index「ナックル」を使っていても、エンジンは「Grab」アクションと関連する空間ポーズだけを見るため、異なるハードウェアドライバのニュアンスではなくインタラクションの物理に集中できます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/07_Action_Spaces_Input/03_space_manifolds.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/08_Slang_Spatial_Shaders/01_introduction.adoc[次へ]

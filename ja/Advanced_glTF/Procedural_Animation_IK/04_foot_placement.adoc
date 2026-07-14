@@ -1,0 +1,166 @@
+:pp: {plus}{plus}
+= 凹凸地形上の足置き
+
+== 聞こえより難しい理由
+
+足置きは、IK システムから多くの開発者が最初に求める実用的応用であり、上記のアルゴリズム説明だけでは十分に備えてくれない微妙さをいくつか露わにします。足を地面に触れさせるのは単純に聞こえます。各足から下向きにレイを飛ばし、地形との交点を見つけ、IK で足をそこに置く。実際には、正しく見せる前に少なくとも 3 つの追加問題を解く必要があります。
+
+第一の問題は **身体高さ** です。足を地形に合わせて下げても、キャラクターの身体高さ（通常骨盤や腰の根ジョイント位置）が調整されなければ、斜面の片側では足が床に沈み、反対側では空中に浮いたキャラクターになります。骨盤は、地形上で最も低い足の接触点に合わせて下がる必要があります。
+
+第二の問題は **足の回転** です。足を地形面まで下げるのは補正の半分にすぎません—足は地形法線に合わせて*回転*する必要もあります。斜面に接地した足は、平らな地面に立っているかのように水平のままでなく、斜面に沿うよう角度を付けるべきです。接触点の地形法線を計算し、足をそれに揃えて回転させる必要があります。
+
+第三の問題は **平滑化** です。毎フレーム IK 補正を直接適用すると、慣性なしで IK 解へ瞬時に飛びます。地形面が急に変わる—例えば斜面から平坦部へ踏み出す—と足は即座にスナップします。現実では足には運動量があり、数フレームかけてターゲット位置に近づくべきです。IK ターゲットを時間方向にも平滑化する必要があります。
+
+== 足置きパイプライン
+
+完全な足置きシステムには、毎フレーム順に実行する 4 つの明確なステージがあります。
+
+**ステージ 1 — レイキャスト。** 各足について、足の上方から下向き（ワールド空間、重力方向）にレイを飛ばします。レイ原点は、キャラクターが地形より上にいる可能性を考慮して十分高く—通常、足位置よりキャラクター全高分以上—にします。各接触のヒット点と面法線を記録します。
+
+**ステージ 2 — ターゲットの平滑化。** ヒット位置と法線に時間方向のローパスフィルタを適用します。単純な指数移動平均で十分です: `smoothed = lerp(smoothed, raw, smoothing_factor * delta_time)`。平滑化係数は足が地形に「追いつく」速さを制御します—大きいほど応答は速いがスナップも増えます。8〜12 前後の値が自然な結果を出すことが多いです。
+
+**ステージ 3 — 骨盤の調整。** 各足が垂直方向（アニメーション位置から平滑化した地形接触まで下）にどれだけ動く必要があるかを求めます。2 足の垂直補正の大きい方を取り、キャラクター全体の根ジョイントをその分だけ下げます。どちらの足も地形に届くために過度に伸ばす必要がないようにします。
+
+**ステージ 4 — IK の求解。** 各脚チェーンで IK ソルバー（CCD または FABRIK）を実行し、平滑化したヒット点をターゲットにします。次に足ジョイントを平滑化した地形法線に揃えて回転させます。
+
+== 骨盤調整の実装
+
+骨盤調整は IK 求解の前に行います。望む足位置を問い合わせ、必要な下方向オフセットを計算します。
+
+[source,cpp]
+----
+struct FootPlacementData {
+    glm::vec3 target_position;  // Smoothed world-space target for the foot
+    glm::vec3 surface_normal;   // Smoothed terrain normal at the contact point
+    float     ik_weight;        // 0 = no IK, 1 = full IK (for blending)
+};
+
+struct FootPlacementState {
+    FootPlacementData left;
+    FootPlacementData right;
+    glm::vec3 smoothed_pelvis_offset; // Low-pass filtered pelvis height adjustment
+};
+
+void update_foot_targets(
+    const PhysicsWorld&  world,
+    const glm::vec3&     left_foot_world,
+    const glm::vec3&     right_foot_world,
+    float                character_height,
+    float                delta_time,
+    FootPlacementState&  state)
+{
+    const float SMOOTHING = 10.0f;
+
+    auto raycast_foot = [&](const glm::vec3& foot_world) -> std::pair<glm::vec3, glm::vec3> {
+        glm::vec3 ray_origin = foot_world + glm::vec3(0, character_height, 0);
+        glm::vec3 ray_dir    = glm::vec3(0, -1, 0);
+        float     ray_length = character_height * 2.0f;
+
+        // Use the abstract PhysicsWorld::raycast() — keeps this code engine-agnostic.
+        float     out_distance;
+        glm::vec3 out_normal;
+        JPH::BodyID out_body_id;
+
+        if (world.raycast(ray_origin, ray_dir, ray_length,
+                          out_distance, out_normal, out_body_id))
+        {
+            glm::vec3 hit_point = ray_origin + ray_dir * out_distance;
+            return { hit_point, out_normal };
+        }
+        // No hit: keep the animated foot position, flat normal
+        return { foot_world, glm::vec3(0, 1, 0) };
+    };
+
+    auto [left_pos, left_normal]   = raycast_foot(left_foot_world);
+    auto [right_pos, right_normal] = raycast_foot(right_foot_world);
+
+    float t = glm::clamp(SMOOTHING * delta_time, 0.0f, 1.0f);
+
+    state.left.target_position  = glm::mix(state.left.target_position,  left_pos,    t);
+    state.left.surface_normal   = glm::normalize(glm::mix(state.left.surface_normal,   left_normal,  t));
+    state.right.target_position = glm::mix(state.right.target_position, right_pos,   t);
+    state.right.surface_normal  = glm::normalize(glm::mix(state.right.surface_normal,  right_normal, t));
+
+    // Pelvis adjustment: push the pelvis down by the maximum foot drop
+    float left_drop  = left_foot_world.y  - state.left.target_position.y;
+    float right_drop = right_foot_world.y - state.right.target_position.y;
+    float pelvis_drop = std::max(0.0f, std::max(left_drop, right_drop));
+
+    glm::vec3 desired_pelvis_offset(0, -pelvis_drop, 0);
+    state.smoothed_pelvis_offset = glm::mix(
+        state.smoothed_pelvis_offset, desired_pelvis_offset, t);
+}
+----
+
+骨盤ドロップに `std::max(0.0f, ...)` を使っている点に注目してください。骨盤は*下げる*だけで、上げません。地形がアニメーション足位置より高い（キャラクターが盛り上がった面へ踏み出そうとしている）場合、IK が脚を曲げて対処します。急に上がる斜面で骨盤が空へ押し上げられるのは望みません。
+
+== IK と足回転の適用
+
+骨盤調整の後、脚チェーンはわずかに再配置されています。各脚で IK ソルバーを実行し、続けて足回転を行います。
+
+[source,cpp]
+----
+void apply_foot_ik(
+    std::vector<Node>&          nodes,
+    const IKChain&              leg_chain,
+    uint32_t                    foot_node_idx,
+    const FootPlacementData&    foot_data,
+    const glm::vec3&            up_axis)
+{
+    // Run the IK solver to place the foot at the target position
+    solve_ccd(nodes, leg_chain, foot_data.target_position);
+
+    // Now rotate the foot to align with the terrain normal.
+    // The foot's "up" direction in its local space needs to align with the surface normal.
+    Node& foot = nodes[foot_node_idx];
+
+    // The foot's current world-space up direction
+    // (assuming the foot's local Y is the "up" direction—adjust for your rig)
+    glm::vec3 foot_current_up = glm::normalize(
+        glm::mat3(foot.world_matrix) * glm::vec3(0, 1, 0));
+
+    float dot = glm::clamp(glm::dot(foot_current_up, foot_data.surface_normal), -1.0f, 1.0f);
+    if (dot < 0.9999f) {
+        float     angle = std::acos(dot);
+        glm::vec3 axis  = glm::normalize(glm::cross(foot_current_up, foot_data.surface_normal));
+
+        glm::quat world_correction = glm::angleAxis(angle, axis);
+        glm::quat new_world_rot    = world_correction * foot.get_world_rotation();
+
+        glm::quat parent_world_rot = (foot.parent_index != INVALID_NODE_INDEX)
+            ? nodes[foot.parent_index].get_world_rotation()
+            : glm::quat(1, 0, 0, 0);
+
+        foot.local_rotation = glm::inverse(parent_world_rot) * new_world_rot;
+        foot.mark_dirty();
+        update_world_matrices_subtree(nodes, foot_node_idx);
+    }
+}
+----
+
+== IK のブレンドイン・アウト
+
+もう 1 つ扱う必要があります。キャラクターが動いているとき、IK システムはアニメーションシステムと戦ってはいけません。歩き始めると足は常に地面から離れます—アニメーションの足軌道はスイング相で意図的に足を空中へ持ち上げます。スイング中に足置き IK を走らせると、IK は即座に足を地面へ引き戻そうとし、持ち上がりを妨げます。
+
+解決策は **プラントウェイト** で IK 補正をゲートすることです。足ごとの値で、足がしっかり接地すべきとき 1.0、空中のとき 0.0 です。プラントウェイトはこの極端の間を滑らかに遷移します。
+
+プラントウェイトはアニメーション自体から導けます。多くのアニメーションシステムはウォークサイクルに **足接触イベント** を付けます—各足が地面に着く・離れる瞬間を示すキーフレームトリガーイベントです。アニメーションツールがこれらを生成するなら、それを聞いてプラントウェイトを駆動します。
+
+足接触イベントがなければ、ヒューリスティックで導けます。足のアニメーション速度（フレーム間のワールド位置変化率）がしきい値を下回ったら接地とみなします。ウォークサイクルではかなりうまくいきますが、より速い歩容では失敗することがあります。
+
+プラントウェイトが得られたら、アニメーション位置と IK 補正位置の間をブレンドします。
+
+[source,cpp]
+----
+// After computing the IK target position, blend it with the animated position
+// based on the plant weight. A weight of 1.0 uses full IK; 0.0 uses animation.
+glm::vec3 blended_target = glm::mix(
+    animated_foot_position,
+    foot_data.target_position,
+    foot_data.ik_weight
+);
+----
+
+これにより足置きシステムは、ベースアニメーションを上書きするのではなく強化するレイヤーになります。足が接地しているとき IK が地形への正確な接触をもたらし、空中のとき IK は滑らかにフェードアウトしてアニメーションを邪魔しません。
+
+xref:Advanced_glTF/Procedural_Animation_IK/03_fabrik.adoc[前へ: FABRIK] | xref:Advanced_glTF/Procedural_Animation_IK/05_look_at.adoc[次へ: ルックアットコントローラ]

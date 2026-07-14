@@ -1,0 +1,89 @@
+:pp: {plus}{plus}
+
+= VUID「オートフィックス」: バリデーションレイヤのマスター
+
+== はじめに: 翻訳能力
+
+Vulkan **バリデーションレイヤ** は、デバッグ兵器庫で最も強力なツールです。不正な構造サイズから洗練された同期ハザードまで、何千ものよくあるエラーを捕まえます。しかし初心者や中級開発者にとってさえ、単一のバリデーションエラーの圧倒的な密度は麻痺させ得ます。
+
+**協調エンジニアリング** では、AI アシスタントでバリデーションエラーを翻訳します。エラーを「読む」だけでなく、難解な VUID（Valid Usage ID）を実際の C{pp} ソースコードと相関させ、決定的な修正を提供します。
+
+== コア概念: 「VUID からソース」ブリッジ
+
+**VUID オートフィックス** は単純な検索置換ではありません。**症状**、**場所**、**仕様コンテキスト** の三者相関です。
+
+**症状** はバリデーションレイヤが提供する完全な VUID 文字列です。これらは Vulkan 仕様の単一で不変の規則を指す一意の識別子です。**場所** は実際の C{pp} ソースコード——問題の Vulkan 呼び出しが行われている特定の関数やクラス——です。最後に **仕様コンテキスト** は **Model Context Protocol（MCP）** サーバが提供する地上真理で、AI が SDK の最新版でその特定 VUID の「マニュアルを読む」ことを可能にします。
+
+これら 3 要素を橋渡しすることで、AI は **診断分析** を実行できます。「型不一致」を見るだけではなく、シェーダが書き込みをしているため `storage_buffer` を期待している一方、C{pp} コードが `uniform_buffer` として初期化していることを見ます。結果の修正は単なる「最善の推測」ではなく、エンジンアーキテクチャと一貫した仕様どおりの訂正です。
+
+== 実世界体験: ディスクリプタ不一致の修正
+
+複雑な **バインドレステクスチャ** システムを実装しているところを想像してください。アプリを実行すると、コンソールがこのエラーで爆発します。
+
+[source,text]
+----
+VALIDATION ERROR: [ VUID-VkDescriptorSetLayoutBinding-descriptorType-01510 ]
+Object: 0x5555559868f0 | Message: pBindings[0].descriptorType is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+but shader expects VK_DESCRIPTOR_TYPE_STORAGE_BUFFER...
+----
+
+=== ステップ 1: 診断クエリ
+このエラーを単に「検索」しません。AI に **コンテキストブリッジ** を与えます。
+**プロンプト:** *「この VUID が出ている: [エラーを貼付]。これが `DescriptorSetLayout` 作成コード: [コードを貼付]。エンジンの `Buffer` クラスに基づき、なぜこの型不一致が起きているか？」*
+
+=== ステップ 2: 論理的相関
+AI は単に enum を変えろと言いません。**シェーダコード**（RAG 使用）と **C{pp} 初期化** を分析します。
+**AI 診断:** *「フラグメントステージで書き込みをしているため、シェーダは `storage_buffer` を期待している。しかし C{pp} コードは `uniform_buffer` として初期化している。ディスクリプタ型を `STORAGE_BUFFER` に更新し、`VkBufferUsageFlags` に `STORAGE_BUFFER_BIT` が含まれることを保証しなければならない。」*
+
+=== ステップ 3: コンテキストに沿った修正
+AI はエンジンの RAII ラッパに合わせた正確なコード変更を提供します。この変更が `maxDescriptorSetStorageBuffers` リミットの増加を必要とするかもしれないこと——人間の開発者がしばしば見落とす詳細——さえ警告します。
+
+== 高度: 「常に最新」の VUID 辞書
+
+このワークフローの最も強力な側面の一つは、**MCP** で **ライブ Vulkan Spec** を照会することです。xref:AI_Assisted_Vulkan/02_environment_setup/06_mcp_context_bridge.adoc[コンテキストブリッジ] で議論したように、アシスタントはディスク上の `vk.xml` ファイルを照会できます。つまり Vulkan 1.4 で新しい VUID が導入されても、モデル自体が何年前に学習されていても、SDK を更新した同じ日に AI はその規則を知ります。
+
+== 実践チュートリアル: VUID オートフィックスの実行
+
+バリデーションエラーに遭遇してもパニックしないでください。難解な警告を堅実な修正へ変える次のステップに従ってください。
+
+=== ステップ 1: 分離とコンテキスト読み込み
+ターミナルから VUID 文字列をコピーします。次に AI アシスタント（Goose または IDE Chat）で、関連コードが読み込まれていることを確認します。
+
+[source,bash]
+----
+# Example: Pointing Goose to the renderer and shader code
+goose session --instruction "Analyze Renderer.cpp and main.frag. We have a VUID error to solve."
+----
+
+=== ステップ 2: 診断プロンプト
+正確なエラーを提供し、エンジンの論理との相関を求めます。
+
+[source,text]
+----
+I am encountering this validation error:
+[ VUID-VkDescriptorSetLayoutBinding-descriptorType-01510 ]
+Message: pBindings[0].descriptorType is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+but shader expects VK_DESCRIPTOR_TYPE_STORAGE_BUFFER.
+
+Based on our 'DescriptorSetManager' class, why is this mismatch occurring?
+----
+
+=== ステップ 3: 検証と適用
+AI が解決策を提案したら、「Pre-Flight Check」を求め、パイプラインの他部分を壊さないことを保証します。
+
+[source,text]
+----
+Explain why changing to STORAGE_BUFFER resolves this rule.
+Will this require any changes to our memory alignment logic or
+buffer usage flags in 'Buffer.cpp'?
+----
+
+最後に修正を適用し、アプリを再実行します。バリデーションレイヤが静かなら、修正は検証済みです。
+
+ほとんどのユースケースでは、チャットインタフェース付き IDE で、単に VUID をコピーして AI アシスタントのプロンプトに貼り付けるだけで足ります。AI はエラーが起きていると推論し、直そうとします。このプロセスはシームレスで効率的で、バリデーションエラーとコード修正のギャップを埋めるために AI を活用します。ただし上記は、ローカル LLM が得意とする明示的修正リクエストパイプラインの例であり、最良の結果を得るためにローカル LLM を扱うときに選ぶべきものです。
+
+== まとめ: 仕様認識デバッグ
+
+AI をバリデーションレイヤとソースコードの間のブリッジとして使うことで、**エラー** から **理解** へ、そして **解決** へ直接移ります。もはやバリアが失敗した「なぜ」を「推測」しているのではなく、仕様どおりでコードベースと一貫した診断を受け取っています。
+
+次へ: xref:AI_Assisted_Vulkan/06_debugging/03_renderdoc_ai_integration.adoc[AI + RenderDoc 統合]

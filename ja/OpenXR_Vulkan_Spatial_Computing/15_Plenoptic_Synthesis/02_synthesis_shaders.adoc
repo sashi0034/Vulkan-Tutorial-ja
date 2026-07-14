@@ -1,0 +1,80 @@
+:pp: {plus}{plus}
+= プレノプティック合成シェーダー
+
+4D ライトフィールドを 2D 画像へ戻すには、**イメージベースレンダリング（IBR）** を使い、仮想カメラレンズを通る光線を選択的にサンプリングします。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+OpenXR は各フレームの正確な目ポーズを提供しますが、4D 四線形補間経由でプレノプティックデータから滑らかな波面を再構成する複雑な過程は、Vulkan 駆動の合成手法です。Vulkan の高速メモリアクセスとサブグループ演算を使い、標準ランタイム投影モデルを超える高度な空間効果を実装します。
+
+== 概念: 波面の再構成
+
+4D ライトフィールドを 2D 画像へ戻すには、**イメージベースレンダリング（IBR）** を使います。三角形を描く代わりに、4D バッファを光線の密な「クラウド」として扱い、仮想カメラレンズを通るものを選択的に取り出します。
+
+1.  **レイトレーシング**: 各ピクセルについて、目から始まりそのピクセルを通る光線を計算する。
+2.  **交差**: その光線がライトフィールドの **ST 平面**（位置）と **UV 平面**（方向）に当たる場所を見つける。
+3.  **合成**: 4D バッファ内のそれらの座標で光線の色を参照する。
+
+ランタイムは各フレームの正確な `XrView` ポーズを提供し、合成シェーダーはそれを使って光線の原点と方向を決め、視点がヘッドセットと完全に揃うようにします。
+
+== 四線形補間: 16 サンプルの参照
+
+ライトフィールドは離散グリッドとして格納されるため、補間が必要です。4D では **四線形補間（Quadrilinear Interpolation）** が必要で、ピクセルごとに 16 本の異なる光線（空間 4 × 方向 4）をサンプリングします。
+
+[source,slang]
+----
+// Quadrilinear interpolation logic in Slang
+float4 sampleLightField(float2 st, float2 uv) {
+    // 1. Calculate floor and fractional parts for both planes
+    uint2 st0 = uint2(floor(st));
+    uint2 uv0 = uint2(floor(uv));
+    float2 stF = frac(st);
+    float2 uvF = frac(uv);
+
+    // 2. Perform ST-plane interpolation at the surrounding UV coordinates
+    float4 c00 = lerp(lerp(fetch(st0, uv0), fetch(st0 + uint2(1, 0), uv0), stF.x),
+                      lerp(fetch(st0, uint2(0, 1), uv0), fetch(st0 + uint2(1, 1), uv0), stF.x),
+                      stF.y);
+    // ... repeat for the other 3 UV neighbors ...
+
+    // 3. Perform the final UV-plane interpolation
+    return finalColor;
+}
+----
+
+C++ 側では、指定初期化子を使い、合成パス用にライトフィールドリソースをバインドします。
+
+[source,cpp]
+----
+// Binding the lightfield for synthesis using designated initializers
+vk::DescriptorBufferInfo lfBufferInfo{
+    .buffer = *lightFieldBuffer,
+    .offset = 0,
+    .range = VK_WHOLE_SIZE
+};
+
+vk::WriteDescriptorSet lfWrite{
+    .dstSet = *synthesisSet,
+    .dstBinding = 0,
+    .descriptorCount = 1,
+    .descriptorType = vk::DescriptorType::eStorageBuffer,
+    .pBufferInfo = &lfBufferInfo
+};
+----
+
+== 発展: 協調レイキャスティングと動的オクルージョン
+
+Vulkan により、標準のビュー依存フェッチを超えて合成を最適化できます。
+
+*   **協調レイキャスティング**: Vulkan の **Subgroup Operations** を使い、隣接ピクセル間でレイキャスティングを協調させ、高価な 4D 参照と平面交差のコストを共有できる。
+*   **動的オクルージョン**: Vulkan の **Depth-Stencil Testing** を使い、ライトフィールド合成と従来のラスタライズ 3D 幾何の間の動的オクルージョンを実装し、仮想物体がホログラフィックシーンに現実的に「沈む」ようにできる。
+
+== 性能: 光線のコアレッシング
+
+ピクセルあたり 16 回の参照を行うため、**SIMT コアレッシング** に注意が必要です。第 14 章で実装した **4D タイリング** により、これら 16 サンプルが物理 VRAM 上で地理的に近いことを保証します。これにより GPU は 1〜2 回のキャッシュラインフェッチだけで全要求を満たし、プレノプティック合成を高フレームレートで保てます。
+
+TIP: イメージベースレンダリングと四線形フィルタリングの詳細については、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#textures-interpolation[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/15_Plenoptic_Synthesis/01_introduction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/15_Plenoptic_Synthesis/03_ray_traced_synthesis.adoc[Next]

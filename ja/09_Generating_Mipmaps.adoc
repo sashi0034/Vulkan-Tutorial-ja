@@ -1,0 +1,546 @@
+:pp: {plus}{plus}
+
+= ミップマップの生成
+
+== はじめに
+
+プログラムは 3D モデルを読み込んで描画できるようになりました。
+この章では、もう一つの機能としてミップマップ生成を追加します。
+ミップマップはゲームやレンダリングソフトウェアで広く使われており、Vulkan では
+その作成方法を完全に制御できます。
+
+ミップマップは、事前計算された縮小版の画像です。
+各新しい画像は、前のものの幅と高さの半分です。
+ミップマップは _Level of Detail_ または _LOD_ の一形態として使われます。
+カメラから遠いオブジェクトは、より小さなミップ画像からテクスチャをサンプリングします。
+より小さな画像を使うことでレンダリング速度が上がり、
+https://en.wikipedia.org/wiki/Moir%C3%A9_pattern[モアレパターン]
+のようなアーティファクトを避けられます。
+ミップマップの見た目の例:
+
+image::/images/mipmaps_example.jpg[]
+
+== 画像の作成
+
+Vulkan では、各ミップ画像は `vk::Image` の異なる _ミップレベル_ に格納されます。
+ミップレベル 0 が元の画像で、レベル 0 以降のミップレベルは一般に _ミップチェーン_ と呼ばれます。
+
+ミップレベルの数は、`vk::Image` の作成時に指定されます。
+これまで、この値は常に 1 に設定していました。
+画像の寸法からミップレベルの数を計算する必要があります。
+まず、この数を格納するクラスメンバを追加します。
+
+[,c++]
+----
+...
+uint32_t               mipLevels          = 0;
+vk::raii::Image        textureImage       = nullptr;
+...
+----
+
+`mipLevels` の値は、`createTextureImage` でテクスチャを読み込んだ後に求められます。
+
+[,c++]
+----
+int            texWidth, texHeight, texChannels;
+stbi_uc       *pixels    = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+...
+mipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(texWidth, texHeight)))) + 1;
+----
+
+これはミップチェーンのレベル数を計算します。
+`max` 関数が最大の寸法を選択します。
+`log2` 関数はその寸法が 2 で何回割れるかを計算します。
+`floor` 関数は、最大の寸法が 2 の累乗でない場合を処理します。
+元の画像がミップレベルを持つよう、`1` が加算されます。
+
+この値を使うには、ミップレベルの数を指定できるよう `createImage`、`createImageView`、
+`transitionImageLayout` 関数を変更する必要があります。
+関数に `mipLevels` パラメータを追加します。
+
+[,c++]
+----
+std::pair<vk::raii::Image, vk::raii::DeviceMemory>
+    createImage(uint32_t                width,
+                uint32_t                height,
+                uint32_t                mipLevels,
+                vk::Format              format,
+                vk::ImageTiling         tiling,
+                vk::ImageUsageFlags     usage,
+                vk::MemoryPropertyFlags properties)
+{
+    vk::ImageCreateInfo imageInfo{.imageType     = vk::ImageType::e2D,
+                                  .format        = format,
+                                  .extent        = {width, height, 1},
+                                  .mipLevels     = mipLevels,
+    ...
+}
+----
+
+[,c++]
+----
+vk::raii::ImageView createImageView(vk::Image const &image, vk::Format format, vk::ImageAspectFlags aspectFlags, uint32_t mipLevels) const
+{
+		vk::ImageViewCreateInfo viewInfo{
+		    .image            = image,
+		    .viewType         = vk::ImageViewType::e2D,
+		    .format           = format,
+		    .subresourceRange = {.aspectMask = aspectFlags, .levelCount = mipLevels, .layerCount = 1}};
+    ...
+}
+----
+
+[,c++]
+----
+void transitionImageLayout(
+    vk::raii::CommandBuffer &commandBuffer, vk::raii::Image const &image, vk::ImageLayout oldLayout, vk::ImageLayout newLayout, uint32_t mipLevels)
+{
+		vk::ImageMemoryBarrier barrier{.oldLayout           = oldLayout,
+		                               .newLayout           = newLayout,
+		                               .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+		                               .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+		                               .image               = image,
+		                               .subresourceRange    = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = mipLevels, .layerCount = 1}};
+    ...
+----
+
+これらの関数へのすべての呼び出しを更新して、正しい値を使うようにします。
+
+[,c++]
+----
+std::tie(depthImage, depthImageMemory) = createImage(swapChainExtent.width,
+                                                     swapChainExtent.height,
+                                                     1,
+                                                     depthFormat,
+                                                     vk::ImageTiling::eOptimal,
+                                                     vk::ImageUsageFlagBits::eDepthStencilAttachment,
+                                                     vk::MemoryPropertyFlagBits::eDeviceLocal);
+...
+std::tie(textureImage, textureImageMemory) =
+    createImage(texWidth,
+                texHeight,
+                mipLevels,
+                vk::Format::eR8G8B8A8Srgb,
+                vk::ImageTiling::eOptimal,
+                vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+                vk::MemoryPropertyFlagBits::eDeviceLocal);
+----
+
+[,c++]
+----
+swapChainImageViews.emplace_back(createImageView(image, swapChainSurfaceFormat.format, vk::ImageAspectFlagBits::eColor, 1));
+...
+depthImageView = createImageView(depthImage, depthFormat, vk::ImageAspectFlagBits::eDepth, 1);
+...
+textureImageView = createImageView(*textureImage, vk::Format::eR8G8B8A8Srgb, vk::ImageAspectFlagBits::eColor, mipLevels);
+----
+
+[,c++]
+----
+transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, mipLevels);
+----
+
+== ミップマップの生成
+
+テクスチャ画像は複数のミップレベルを持つようになりましたが、ステージングバッファは
+ミップレベル 0 を埋めるためだけに使えます。
+他のレベルはまだ未定義です。
+これらのレベルを埋めるには、持っている単一のレベルからデータを生成する必要があります。
+`vk::raii::CommandBuffer::blitImage` コマンドを使います。
+このコマンドはコピー、スケーリング、フィルタリング操作を行います。
+テクスチャ画像の各レベルにデータを _ブリット_ するため、これを複数回呼び出します。
+
+`vk::raii::CommandBuffer::blitImage` は転送操作と見なされるため、テクスチャ画像を
+転送のソースとデスティネーションの両方として使う意図を Vulkan に伝える必要があります。
+`createTextureImage` でテクスチャ画像の用途フラグに `vk::ImageUsageFlagBits::eTransferSrc`
+を追加します。
+
+[,c++]
+----
+...
+std::tie(textureImage, textureImageMemory) =
+    createImage(texWidth,
+                texHeight,
+                mipLevels,
+                vk::Format::eR8G8B8A8Srgb,
+                vk::ImageTiling::eOptimal,
+                vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+                vk::MemoryPropertyFlagBits::eDeviceLocal);
+...
+----
+
+他の画像操作と同様に、`vk::raii::CommandBuffer::blitImage` は操作対象の画像のレイアウトに
+依存します。
+画像全体を `vk::ImageLayout::eGeneral` に遷移することもできますが、これはおそらく遅いでしょう。
+最適なパフォーマンスのため、ソース画像は `vk::ImageLayout::eTransferSrcOptimal` に、
+デスティネーション画像は `vk::ImageLayout::eTransferDstOptimal` にあるべきです。
+Vulkan では、画像の各ミップレベルを独立して遷移できます。
+各ブリットは一度に 2 つのミップレベルだけを扱うので、ブリットコマンドの間に各レベルを
+最適なレイアウトに遷移できます。
+
+`transitionImageLayout` は画像全体のレイアウト遷移だけを行うので、さらにいくつかの
+パイプラインバリアコマンドを書く必要があります。
+`createTextureImage` にある `vk::ImageLayout::eShaderReadOnlyOptimal` への既存の遷移を
+削除します。
+
+[,c++]
+----
+...
+transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, mipLevels);
+copyBufferToImage(commandBuffer, stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+//transitioned to vk::ImageLayout::eShaderReadOnlyOptimal while generating mipmaps
+...
+----
+
+これにより、テクスチャ画像の各レベルは `vk::ImageLayout::eTransferDstOptimal` のままになります。
+各レベルは、そこから読み取るブリットコマンドが終わった後に
+`vk::ImageLayout::eShaderReadOnlyOptimal` に遷移されます。
+
+これから、ミップマップを生成する関数を書きます。
+
+[,c++]
+----
+void generateMipmaps(vk::raii::CommandBuffer &commandBuffer,
+                     vk::raii::Image         &image,
+                     int32_t                  texWidth,
+                     int32_t                  texHeight,
+                     uint32_t                 mipLevels)
+{
+		vk::ImageMemoryBarrier barrier = {.srcAccessMask       = vk::AccessFlagBits::eTransferWrite,
+		                                  .dstAccessMask       = vk::AccessFlagBits::eTransferRead,
+		                                  .oldLayout           = vk::ImageLayout::eTransferDstOptimal,
+		                                  .newLayout           = vk::ImageLayout::eTransferSrcOptimal,
+		                                  .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+		                                  .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+		                                  .image               = image,
+}
+----
+
+いくつかの遷移を行うので、この `vk::ImageMemoryBarrier` を再利用します。
+上で設定したフィールドはすべてのバリアで同じままです。
+`subresourceRange.miplevel`、`oldLayout`、`newLayout`、`srcAccessMask`、
+`dstAccessMask` は各遷移で変更されます。
+
+[,c++]
+----
+int32_t mipWidth  = texWidth;
+int32_t mipHeight = texHeight;
+
+for (uint32_t i = 1; i < mipLevels; i++)
+{
+}
+----
+
+このループが各 `vk::raii::CommandBuffer::blitImage` コマンドを記録します。
+ループ変数が 0 ではなく 1 から始まることに注意してください。
+
+[,c++]
+----
+barrier.subresourceRange.baseMipLevel = i - 1;
+barrier.oldLayout                     = vk::ImageLayout::eTransferDstOptimal;
+barrier.newLayout                     = vk::ImageLayout::eTransferSrcOptimal;
+barrier.srcAccessMask                 = vk::AccessFlagBits::eTransferWrite;
+barrier.dstAccessMask                 = vk::AccessFlagBits::eTransferRead;
+
+commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, barrier);
+----
+
+まず、レベル `i - 1` を `vk::ImageLayout::eTransferSrcOptimal` に遷移します。
+この遷移は、前のブリットコマンドから、または `vk::raii::CommandBuffer::copyBufferToImage`
+から、レベル `i - 1` が埋められるのを待ちます。
+現在のブリットコマンドはこの遷移を待ちます。
+
+[,c++]
+----
+vk::ImageBlit blit = {.srcSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = i - 1, .layerCount = 1},
+                      .srcOffsets     = std::array<vk::Offset3D, 2>({{}, {mipWidth, mipHeight, 1}}),
+                      .dstSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = i, .layerCount = 1},
+                      .dstOffsets     = std::array<vk::Offset3D, 2>({{}, {1 < mipWidth ? mipWidth / 2 : 1, 1 < mipHeight ? mipHeight / 2 : 1, 1}})};
+----
+
+次に、ブリット操作で使われる領域を指定します。
+ソースのミップレベルは `i - 1`、デスティネーションのミップレベルは `i` です。
+`srcOffsets` 配列の 2 つの要素は、データがブリットされる元の 3D 領域を決定します。
+`dstOffsets` はデータがブリットされる先の領域を決定します。
+各ミップレベルは前のレベルの半分のサイズなので、`dstOffsets[1]` の X と Y 寸法は
+2 で割られます。
+2D 画像の深度は 1 なので、`srcOffsets[1]` と `dstOffsets[1]` の Z 寸法は 1 でなければ
+なりません。
+
+[,c++]
+----
+commandBuffer.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, image, vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+----
+
+ここでブリットコマンドを記録します。
+`srcImage` と `dstImage` パラメータの両方に `image` が使われていることに注意してください。
+同じ画像の異なるレベル間でブリットしているからです。
+ソースのミップレベルはちょうど `vk::ImageLayout::eTransferSrcOptimal` に遷移され、
+デスティネーションレベルは `createTextureImage` からまだ
+`vk::ImageLayout::eTransferDstOptimal` にあります。
+
+xref:04_Vertex_buffers/02_Staging_buffer.adoc[頂点バッファ] で提案されているように
+専用の転送キューを使っている場合は注意してください。`vk::raii::CommandBuffer::blitImage`
+はグラフィックス能力を持つキューに投入しなければなりません。
+
+最後のパラメータで、ブリットに使う `vk::Filter` を指定できます。
+`vk::raii::Sampler` を作るときと同じフィルタリングオプションがあります。
+補間を有効にするため `vk::Filter::eLinear` を使います。
+
+[,c++]
+----
+barrier.oldLayout     = vk::ImageLayout::eTransferSrcOptimal;
+barrier.newLayout     = vk::ImageLayout::eShaderReadOnlyOptimal;
+barrier.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+
+commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, barrier);
+----
+
+このバリアはミップレベル `i - 1` を `vk::ImageLayout::eShaderReadOnlyOptimal` に遷移します。
+この遷移は現在のブリットコマンドの完了を待ちます。
+すべてのサンプリング操作はこの遷移の完了を待ちます。
+
+[,c++]
+----
+    ...
+    if (1 < mipWidth)
+    {
+      mipWidth /= 2;
+    }
+    if (1 < mipHeight)
+    {
+      mipHeight /= 2;
+    }
+}
+----
+
+ループの終わりで、現在のミップ寸法を 2 で割ります。
+寸法が決して 0 にならないよう、除算の前に各寸法を確認します。
+これは画像が正方形でない場合を処理します。一方のミップ寸法が他方より先に 1 に
+達するからです。
+その場合、その寸法は残りのすべてのレベルで 1 のままであるべきです。
+
+[,c++]
+----
+		barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+		barrier.oldLayout                     = vk::ImageLayout::eTransferDstOptimal;
+		barrier.newLayout                     = vk::ImageLayout::eShaderReadOnlyOptimal;
+		barrier.srcAccessMask                 = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask                 = vk::AccessFlagBits::eShaderRead;
+
+		commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, barrier);
+}
+----
+
+最後に、もう 1 つパイプラインバリアを挿入します。
+このバリアは最後のミップレベルを `vk::ImageLayout::eTransferDstOptimal` から
+`vk::ImageLayout::eShaderReadOnlyOptimal` に遷移します。
+最後のミップレベルは決してブリット元にならないため、ループでは処理されませんでした。
+
+最後に、`createTextureImage` に `generateMipmaps` の呼び出しを追加します。
+
+[,c++]
+----
+transitionImageLayout(*textureImage, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, mipLevels);
+copyBufferToImage(stagingBuffer, *textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+//transitioned to vk::ImageLayout::eShaderReadOnlyOptimal while generating mipmaps
+generateMipmaps(commandBuffer, textureImage, texWidth, texHeight, mipLevels);
+----
+
+テクスチャ画像のミップマップがこれで埋められました。
+
+== 線形フィルタリングのサポート
+
+`vk::raii::CommandBuffer::blitImage` のような組み込み関数ですべてのミップレベルを生成するのは
+非常に便利ですが、残念ながらすべてのプラットフォームでサポートされるとは限りません。
+使うテクスチャ画像フォーマットが線形フィルタリングをサポートしている必要があり、
+これは `vk::raii::PhysicalDevice::getFormatProperties` 関数で確認できます。
+`generateMipmaps` 関数にこのチェックを追加します。
+
+まず、画像フォーマットを指定するパラメータを追加します。
+
+[,c++]
+----
+void createTextureImage()
+{
+    ...
+    generateMipmaps(commandBuffer, textureImage, vk::Format::eR8G8B8A8Srgb, texWidth, texHeight, mipLevels);
+}
+
+void generateMipmaps(vk::raii::CommandBuffer &commandBuffer,
+                     vk::raii::Image         &image,
+                     vk::Format               imageFormat,
+                     int32_t                  texWidth,
+                     int32_t                  texHeight,
+                     uint32_t                 mipLevels)
+{
+    ...
+}
+----
+
+`generateMipmaps` 関数で、`vk::raii::PhysicalDevice::getFormatProperties` を使って
+テクスチャ画像フォーマットのプロパティを要求します。
+
+[,c++]
+----
+void generateMipmaps(vk::raii::CommandBuffer &commandBuffer,
+                     vk::raii::Image         &image,
+                     vk::Format               imageFormat,
+                     int32_t                  texWidth,
+                     int32_t                  texHeight,
+                     uint32_t                 mipLevels)
+{
+    // Check if image format supports linear blit-ing
+    vk::FormatProperties formatProperties = physicalDevice->getFormatProperties(imageFormat);
+    ...
+----
+
+`vk::FormatProperties` 構造体には、使われ方に応じてフォーマットがどう使えるかを記述する
+`linearTilingFeatures`、`optimalTilingFeatures`、`bufferFeatures` という 3 つのフィールドが
+あります。
+optimal タイリング形式でテクスチャ画像を作成するので、`optimalTilingFeatures` を
+確認する必要があります。
+線形フィルタリング機能のサポートは `vk::FormatFeatureFlagBits::eSampledImageFilterLinear`
+で確認できます。
+
+[,c++]
+----
+if (!(formatProperties.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImageFilterLinear))
+{
+  throw std::runtime_error("texture image format does not support linear blitting!");
+}
+----
+
+この場合、2 つの代替手段があります。
+一般的なテクスチャ画像フォーマットから線形ブリットを _サポートする_ ものを探す関数を
+実装するか、https://github.com/nothings/stb/blob/master/stb_image_resize.h[stb_image_resize]
+のようなライブラリでソフトウェア上でミップマップ生成を実装できます。
+その後、元の画像を読み込んだのと同じ方法で、各ミップレベルを画像に読み込めます。
+
+実際には、ランタイムにミップマップレベルを生成することは珍しい、という点にも
+留意すべきです。
+通常は読み込み速度を向上させるため、ベースレベルと一緒にテクスチャファイルに
+事前生成して格納されます。
+ソフトウェアでのリサイズの実装と、ファイルからの複数レベルの読み込みは、読者への
+演習として残します。
+
+== サンプラー
+
+`vk::raii::Image` がミップマップデータを保持する一方、`vk::raii::Sampler` はレンダリング中に
+そのデータがどう読み取られるかを制御します。
+Vulkan では `minLod`、`maxLod`、`mipLodBias`、`mipmapMode` を指定できます
+（「Lod」は「Level of Detail」を意味します）。
+テクスチャがサンプリングされるとき、サンプラーは次の擬似コードに従ってミップレベルを
+選択します。
+
+[,c++]
+----
+lod = getLodLevelFromScreenSize(); //smaller when the object is close, may be negative
+lod = clamp(lod + mipLodBias, minLod, maxLod);
+
+level = clamp(floor(lod), 0, texture.mipLevels - 1);  //clamped to the number of mip levels in the texture
+
+if (mipmapMode == vk::SamplerMipmapMode::eNearest)
+{
+    color = sample(level);
+}
+else
+{
+    color = blend(sample(level), sample(level + 1));
+}
+----
+
+`samplerInfo.mipmapMode` が `vk::SamplerMipmapMode::eNearest` の場合、`lod` は
+サンプリングするミップレベルを選択します。
+ミップマップモードが `vk::SamplerMipmapMode::eLinear` の場合、`lod` はサンプリングする
+2 つのミップレベルを選択するために使われます。
+それらのレベルがサンプリングされ、結果が線形ブレンドされます。
+
+サンプル操作も `lod` の影響を受けます。
+
+[,c++]
+----
+if (lod <= 0)
+{
+    color = readTexture(uv, magFilter);
+}
+else
+{
+    color = readTexture(uv, minFilter);
+}
+----
+
+オブジェクトがカメラに近い場合、フィルタとして `magFilter` が使われます。
+オブジェクトがカメラから遠い場合、`minFilter` が使われます。
+通常、`lod` は非負で、カメラに近いときだけ 0 です。
+`mipLodBias` により、Vulkan に通常使うよりも低い `lod` と `level` を使うよう強制できます。
+
+この章の結果を見るには、`textureSampler` の値を選ぶ必要があります。
+すでに `minFilter` と `magFilter` を `vk::Filter::eLinear` を使うよう設定しています。
+`minLod`、`maxLod`、`mipLodBias`、`mipmapMode` の値を選ぶだけです。
+
+[,c++]
+----
+void createTextureSampler()
+{
+    vk::PhysicalDeviceProperties properties = physicalDevice.getProperties();
+		vk::SamplerCreateInfo        samplerInfo{
+		    .magFilter        = vk::Filter::eLinear,
+		    .minFilter        = vk::Filter::eLinear,
+		    .mipmapMode       = vk::SamplerMipmapMode::eLinear,
+		    .addressModeU     = vk::SamplerAddressMode::eRepeat,
+		    .addressModeV     = vk::SamplerAddressMode::eRepeat,
+		    .addressModeW     = vk::SamplerAddressMode::eRepeat,
+		    .mipLodBias       = 0.0f,
+		    .anisotropyEnable = vk::True,
+		    .maxAnisotropy    = properties.limits.maxSamplerAnisotropy,
+		    .compareEnable    = vk::False,
+		    .compareOp        = vk::CompareOp::eAlways,
+		    .minLod           = 0.0f,
+		    .maxLod           = vk::LodClampNone};
+    ...
+}
+----
+
+上のコードでは、縮小と拡大の両方に線形フィルタリング、ミップレベル間の線形補間で
+サンプラーをセットアップしています。ミップレベルバイアスも 0.0f に設定しています。
+
+`minLod` と `maxLod` は、最小および最大 LOD 値をクランプすることで、実質的に使う
+ミップレベルの範囲を設定するために使われます。`minLod` を `0.0f`、`maxLod` を
+`vk::LodClampNone` に設定することで、ミップレベルの全範囲が使われることを保証します。
+
+今プログラムを実行すると、次のように見えるはずです。
+
+image::/images/mipmaps.png[]
+
+シーンがとてもシンプルなので、劇的な違いはありません。
+よく見ると微妙な違いがあります。
+
+image::/images/mipmaps_comparison.png[]
+
+最も目立つ違いは紙の上の文字です。
+ミップマップありでは、文字が滑らかになっています。
+ミップマップなしでは、モアレアーティファクトによる粗いエッジと隙間があります。
+
+サンプラー設定をいじって、ミップマッピングにどう影響するかを見ることができます。
+たとえば、`minLod` を変更することで、サンプラーに最も低いミップレベルを使わないよう
+強制できます。
+
+[,c++]
+----
+samplerInfo.minLod = static_cast<float>(mipLevels / 2);
+----
+
+これらの設定は次の画像を生成します。
+
+image::/images/highmipmaps.png[]
+
+これが、オブジェクトがカメラから遠いときに、より高いミップレベルが使われる様子です。
+
+xref:10_Multisampling.adoc[次の章] では、より滑らかな画像を生成するマルチサンプリングを案内します。
+
+link:/attachments/29_mipmapping.cpp[C{pp} コード] /
+link:/attachments/27_shader_depth.slang[slang シェーダ] /
+link:/attachments/27_shader_depth.vert[GLSL 頂点シェーダ] /
+link:/attachments/27_shader_depth.frag[GLSL フラグメントシェーダ]

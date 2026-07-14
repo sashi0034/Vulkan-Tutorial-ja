@@ -1,0 +1,72 @@
+:pp: {plus}{plus}
+= スペース多様体
+
+ほとんどの入力アクションは離散イベント（ボタン押下など）になりますが、ポーズアクションは特別です。本質的に空間的だからです。ユーザーの手の動きと 3D エンジン内のオブジェクトのギャップを埋めるには、**アクションスペース** を作成する必要があります。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+アクションベースシステムで入力を定義し、空間座標系（アクションスペース）を管理することは、OpenXR における必須のアーキテクチャパターンです。OpenXR エコシステムがサポートする多様なコントローラでアプリケーションを動かせるよう、これらの抽象を使わなければなりません。
+
+== 仮想座標系: アクションスペース
+
+アクションスペースを、ユーザーの手に「追従する」仮想座標系と考えてください。OpenXR では、すべての空間トラッキングは相対的です。手の位置を見つけるには、「この Hand Space は私の World Space に対してどこにあるか？」と尋ねなければなりません。
+
+1.  **Grip Pose**: ユーザーの掌の位置。仮想オブジェクトを持つために使う。
+2.  **Aim Pose**: コントローラ前面から伸びるレイ。ポインティングと UI インタラクションに使う。
+
+[source,cpp]
+----
+// 1. Create a Space for our Hand Pose Action using designated initializers
+XrActionSpaceCreateInfo actionSpaceInfo{
+    .type = XR_TYPE_ACTION_SPACE_CREATE_INFO,
+    .action = handPoseAction,
+    .poseInActionSpace = identityPose // Can be used to apply a fixed offset
+};
+
+XrSpace handSpace;
+xrCreateActionSpace(session, &actionSpaceInfo, &handSpace);
+----
+
+ランタイムはこれらのスペースのワールド整合とレイテンシ補償を処理し、「Hand Space」が物理センサーに対して安定したままであることを保証します。
+
+== スペース多様体: クォータニオンから行列へ
+
+毎フレーム、`xrLocateSpace` を使い手の位置を見つけます。ランタイムはこれを位置と向きを含む `XrSpaceLocation` として提供します。
+
+Vulkan シェーダーは **4x4 行列** を期待します。この変換が「スペース多様体」——7D トラッキングデータを GPU が使う 16D 行列形式へ写像すること——です。
+
+[source,cpp]
+----
+// 2. Locate the hand space relative to the world coordinate system
+XrSpaceLocation location{
+    .type = XR_TYPE_SPACE_LOCATION
+};
+xrLocateSpace(handSpace, worldSpace, predictedDisplayTime, &location);
+
+if (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
+    // 3. Convert XrPosef to a 4x4 transformation matrix
+    vk::mat4 handTransform = xrPoseToMatrix(location.pose);
+
+    // Pass this matrix to our engine's scene graph or directly to a shader
+    pushConstants.modelMatrix = handTransform;
+}
+----
+
+== 発展: 衝突対応ポーズとスムージング
+
+Vulkan では、OpenXR が提供する生のトラッキングデータを超えてポーズを洗練できます。
+
+*   **衝突対応ポーズ**: **Structured Buffer** でシーンのバウンディングボリュームを GPU にアップロードし、Vulkan で OpenXR 提供のポーズをリアルタイムに「クランプ」し、仮想の手が壁を突き抜けないようにできます。
+*   **時間的スムージング**: ランタイムがセンサーノイズをフィルタする一方、Vulkan の **サブグループ演算** を使い、仮想オブジェクト向けに高効率な時間的スムージングや予測的な「重い」感触を実装できます。
+
+== 「App Space」を使う理由
+
+空間コンピューティングでは、**App Space**（または Stage Space）が仮想世界の原点です。`handSpace` を `worldSpace` に対して位置特定することで、ユーザーが部屋を歩き回っても、仮想の手が仮想環境に対して物理の手と完璧に揃ったままであることが保証されます。
+
+この変換プロセスは、物理コントローラを世界の座標系を動く仮想オブジェクトへ変えます。ユーザーがレーザーを指していても単に手を振っていても、エンジンはすべてを単一の一貫した行列として見ます。
+
+TIP: 詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#spaces[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/07_Action_Spaces_Input/02_openxr_action_system.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/07_Action_Spaces_Input/04_incorporating_into_the_engine.adoc[次へ]

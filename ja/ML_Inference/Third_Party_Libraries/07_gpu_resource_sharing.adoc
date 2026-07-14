@@ -1,0 +1,547 @@
+:pp: {plus}{plus}
+
+= GPU リソース共有
+
+== 導入
+
+ML 推論と Vulkan レンダリング統合で constantly 起きるシナリオ: フレームをテクスチャにレンダリ、ML 推論を実行——物体検出、スタイル転送、その他分析。素朴なアプローチはテクスチャ CPU 読み戻し、ML ライブラリへ、推論待ち、継続。 painfully 遅い。GPU stall、データ転送待ち、GPU 加速の利益喪失。
+
+better な方法: *GPU リソース共有*。CPU-GPU 間コピーではなく GPU メモリを Vulkan と ML 推論ライブラリ間で直接共有。テクスチャは GPU 上、Vulkan がレンダリ、ML が読み取り、expensive CPU 往復なし。リアルタイム ML 推論の鍵。
+
+本章では Vulkan と ML 推論ライブラリ間 GPU リソース共有の実装を探ります。外部メモリ共有を可能にする Vulkan 拡張、OS 別機構、各 ML ライブラリへの shared メモリ import、正しさのための同期プリミティブ。
+
+== なぜ GPU リソース共有が重要か
+
+技術詳細の前に、なぜ重要か、期待性能 gain。
+
+=== CPU 往復のコスト
+
+60 FPS グラフィックスアプリの typical フレーム。16.67ms でレンダリと ML 推論。GPU リソース共有なしの流れ:
+
+*ステップ 1: テクスチャへレンダリ*（2ms）——速い、GPU の本領。
+
+*ステップ 2: テクスチャ CPU 読み戻し*（3–5ms）——vkCmdCopyImageToBuffer、バリア、転送完了待ち。1920×1080 RGBA は 8.3MB。PCIe 3.0 理論 16 GB/s でも overhead、同期、バス traffic で real-world は遅い。
+
+*ステップ 3: CPU または別 GPU コンテキストで ML 推論*（5–10ms）——GPU 使用なら再 upload。
+
+*ステップ 4: 結果読み戻し*（1–2ms）——GPU 結果なら CPU 読み戻し、Vulkan 再 upload の可能性。
+
+合計 11–19ms。16.67ms 予算を既に超過、実レンダリやゲームロジック未計上。結果: ドロップフレーム、 stutter、悪 UX。
+
+=== ゼロコピー代替
+
+GPU リソース共有では:
+
+*ステップ 1: 共有テクスチャへレンダリ*（2ms）——外部メモリ対応割り当て。
+
+*ステップ 2: 同期*（<0.1ms）——セマフォ/フェンス signal。
+
+*ステップ 3: 共有メモリ上 ML 推論*（5–10ms）——転送なし直接読み取り。
+
+*ステップ 4: 同期*（<0.1ms）——結果使用前推論完了待ち。
+
+合計 7–12ms。4–7ms 転送 overhead 排除——フレーム予算達成の可否を分ける。リアルタイムでは feasible と infeasible の差。
+
+=== 性能を超えて: メモリ効率
+
+共有なしでは:
+
+- Vulkan テクスチャ（1080p RGBA 8.3MB）
+- CPU ステージング（8.3MB）
+- ML 入力（8.3MB）
+- ML 出力（可変）
+
+1 フレーム分で少なくとも 25MB。共有なら Vulkan テクスチャのみ——ML が同メモリ使用。複数 in-flight フレームや高解像度で節約 multiply。
+
+== Vulkan 外部メモリ拡張
+
+Vulkan 外部メモリ拡張が GPU リソース共有の基盤。他 API/プロセスと共有可能メモリ割り当て。
+
+=== 拡張ファミリ
+
+協調して動作:
+
+*VK_KHR_external_memory_capabilities* — デバイスがサポートする外部メモリ型照会。デバイス選択時に必要機構サポート確認。
+
+*VK_KHR_external_memory* — 外部メモリの核心構造と概念。
+
+*VK_KHR_external_memory_fd*（Linux）——POSIX ファイルディスクリプタ共有。Linux/Android 標準。
+
+*VK_KHR_external_memory_win32*（Windows）——Windows NT ハンドル。Windows 標準。
+
+*VK_EXT_external_memory_dma_buf*（Linux）——DMA-BUF、カーネルバッファ共有。組み込み、HW ビデオデコーダ連携に有用。
+
+*VK_KHR_external_semaphore*、*VK_KHR_external_fence* — 同期プリミティブ共有（後述）。
+
+=== サポート確認
+
+外部メモリ使用前、デバイスサポート確認。デバイス選択時:
+
+[source,cpp]
+----
+vk::PhysicalDeviceExternalMemoryHostPropertiesEXT externalMemoryProps;
+
+vk::PhysicalDeviceProperties2 deviceProps2;
+deviceProps2.pNext = &externalMemoryProps;
+
+deviceProps2 = physicalDevice.getProperties2();
+
+// 外部メモリサポート確認
+vk::ExternalMemoryHandleTypeFlagsKHR supportedHandleTypes;
+
+#ifdef _WIN32
+    supportedHandleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32KHR;
+#else
+    supportedHandleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+#endif
+
+// image 向け handle 型サポート照会
+vk::PhysicalDeviceExternalImageFormatInfo externalImageFormatInfo{
+    .handleType = static_cast<vk::ExternalMemoryHandleTypeFlagBits>(supportedHandleTypes)
+};
+
+vk::PhysicalDeviceImageFormatInfo2 imageFormatInfo{
+    .pNext = &externalImageFormatInfo,
+    .format = vk::Format::eR8G8B8A8Unorm,
+    .type = vk::ImageType::e2D,
+    .tiling = vk::ImageTiling::eOptimal,
+    .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled
+};
+
+vk::ExternalImageFormatProperties externalImageFormatProps;
+
+vk::ImageFormatProperties2 imageFormatProps2;
+imageFormatProps2.pNext = &externalImageFormatProps;
+
+auto result = physicalDevice.getImageFormatProperties2(&imageFormatInfo, &imageFormatProps2);
+
+if (result == vk::Result::eSuccess) {
+    // サポート操作確認
+    bool canExport = static_cast<bool>(externalImageFormatProps.externalMemoryProperties.externalMemoryFeatures &
+                     vk::ExternalMemoryFeatureFlagBits::eExportable);
+    bool canImport = static_cast<bool>(externalImageFormatProps.externalMemoryProperties.externalMemoryFeatures &
+                     vk::ExternalMemoryFeatureFlagBits::eImportable);
+
+    if (canExport) {
+        // このデバイスは共有用メモリ export 可能
+    }
+}
+----
+
+必要 format/usage で export サポート可否。デバイスにより image/buffer サポート差、format 差あり。
+
+=== export 可能メモリの割り当て
+
+サポート確認後、外部メモリ対応で割り当て。メモリ割り当て時 pNext に VkExportMemoryAllocateInfo:
+
+[source,cpp]
+----
+// 外部メモリ対応 image 作成
+vk::ExternalMemoryImageCreateInfo externalMemoryImageInfo;
+#ifdef _WIN32
+    externalMemoryImageInfo.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32KHR;
+#else
+    externalMemoryImageInfo.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+#endif
+
+vk::ImageCreateInfo imageInfo{
+    .pNext = &externalMemoryImageInfo,
+    .imageType = vk::ImageType::e2D,
+    .format = vk::Format::eR8G8B8A8Unorm,
+    .extent = {1920, 1080, 1},
+    .mipLevels = 1,
+    .arrayLayers = 1,
+    .samples = vk::SampleCountFlagBits::e1,
+    .tiling = vk::ImageTiling::eOptimal,
+    .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+    .sharingMode = vk::SharingMode::eExclusive,
+    .initialLayout = vk::ImageLayout::eUndefined
+};
+
+vk::raii::Image image(device, imageInfo);
+
+// メモリ要件取得
+auto memReqs = image.getMemoryRequirements();
+
+// export 対応で割り当て
+vk::ExportMemoryAllocateInfo exportInfo{
+    .handleTypes = externalMemoryImageInfo.handleTypes
+};
+
+vk::MemoryAllocateInfo allocInfo{
+    .pNext = &exportInfo,
+    .allocationSize = memReqs.size,
+    .memoryTypeIndex = findMemoryType(memReqs.memoryTypeBits,
+                                       vk::MemoryPropertyFlagBits::eDeviceLocal)
+};
+
+vk::raii::DeviceMemory memory(device, allocInfo);
+
+// image にバインド
+image.bindMemory(*memory, 0);
+----
+
+image 作成の VkExternalMemoryImageCreateInfo、割り当ての VkExportMemoryAllocateInfo が critical。
+
+=== メモリハンドルの export
+
+export 可能メモリ割り当て後、他 API が import する handle export:
+
+[source,cpp]
+----
+#ifdef _WIN32
+    // Windows: NT handle として export
+    vk::MemoryGetWin32HandleInfoKHR handleInfo{
+        .memory = *memory,
+        .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32KHR
+    };
+
+    HANDLE win32Handle = device.getMemoryWin32HandleKHR(handleInfo);
+
+    // DirectML、OpenCL 等へ渡せる
+#else
+    // Linux: ファイルディスクリプタとして export
+    vk::MemoryGetFdInfoKHR fdInfo{
+        .memory = *memory,
+        .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+    };
+
+    int fd = device.getMemoryFdKHR(fdInfo);
+
+    // OpenCL 等へ渡せる
+#endif
+----
+
+handle（Windows NT、Linux fd）は GPU メモリへの opaque 参照。ML ライブラリへ渡し import。
+
+== プラットフォーム固有ハンドル型
+
+OS ごとにプロセス/API 間リソース共有機構が異なる。robust クロスプラットフォームに essential。
+
+=== Linux: ファイルディスクリプタと DMA-BUF
+
+Linux 主要機構は POSIX fd。Vulkan が fd export、他 API import。
+
+*POSIX fd* — 標準。fd はカーネルオブジェクト参照整数。export fd は下位カーネルメモリオブジェクト参照。Linux OpenCL と多く GPU API と動作。
+
+*DMA-BUF* — デバイス間バッファ共有向け Linux カーネルフレームワーク。組み込み、HW ビデオ codec と重要。VK_EXT_external_memory_dma_buf。
+
+Linux では fd 所有権。fd はカーネル参照カウント——全 fd close まで解放されない。export 後 close 責任（または import 側へ移譲）。
+
+=== Windows: NT ハンドル
+
+Windows は NT（Win32）ハンドル。fd と概念類似、Windows 固有 semantics。
+
+*Opaque ハンドル* — 最も common。下位メモリ直接 expose せずドライバ管理参照。VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR。
+
+*Named ハンドル* — 名前付き、プロセス間名前共有。ML 推論では less common。
+
+Windows handle ライフタイムは Linux fd と異なる。export 時 duplicate（新参照）か transfer（所有権移動）指定。ML 推論では通常 duplicate——両方参照保持、両 release で解放。
+
+=== macOS/iOS: IOSurface
+
+Apple は IOSurface——プロセス/API 間 surface 共有。
+
+IOSurface は image 向け設計。Metal、Core Image、Core Video 等間効率共有。MoltenVK 経由 Vulkan も IOSurface 可能だが Vulkan-Metal 橋渡しでより複雑。
+
+Apple ML 推論 typical は Core ML——IOSurface natural 統合。ONNX Runtime CoreML プロバイダなら IOSurface をランタイムが処理。
+
+=== Android: Hardware Buffers
+
+Android は AHardwareBuffer——Android サブシステム間バッファ共有。DMA-BUF 上だが Android 高レベル API。
+
+Android Vulkan は VK_ANDROID_external_memory_android_hardware_buffer で AHardwareBuffer import/export。Android ML（TFLite GPU、NNAPI 等）標準機構。
+
+AHardwareBuffer 利点: Android ネイティブ——全 Android GPU API が理解、フレームワークがプラットフォーム詳細処理。
+
+== ML ライブラリへのメモリ import
+
+Vulkan export 後 ML ライブラリへ import。ライブラリごと API 異なるが概念類似。
+
+=== ONNX Runtime + OpenCL 実行プロバイダ
+
+OpenCL 外部メモリ拡張で import:
+
+[source,cpp]
+----
+// OpenCL コンテキストとデバイス取得
+cl_context clContext;
+cl_device_id clDevice;
+// ... OpenCL 初期化 ...
+
+#ifdef _WIN32
+    // Windows: cl_khr_external_memory_win32
+    cl_mem_properties_khr props[] = {
+        CL_EXTERNAL_MEMORY_HANDLE_OPAQUE_WIN32_KHR,
+        (cl_mem_properties_khr)win32Handle,
+        0
+    };
+#else
+    // Linux: cl_khr_external_memory_opaque_fd
+    cl_mem_properties_khr props[] = {
+        CL_EXTERNAL_MEMORY_HANDLE_OPAQUE_FD_KHR,
+        (cl_mem_properties_khr)fd,
+        0
+    };
+#endif
+
+// 外部メモリから OpenCL バッファ作成
+cl_int err;
+cl_mem clBuffer = clCreateBufferWithProperties(
+    clContext, props, CL_MEM_READ_WRITE, memorySize, nullptr, &err);
+
+// clBuffer は Vulkan image と同 GPU メモリ参照
+// ONNX Runtime 入力として渡せる
+----
+
+OpenCL バッファから ONNX Runtime テンソル:
+
+[source,cpp]
+----
+// OpenCL メモリから ONNX Runtime テンソル
+std::vector<int64_t> shape = {1, 3, 1080, 1920}; // NCHW
+Ort::MemoryInfo memoryInfo("OpenCL", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+Ort::Value inputTensor = Ort::Value::CreateTensor(
+    memoryInfo, clBuffer, memorySize, shape.data(), shape.size(),
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+
+// 共有メモリテンソルで推論
+----
+
+要点: ONNX Runtime はデータコピーせず shared GPU メモリ上で推論。
+
+=== TensorFlow Lite + GPU デリゲート
+
+Android では AHardwareBuffer 経由外部メモリ:
+
+[source,cpp]
+----
+// Vulkan メモリを AHardwareBuffer として export（Android 固有）
+vk::AndroidHardwareBufferPropertiesANDROID bufferProperties;
+
+bufferProperties = device.getAndroidHardwareBufferPropertiesANDROID(hardwareBuffer);
+
+// 外部メモリ対応 TFLite GPU デリゲート
+TfLiteGpuDelegateOptionsV2 options = TfLiteGpuDelegateOptionsV2Default();
+options.experimental_flags |= TFLITE_GPU_EXPERIMENTAL_FLAGS_ENABLE_SERIALIZATION;
+
+TfLiteDelegate* delegate = TfLiteGpuDelegateV2Create(&options);
+
+// hardware buffer を TFLite に import
+// （適切 API 経由で TFLite GPU デリゲートが通常処理）
+----
+
+デスクトップ TFLite GPU 統合は more limited。OpenCL 相互運用か CPU-GPU 転送フォールバック。
+
+=== DirectML（Windows）
+
+DirectX 12 API として Windows Vulkan と NT handle 共有で natural 統合:
+
+[source,cpp]
+----
+// DirectML デバイス作成
+IDMLDevice* dmlDevice;
+DMLCreateDevice(d3d12Device, DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&dmlDevice));
+
+// Vulkan メモリを D3D12 リソースとして import
+D3D12_HEAP_PROPERTIES heapProps = {};
+heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+D3D12_RESOURCE_DESC resourceDesc = {};
+resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+resourceDesc.Width = 1920;
+resourceDesc.Height = 1080;
+resourceDesc.DepthOrArraySize = 1;
+resourceDesc.MipLevels = 1;
+resourceDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+resourceDesc.SampleDesc.Count = 1;
+resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+ID3D12Resource* sharedResource;
+d3d12Device->OpenSharedHandle(win32Handle, IID_PPV_ARGS(&sharedResource));
+
+// 共有リソースをラップする DirectML テンソルディスクリプタ
+DML_BUFFER_TENSOR_DESC bufferTensorDesc = {};
+bufferTensorDesc.DataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+bufferTensorDesc.Flags = DML_TENSOR_FLAG_NONE;
+bufferTensorDesc.DimensionCount = 4;
+uint32_t sizes[] = {1, 3, 1080, 1920};
+bufferTensorDesc.Sizes = sizes;
+// ... （追加セットアップ）
+
+// 共有リソースを DirectML オペレータにバインド
+----
+
+Windows では Vulkan と DirectML が同 Windows グラフィックス基盤上——統合 particularly clean。
+
+== 同期: 正しさの保証
+
+メモリ共有は半分。操作順序も essential——Vulkan レンダリ完了前に ML 読み始めない、推論完了前に Vulkan が結果使用しない。同期必要。
+
+=== 同期問題
+
+GPU は非同期。Vulkan コマンドバッファ submit は即 return——後で GPU 実行。OpenCL kernel や DirectML も同様。同期なし race:
+
+- ML が Vulkan 完了前に読み始め（不完全データ）
+- Vulkan が推論完了前に次フレームレンダリ（読み取り中データ上書き）
+- 期待時に結果不可視（キャッシュ coherency）
+
+同期プリミティブが実行順序とメモリ可視性を明示制御。
+
+=== Vulkan セマフォとフェンス
+
+*セマフォ* — GPU-GPU。キュー間調整。一方 signal、他方 wait。
+
+*フェンス* — GPU-CPU。CPU が GPU 完了待ち。
+
+外部同期には *外部セマフォ*、*外部フェンス*——他 API と共有可能版。
+
+=== 外部セマフォ
+
+外部メモリと類似:
+
+[source,cpp]
+----
+// export 可能セマフォ作成
+vk::ExportSemaphoreCreateInfo exportSemaphoreInfo;
+#ifdef _WIN32
+    exportSemaphoreInfo.handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32;
+#else
+    exportSemaphoreInfo.handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+#endif
+
+vk::SemaphoreCreateInfo semaphoreInfo{
+    .pNext = &exportSemaphoreInfo
+};
+
+vk::raii::Semaphore renderCompleteSemaphore(device, semaphoreInfo);
+
+// セマフォハンドル export
+#ifdef _WIN32
+    vk::SemaphoreGetWin32HandleInfoKHR handleInfo{
+        .semaphore = *renderCompleteSemaphore,
+        .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32
+    };
+
+    HANDLE semaphoreHandle = device.getSemaphoreWin32HandleKHR(handleInfo);
+#else
+    vk::SemaphoreGetFdInfoKHR fdInfo{
+        .semaphore = *renderCompleteSemaphore,
+        .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd
+    };
+
+    int semaphoreFd = device.getSemaphoreFdKHR(fdInfo);
+#endif
+----
+
+OpenCL へ import:
+
+[source,cpp]
+----
+// cl_khr_semaphore で OpenCL import
+cl_semaphore_properties_khr props[] = {
+#ifdef _WIN32
+    CL_SEMAPHORE_EXPORT_HANDLE_TYPES_KHR,
+    CL_SEMAPHORE_HANDLE_OPAQUE_WIN32_KHR,
+    (cl_semaphore_properties_khr)semaphoreHandle,
+#else
+    CL_SEMAPHORE_EXPORT_HANDLE_TYPES_KHR,
+    CL_SEMAPHORE_HANDLE_OPAQUE_FD_KHR,
+    (cl_semaphore_properties_khr)semaphoreFd,
+#endif
+    0
+};
+
+cl_int err;
+cl_semaphore_khr clSemaphore = clCreateSemaphoreWithPropertiesKHR(
+    clContext, props, &err);
+----
+
+Vulkan と OpenCL 調整:
+
+[source,cpp]
+----
+// Vulkan: レンダリしてセマフォ signal
+vk::SubmitInfo submitInfo{
+    .commandBufferCount = 1,
+    .pCommandBuffers = &*renderCommandBuffer,
+    .signalSemaphoreCount = 1,
+    .pSignalSemaphores = &*renderCompleteSemaphore
+};
+
+graphicsQueue.submit(submitInfo);
+
+// OpenCL: セマフォ待ち、推論
+clEnqueueWaitSemaphoresKHR(clQueue, 1, &clSemaphore, nullptr, 0, nullptr, nullptr);
+
+// OpenCL kernel 起動（または ONNX Runtime 推論）
+
+// OpenCL: 推論完了セマフォ signal
+clEnqueueSignalSemaphoresKHR(clQueue, 1, &inferenceCompleteSemaphore,
+                             nullptr, 0, nullptr, nullptr);
+
+// Vulkan: 推論完了待ち、結果使用
+vk::PipelineStageFlags waitStage = vk::PipelineStageFlagBits::eAllCommands;
+
+vk::SubmitInfo submitInfo2{
+    .waitSemaphoreCount = 1,
+    .pWaitSemaphores = &*inferenceCompleteSemaphore,
+    .pWaitDstStageMask = &waitStage,
+    .commandBufferCount = 1,
+    .pCommandBuffers = &*postProcessCommandBuffer
+};
+
+graphicsQueue.submit(submitInfo2);
+----
+
+依存チェーン: Vulkan レンダリ → signal → OpenCL wait → 推論 → signal → Vulkan wait → 結果使用。すべて GPU 側、CPU 関与なし、最大性能。
+
+=== タイムラインセマフォ
+
+Vulkan 1.2 タイムラインセマフォはより強力。バイナリ（signal/unsignal）ではなく 64 ビットカウンタ。特定値 wait/signal、複雑パイプライン向け。
+
+タイムラインセマフォは pipelining——複数 in-flight フレーム各 ML 推論、フレーム対応追跡に particularly 有用。
+
+== 実践的考慮
+
+GPU リソース共有は強力だが practical 課題あり。
+
+=== メモリレイアウトと形式互換
+
+Vulkan と ML でメモリレイアウト期待が異なる可能性。Vulkan image は optimal tiling、ML は linear（row-major、tight pack）期待 often。
+
+共有には通常 VK_IMAGE_TILING_LINEAR——ML が理解する linear 強制。トレードオフ: レンダリ性能（optimal より linear 遅い）。
+
+または optimal でレンダリ、ML 前 layout 遷移 + linear staging へ copy。overhead 追加だがレンダリ gain が copy コスト上回る場合も。
+
+=== 形式変換
+
+Vulkan BGRA（VK_FORMAT_B8G8R8A8_UNORM）、ML は RGB や planar YUV。compute シェーダまたは前処理で変換。
+
+=== ドライバとプラットフォーム制限
+
+全ドライバが全外部メモリ機能非サポート。古いドライバは外部セマフォ非対応や特定メモリ型のみ。ランタイム capability 確認とフォールバック必須。
+
+モバイル制限 more。Android AHardwareBuffer はデバイス/Android 版で varies。iOS MoltenVK IOSurface に quirks。
+
+=== デバッグ
+
+GPU リソース共有問題は debug 困難。症状:
+
+- 破損（古い/不完全データ読み取り）
+- クラッシュ（解放済みメモリアクセス）
+- ハング（不正同期デッドロック）
+
+validation layer 積極使用。Vulkan validation、OpenCL エラーチェック、ML デバッグツール。デバッグ中明示同期（fence、clFinish）で timing 問題切り分け。
+
+== まとめ
+
+GPU リソース共有は Vulkan アプリ効率 ML 推論の鍵。Vulkan と ML 間直接メモリ共有で expensive CPU 往復排除、メモリ使用量削減。
+
+基盤は Vulkan 外部メモリ拡張。Linux fd、Windows NT handle、macOS IOSurface、Android AHardwareBuffer が実 sharing。
+
+各 ML ライブラリ固有 import API——ONNX Runtime OpenCL、Android TFLite AHardwareBuffer、DirectML D3D12 共有。概念共通: Vulkan export → ML import → 外部セマフォ同期。
+
+結果はゼロコピー GPU-GPU データフロー——グラフィックスアプリリアルタイム ML 推論を feasible に。実装複雑だが demanding ユースケースでは性能 gain essential。
+
+xref:ML_Inference/Third_Party_Libraries/06_integration_patterns.adoc[前へ: 統合パターン] | xref:ML_Inference/Third_Party_Libraries/08_data_transfer_optimization.adoc[次へ: データ転送の最適化]

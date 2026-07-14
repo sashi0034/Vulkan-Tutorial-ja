@@ -1,0 +1,15 @@
+:pp: {plus}{plus}
+
+= ライティングとマテリアル: 基本的なライティングモデルとプッシュ定数
+
+この章では、基本的なライティングモデルの実装と、Vulkan でマテリアルプロパティにプッシュ定数を使う方法を扱います。エンジン実装全体を通じて、モダンで効率的かつ保守可能なコードベースを作るため、vk::raii ダイナミックレンダリングと C++20 モジュールを使います。
+
+== 目次
+
+* xref:Building_a_Simple_Engine/Lighting_Materials/01_introduction.adoc[はじめに]
+* xref:Building_a_Simple_Engine/Lighting_Materials/02_lighting_models.adoc[ライティングモデル]
+* xref:Building_a_Simple_Engine/Lighting_Materials/03_push_constants.adoc[プッシュ定数]
+* xref:Building_a_Simple_Engine/Lighting_Materials/04_lighting_implementation.adoc[ライティング実装]
+* xref:Building_a_Simple_Engine/Lighting_Materials/05_vulkan_integration.adoc[Vulkan 統合]
+* xref:Building_a_Simple_Engine/Lighting_Materials/07_shadows.adoc[シャドウ]
+* xref:Building_a_Simple_Engine/Lighting_Materials/06_conclusion.adoc[まとめ]

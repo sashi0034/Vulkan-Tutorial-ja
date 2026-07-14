@@ -1,0 +1,333 @@
+= ベンダー固有最適化: 最後の一滴を絞る
+:pp: ++
+:stem: latexmath
+
+汎用 Vulkan コンピュートシェーダは「大きな均衡装置」——ほぼすべての現代 GPU で動きます。しかし ML 推論のハイステークス世界では「動く」だけでは足りません。支配したいのです。
+
+NVIDIA には **Tensor Core**、AMD には **AI Accelerators（WMMA）**、Intel には **XMX** エンジンがあります。小さな行列タイルの乗算専用ハードウェアブロック。無視すれば latexmath:[5\times] から latexmath:[10\times] の性能をテーブルに残します。
+
+本章では **ハードウェアAware Vulkan** の書き方を学びます。「Big Three」間のアーキテクチャ差を探り、高レベルライブラリ使用（ONNX Runtime）と低レベルシェーダエンジニアリングのギャップを橋渡しします。
+
+== 実用経路: ライブラリレベルハードウェア加速
+
+Desktop Applications 章で教えた ONNX Runtime 使用時、「Tensor Core 向けにカスタムアセンブリを書く必要がある？」
+
+答えは **いいえ**。高レベルライブラリは **Execution Provider（EP）** 経由でこのハードウェアを自動検出・利用するよう設計されています。
+
+=== 1. WebGPU / DirectML（Universal Windows/Linux）
+`webgpu` または `DirectML` execution provider 使用時、ライブラリはモデルノードを **Metacommands** に変換——ドライバ提供のベンダー最適化 GPU カーネル。
+
+*   **検証方法**: Windows では **タスクマネージャー** または **NVIDIA コントロールパネル**。推論中に「Compute」または「Tensor」エンジン使用率がスパイクし 3D 使用率が低ければ、ライブラリは汎用グラフィックスユニットをバイパス成功。
+*   **チューニング**: 環境変数で特定動作を強制可能。例: `ORT_DIRECTML_DEVICE_ID` で特定 GPU 選択、DirectML 内部フラグで「Performance」vs「Power」優先。
+
+=== 2. CUDA / TensorRT（NVIDIA 固有）
+NVIDIA ハードウェアで絶対最高性能には **TensorRT** execution provider が王。モデルを実行するだけでなく、特定 GPU アーキテクチャ（Ada Lovelace vs Ampere など）向けに **コンパイル**。
+
+*   **コンパイル**: TensorRT でモデルを初実行すると数分停止——特定シリコン上で異なる行列タイルサイズをテストし最高スループットを見つけている。
+*   **FP16/INT8**: TensorRT 経由で Tensor Core を使うには `SessionOptions` で明示有効化:
+[source,cpp]
+----
+Ort::SessionOptions options;
+OrtTensorRTProviderOptions trt_options;
+trt_options.device_id = 0;
+trt_options.trt_fp16_enable = 1; // Enables Tensor Cores
+trt_options.trt_int8_enable = 1; // Requires calibration data
+options.AppendExecutionProvider_TensorRT(trt_options);
+----
+
+== シリコンの状況: 行列数学ユニット
+
+シェーダレベル（経路 2）でベンダー最適化するには「Matrix Unit」——小行列タイルで融合乗算加算（latexmath:[D = A \times B + C]）を行うハードウェアブロック——を理解する必要があります。
+
+=== 1. NVIDIA（Tensor Core）
+**Volta** アーキテクチャ以降、NVIDIA SM（Streaming Multiprocessor）に Tensor Core を搭載。
+
+*   **ユニット**: Tensor Core は個別数値ではなく **行列タイル**（通常 16x16）で動作。
+*   **ワークフロー**: **Warp**（32 スレッド）内スレッドが協調。行列 latexmath:[A] は 1 スレッドがロードするのではなく、行が 32 スレッド全体に分散。Tensor Core が Warp 内全スレッドのレジスタに同時「手を伸ばし」乗算。
+
+.Warp-Level Matrix Cooperation
+image::images/ML_Inference/Advanced_Topics/coop_matrix_warp.svg[Diagram showing Matrix A and B distribution across a GPU Warp for hardware acceleration, 800]
+
+*   **ボトルネック**: Tensor Core は速すぎて、ほぼ常に **メモリバウンド** です。数クロックサイクルごとに 16x16 タイルを供給できなければアイドル。**共有メモリタイリング**（第 05 章）が必須。
+
+=== 2. AMD（WMMA - Wave Matrix Multiply-Accumulate）
+**RDNA3**（RX 7000 シリーズ）で AI Accelerators を導入。
+
+*   **ユニット**: WMMA ユニットは AMD の広い **SIMD ユニット** を飽和させる設計。
+*   **ワークフロー**: NVIDIA と類似だが AMD **Wavefront**（32 または 64 スレッド）向け最適化。AMD アーキテクチャは **Infinity Cache** でこれらユニットを供給することに大きく依存します。
+*   **ニュアンス**: AMD ではハードウェアが異なる「Wave」サイズ（Wave32 vs Wave64）をサポート。Wave32 向けシェーダが Wave64 カードでハードウェア制限を正しくクエリしないと半速で動き、残り半分は未初期化ゴミ。
+
+=== 3. Intel（XMX - Xe Matrix Extensions）
+Intel **Arc** GPU（Xe-HPG）は消費者市場で最も積極的な行列ハードウェアの一つです。
+
+*   **ユニット**: 各 Xe-core に **Systolic Array**。
+*   **Systolic Flow**: 標準 GPU スレッドがレジスタ読み書きするのに対し、systolic array はデータを処理要素から隣へ直接渡す。「パルス」がグリッドを流れるイメージ。
+*   **成果**: レジスタ圧力を最小化し、Intel GPU はメモリ待ちなしに非常に深い行列計算を実行。**INT8** と **BF16**（Brain Floating Point）精度で特に効率的。
+
+== Cooperative Matrices: ユニバーサル高速経路
+
+`VK_KHR_cooperative_matrix` 拡張は行列ハードウェアの「標準ライブラリ」。Vulkan コンパイラが自動的に正しいハードウェアユニット（Tensor Core、WMMA、XMX）へマップする型を提供。
+
+=== 概念: 不透明タイリング
+ネスト `for` ループの代わりに `coopmat` 型を使用。`coopmat` は **不透明**——どのスレッドがどのピクセルを所有するか不明。ハードウェアが最適マッピングを決定。
+
+[source,glsl]
+----
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Define a matrix configuration
+// M, N, K are the tile dimensions (e.g., 16, 16, 16)
+layout(constant_id = 0) const uint M = 16;
+layout(constant_id = 1) const uint N = 16;
+layout(constant_id = 2) const uint K = 16;
+
+// Cooperative matrices for Subgroup scope (the 32/64 threads work together)
+coopmat<float16_t, gl_ScopeSubgroup, M, K, gl_MatrixUseA> matA;
+coopmat<float16_t, gl_ScopeSubgroup, K, N, gl_MatrixUseB> matB;
+coopmat<float32_t, gl_ScopeSubgroup, M, N, gl_MatrixUseAccumulator> matC;
+
+void main() {
+    // 1. Cooperative Load: Hardware-optimized memory fetch
+    // Stride is the number of elements between rows in VRAM.
+    // 'false' indicates the memory is not column-major.
+    coopMatLoad(matA, inputABuffer, indexA, strideA, false);
+    coopMatLoad(matB, inputBBuffer, indexB, strideB, false);
+
+    // 2. The Systolic Burst: Multiply-Add in one instruction
+    // This maps to 'hmma' on NVIDIA or 'v_wmma' on AMD.
+    matC = coopMatMulAdd(matA, matB, matC);
+
+    // 3. Store the result
+    coopMatStore(matC, outputBuffer, indexC, strideC, false);
+}
+----
+
+== ハンズオン: 行列アクセラレータのクエリと使用
+
+Cooperative matrices は内部レイアウトがハードウェア定義のため「不透明」。使用にはユーザー GPU がサポートする特定構成（M、N、K）をクエリする必要があります。
+
+=== フェーズ 1: 拡張の有効化（C++）
+
+行列ハードウェアは Vulkan セットアップ時の明示的有効化が必要。
+
+[source,cpp]
+----
+// 1. Instance Extensions
+// Usually none needed beyond standard Vulkan 1.2+
+
+// 2. Device Extensions
+std::vector<const char*> deviceExtensions = {
+    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+    VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME // Often needed for ML data types
+};
+
+// 3. Feature Activation
+VkPhysicalDeviceCooperativeMatrixFeaturesKHR matrixFeatures = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+    .cooperativeMatrix = VK_TRUE, // Enable the actual hardware path
+    .cooperativeMatrixRobustness = VK_TRUE // Recommended for safety
+};
+
+// Pass matrixFeatures to your VkDeviceCreateInfo pNext chain
+----
+
+=== フェーズ 2: ハードウェア能力のクエリ
+
+すべての GPU が異なる行列サイズをサポート。RTX 4090 は 16x16、AMD カードは 32x32 を好む可能性。ランタイムにクエリ必須。
+
+[source,cpp]
+----
+uint32_t propertyCount = 0;
+vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(gpu, &propertyCount, nullptr);
+
+std::vector<VkCooperativeMatrixPropertiesKHR> props(propertyCount);
+for(auto& p : props) p.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+
+vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(gpu, &propertyCount, props.data());
+
+// Filter for the configuration you want (e.g., float16 math)
+for (const auto& p : props) {
+    if (p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.scope == VK_SCOPE_SUBGROUP_KHR) {
+        std::cout << "Supported Tile: M=" << p.MSize << " N=" << p.NSize << " K=" << p.KSize << std::endl;
+        // Save these for Specialization Constants!
+    }
+}
+----
+
+=== フェーズ 3: Specialization Constant ハンドシェイク
+
+シェーダはレジスタ割り当てのためコンパイル時にタイルサイズを知る必要があり、クエリしたハードウェア値を **Specialization Constants** で渡します。
+
+[source,cpp]
+----
+// Map hardware M, N, K to specialization constants
+std::array<VkSpecializationMapEntry, 3> specMap;
+specMap[0] = { .constantID = 0, .offset = 0, .size = sizeof(uint32_t) }; // M
+specMap[1] = { .constantID = 1, .offset = 4, .size = sizeof(uint32_t) }; // N
+specMap[2] = { .constantID = 2, .offset = 8, .size = sizeof(uint32_t) }; // K
+
+uint32_t specData[] = { supportedM, supportedN, supportedK };
+
+VkSpecializationInfo specInfo = {
+    .mapEntryCount = 3, .pMapEntries = specMap.data(),
+    .dataSize = sizeof(specData), .pData = specData
+};
+
+// Pass specInfo to your VkComputePipelineCreateInfo
+----
+
+=== フェーズ 4: ディスパッチオーケストレーション
+
+Cooperative matrices 使用時、ディスパッチは **Subgroup** に整列する必要があります。
+
+1.  **ワークグループサイズ**: `local_size_x` を `subgroupSize`（例: 32）に設定。
+2.  **グリッド次元**: 総行列サイズをハードウェアタイルサイズ（M、N）で除算。
+    *   `dispatchX = totalN / supportedN;`
+    *   `dispatchY = totalM / supportedM;`
+
+== レジスタ習得: 隠れたボトルネック
+
+経路 2（カスタムシェーダ）では最大の敵はコードロジックではなく **レジスタ圧力**。
+
+=== レジスタファイル
+すべての GPU コンピュートユニットには **レジスタファイル** と呼ばれる固定量の高速メモリプール。
+
+*   シェーダが **32 レジスタ** 使用なら GPU は **2,048 スレッド** を同時起動（高 Occupancy）。
+*   **128 レジスタ**（大 `coopmat` や大配列）なら **512 スレッド** のみ（低 Occupancy）。
+
+=== Occupancy が重要な理由
+GPU は **メモリレイテンシ** を隠すためスレッドを使用。1 スレッドが VRAM 待ちのとき GPU は計算準備完了の別スレッドに「スワップ」。
+
+*   **高 Occupancy**: GPU は常に「新鮮」スレッドを実行可能。ハードウェアは busy。
+*   **低 Occupancy**: 512 スレッドすべてが VRAM 待ち。コンピュートユニットはアイドル。「レジスタバウンド」。
+
+=== プロのプロファイリング: 「顕微鏡」
+修正にはベンダー固有プロファイラ:
+
+1.  **NVIDIA（Nsight Compute）**: 「Register Pressure」指標。 「Spilling to Local Memory」ならレジスタが遅い VRAM に溢れた。`coopmat` タイル縮小またはループ簡素化。
+2.  **AMD（Radeon GPU Profiler）**: 「Wavefront Occupancy」グラフ。SIMD あたり 4 wavefront 未満ならレイテンシを効果的に隠せていない。
+3.  **Intel（Graphics Performance Analyzers）**: 「Stall Reason」。 「Register Dependency」なら数学がレジスタファイルのデータ供給より速い。
+
+== Subgroup Shuffle: VRAM なし通信
+
+行列数学をしていなくても **Subgroup Operations** でベンダー向け最適化可能。Subgroup 内スレッドは **共有メモリや L1 キャッシュに触れず** データ共有。
+
+=== 「Shuffle」パターン
+**Softmax** 計算を想像。数値安定性のため行の最大値が必要。
+
+*   **素朴な方法**: 各スレッドが共有メモリに書き、`barrier()`、1 スレッドがすべて読む。（レイテンシ: 40〜100 サイクル）。
+*   **ハードウェア方法**: `subgroupMax()` を使用。
+
+[source,glsl]
+----
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+void main() {
+    float myVal = ...;
+    // The GPU hardware performs a reduction across all 32 threads
+    // in the register file.
+    float rowMax = subgroupMax(myVal);
+    // rowMax is now correct for ALL threads in the subgroup.
+}
+----
+レイテンシを 100 サイクルから **1 サイクル** に削減。
+
+== ベンダーニュアンス: Wavefront サイズ
+ベンダー固有コードの最大ハードルの一つは **Subgroup Size**。
+
+*   **NVIDIA**: 常に 32（Warp）。
+*   **Intel**: シェーダ複雑度により通常 8、16、32。
+*   **AMD**: ハードウェア世代により 32 または 64（Wave32 vs Wave64）。
+
+堅牢なベンダーコードでは `32` をハードコードしない。常に `gl_SubgroupSize` をクエリするか Vulkan 提供の `subgroupSize` specialization constant を使用。Wave64 AMD カードで 32 を仮定すると半分のデータしか処理せず、残り半分は未初期化ゴミ。
+
+== マルチベンダーディスパッチャパターン
+
+プロ推論エンジンは 3 つの別アプリではなく、ランタイムにハードウェアを検出し実装を「スワップ」する 1 アプリであるべき。
+
+[source,cpp]
+----
+class InferencePath {
+public:
+    virtual void dispatch(vk::CommandBuffer cmd) = 0;
+};
+
+// Implementation for NVIDIA Tensor Cores
+class NvidiaPath : public InferencePath { ... };
+
+// Implementation for AMD WMMA
+class AmdPath : public InferencePath { ... };
+
+// Implementation for Intel XMX
+class IntelPath : public InferencePath { ... };
+
+// Generic path using standard subgroups
+class GenericPath : public InferencePath { ... };
+
+// Helper to check for extension support
+bool supportsCoopMat(vk::PhysicalDevice gpu) {
+    auto extensions = gpu.enumerateDeviceExtensionProperties();
+    for (const auto& ext : extensions) {
+        if (std::string(ext.extensionName) == VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) return true;
+    }
+    return false;
+}
+
+std::unique_ptr<InferencePath> selectOptimalPath(vk::PhysicalDevice gpu) {
+    auto props = gpu.getProperties();
+
+    // Check Vendor ID
+    if (props.vendorID == 0x10DE && supportsCoopMat(gpu)) {
+        return std::make_unique<NvidiaPath>();
+    }
+    if (props.vendorID == 0x1002 && supportsCoopMat(gpu)) {
+        return std::make_unique<AmdPath>();
+    }
+    if (props.vendorID == 0x8086 && supportsCoopMat(gpu)) {
+        return std::make_unique<IntelPath>();
+    }
+
+    return std::make_unique<GenericPath>();
+}
+----
+
+== ベンダー固有性能プロファイル
+
+精度選択時、ターゲットハードウェアのスループット比を理解する必要があります。現代 GPU は整数数学に大きく偏っています。以下は標準行列乗算（GEMM）のピーク理論スループット。
+
+[options="header", cols="1,2,2,2"]
+|===
+| Precision | NVIDIA (RTX 4090) | AMD (RX 7900 XTX) | Intel (Arc A770)
+| **FP32**  | 82.6 TFLOPS        | 61.3 TFLOPS        | 17.2 TFLOPS
+| **FP16**  | 330.3 TFLOPS (TC)  | 122.6 TFLOPS (WMMA)| 68.8 TFLOPS (XMX)
+| **INT8**  | 660.6 TOPS (TC)    | 245.2 TOPS (WMMA)  | 137.6 TOPS (XMX)
+|===
+
+**出典**:
+
+*   **NVIDIA**: link:https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/[RTX 4090 Product Specifications]（Tensor Core スループットはピーク演算とスパース性比から導出）。
+*   **AMD**: link:https://www.amd.com/en/products/graphics/amd-radeon-rx-7900-xtx[AMD Radeon RX 7900 XTX Specs]（AI Accelerator 性能）。
+*   **Intel**: link:https://www.intel.com/content/www/us/en/products/sku/229151/intel-arc-a770-graphics-16gb/specifications.html[Intel Arc A770 Specifications]（XMX スループット）。
+
+**洞察**: FP32 から INT8 へ移行すると、メモリ節約だけでなく、すべての主要ベンダーで **8 倍から 10 倍速い** ハードウェア経路にアクセス。
+
+== メモリアライメント: 静かな性能キラー
+
+行列ハードウェアはメモリレイアウトに非常に厳しいです。無視するとドライバが静かに「スローパス」にフォールバックし、latexmath:[10\times] 高速化が消えます。
+
+1.  **バッファアライメント**: NVIDIA Tensor Core はバッファ開始アドレスと各行「Stride」が **128 ビット（16 バイト）** 整列を要求。
+2.  **タイリング戦略**: 行列次元を常に 16 の倍数に。レイヤが 100x100 なら 112x112 にゼロパディング。ハードウェア数学が速すぎて 12 余分ゼロ計算は非整列 100x100 カーネルより速い。
+
+== まとめ: ハードウェア習得チェックリスト
+
+1.  **ライブラリ経路**: `SessionOptions` で `trt_fp16_enable` または `webgpu` プロバイダを有効化。
+2.  **クエリ**: `VkPhysicalDeviceCooperativeMatrixPropertiesKHR` の `vkGetPhysicalDeviceProperties2` チェック。
+3.  **タイリング**: ML レイヤを 16x16 または 32x32 ブロックに整列しハードウェア行列ユニットに合わせる。
+4.  **Cooperative Matrices**: 内側ループを `coopMatMulAdd` に置換し latexmath:[5\text{--}10\times] ブースト。
+5.  **Subgroups**: すべてのスレッド間通信に `subgroupMax`、`subgroupSum`、`subgroupShuffle`。
+6.  **アライメント**: すべてのバッファ stride を 16 バイト整列し **Coalesced Memory Access** を有効化。
+
+次章では最終ハードウェア制約 **メモリ管理**——プロのプーリングとストリーミング技法で巨大 10GB モデルを 4GB GPU メモリに収める方法。
+
+xref:ML_Inference/Advanced_Topics/02_quantization_strategies.adoc[前へ: 量子化戦略] | xref:ML_Inference/Advanced_Topics/04_memory_management.adoc[次へ: 高度なメモリ管理]

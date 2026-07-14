@@ -1,0 +1,52 @@
+:pp: {plus}{plus}
+
+= ダイナミックレンダリング
+
+== はじめに
+
+以前のバージョンのVulkanでは、パイプライン作成を終える前に、レンダーパスオブジェクトを通じてレンダリング中に使うフレームバッファアタッチメントについてVulkanに伝える必要がありました。しかし、Vulkan 1.3でダイナミックレンダリングが導入されたことで、グラフィックスパイプライン作成時とコマンドバッファ記録時にこの情報を直接指定できるようになりました。
+
+ダイナミックレンダリングは、レンダーパスとフレームバッファオブジェクトの必要性をなくすことでレンダリング処理を単純化します。代わりに、レンダリングを開始するときにカラー、深度、ステンシルアタッチメントを直接指定できます。
+
+== Pipeline Rendering Create Info
+
+ダイナミックレンダリングを使うには、レンダリング中に使うアタッチメントのフォーマットを指定する必要があります。これはグラフィックスパイプライン作成時に`vk::PipelineRenderingCreateInfo`構造体を通じて行います。
+
+[,c++]
+----
+vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{ .colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format };
+----
+
+この構造体は、スワップチェーン画像のフォーマットを持つカラーアタッチメントを1つ使うことを指定します。次に、この構造体を`vk::GraphicsPipelineCreateInfo`構造体から始まる`vk::StructureChain`に含めます。
+
+[,c++]
+----
+vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+    {.stageCount          = 2,
+     .pStages             = shaderStages,
+     .pVertexInputState   = &vertexInputInfo,
+     .pInputAssemblyState = &inputAssembly,
+     .pViewportState      = &viewportState,
+     .pRasterizationState = &rasterizer,
+     .pMultisampleState   = &multisampling,
+     .pColorBlendState    = &colorBlending,
+     .pDynamicState       = &dynamicState,
+     .layout              = pipelineLayout,
+     .renderPass          = nullptr},
+    {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format}};
+----
+
+従来のレンダーパスではなくダイナミックレンダリングを使っているため、`renderPass`パラメータは`nullptr`に設定されていることに注意してください。
+
+== コマンドバッファの記録
+
+コマンドバッファを記録するときは、指定したアタッチメントへのレンダリングを開始するために`vk::CommandBuffer::beginRendering`関数を使います。詳細はDrawingの章で扱います。
+
+ダイナミックレンダリングの利点は、レンダーパスとフレームバッファオブジェクトが不要になりレンダリング処理が単純になることです。また、新しいレンダーパスオブジェクトを作成せずにレンダリング先のアタッチメントを変えられるため、柔軟性も高まります。
+
+xref:./04_Conclusion.adoc[次の章]では、すべてをまとめて、ついにグラフィックスパイプラインオブジェクトを作成します。
+
+link:/attachments/12_graphics_pipeline_complete.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

@@ -1,0 +1,235 @@
+:pp: {plus}{plus}
+
+= モデル表現
+
+レイヤ抽象化を特定し、共通パターンを抽出しました。しかしまだレイヤを手動で配線しています——順に作成し、バッファを接続し、実行順序を管理します。これはスケールしません。
+
+ネットワーク全体を表すデータ構造が必要です: どの演算が存在するか、どう接続するか、どのデータが流れるか。そうすればこの構造を走査して自動実行するコードを書けます。
+
+これがグラフ表現です。グラフィックス描画のグラフではなく——計算グラフです。ネットワークの設計図と考えてください。
+
+== グラフに含まれるもの
+
+計算グラフには 3 つの基本コンポーネントがあります。
+
+**テンソル**: データ。入力画像、中間活性化、学習済み重み、最終出力。各テンソルには形状（グレースケール画像なら [1, 28, 28] など）、データ型（通常 float32）、必要に応じて実データ（重みと定数用）があります。
+
+**演算**: 計算。dense レイヤ、畳み込み、ReLU、プーリング。各演算には型、型固有のパラメータ（畳み込みのカーネルサイズなど）、入出力テンソルへの接続があります。
+
+**接続**: 演算間のエッジ。演算 A がテンソル X を生成します。演算 B がテンソル X を入力として消費します。この依存関係により、A が終わるまで B は実行できません。
+
+これらが合わさって有向非巡回グラフ（DAG）を形成します。有向——データは入力から出力へ一方向に流れます。非巡回——ループはありません。演算 A が B に依存し、B が C に依存し、C が再び A に依存する、ということはできません。
+
+== テンソルの表現
+
+テンソルには形状情報が必要で、オプションでデータを保持します。
+
+[source,cpp]
+----
+class Tensor {
+public:
+    Tensor(std::string name, std::vector<int64_t> shape)
+        : name_(std::move(name)), shape_(std::move(shape)) {}
+
+    const std::string& name() const { return name_; }
+    const std::vector<int64_t>& shape() const { return shape_; }
+
+    // For constant tensors (weights, biases)
+    void setData(std::vector<float> data) { data_ = std::move(data); }
+    bool hasData() const { return data_.has_value(); }
+
+    // GPU buffer (set during allocation)
+    void setBuffer(vk::raii::Buffer buffer) { buffer_ = std::move(buffer); }
+
+private:
+    std::string name_;
+    std::vector<int64_t> shape_;
+    std::optional<std::vector<float>> data_;  // CPU data for constants
+    std::optional<vk::raii::Buffer> buffer_;  // GPU buffer when allocated
+};
+----
+
+シンプルです。テンソルは名前（デバッグ用）、形状（検証用）、データ（定数の場合）、GPU バッファ（割り当て後）を知ります。
+
+形状は次元のベクトルです。スカラーは []、ベクトルは [N]、行列は [M, N]、画像は [height, width, channels]、画像のバッチは [batch, height, width, channels] です。
+
+== 演算の表現
+
+演算には型があり、テンソルに接続します。
+
+[source,cpp]
+----
+enum class OpType {
+    Dense, Conv2D, ReLU, MaxPool, /* ... */
+};
+
+class Operation {
+public:
+    Operation(std::string name, OpType type)
+        : name_(std::move(name)), type_(type) {}
+
+    // Connections
+    void addInput(std::shared_ptr<Tensor> tensor) { inputs_.push_back(tensor); }
+    void addOutput(std::shared_ptr<Tensor> tensor) { outputs_.push_back(tensor); }
+
+    // Type-specific parameters stored as attributes
+    template<typename T>
+    void setAttribute(const std::string& name, T value) {
+        attributes_[name] = value;
+    }
+
+private:
+    std::string name_;
+    OpType type_;
+    std::vector<std::shared_ptr<Tensor>> inputs_;
+    std::vector<std::shared_ptr<Tensor>> outputs_;
+    std::unordered_map<std::string, std::any> attributes_;
+};
+----
+
+inputs と outputs ベクトルがグラフ構造を定義します。dense レイヤは 2 入力（データと重み）と 1 出力があります。畳み込みは 3 入力（データ、重み、バイアス）かもしれません。加算演算は 2 入力（加算するテンソル）と 1 出力です。
+
+属性は演算固有のパラメータを保持します。畳み込みではカーネルサイズ、ストライド、パディングです。プーリングではプールサイズとストライドです。型消去には std::any を使います——演算ごとに異なるパラメータ型が必要です。
+
+== グラフコンテナ
+
+すべてのテンソルと演算を保持するコンテナが必要です。
+
+[source,cpp]
+----
+class ComputationGraph {
+public:
+    std::shared_ptr<Tensor> addTensor(
+        std::string name,
+        std::vector<int64_t> shape
+    ) {
+        auto tensor = std::make_shared<Tensor>(name, shape);
+        tensors_[name] = tensor;
+        return tensor;
+    }
+
+    std::shared_ptr<Operation> addOperation(std::string name, OpType type) {
+        auto op = std::make_shared<Operation>(name, type);
+        operations_.push_back(op);
+        return op;
+    }
+
+    // Mark graph inputs/outputs
+    void addInput(std::shared_ptr<Tensor> tensor) { inputs_.push_back(tensor); }
+    void addOutput(std::shared_ptr<Tensor> tensor) { outputs_.push_back(tensor); }
+
+    // Access
+    const std::vector<std::shared_ptr<Tensor>>& inputs() const { return inputs_; }
+    const std::vector<std::shared_ptr<Tensor>>& outputs() const { return outputs_; }
+    const std::vector<std::shared_ptr<Operation>>& operations() const { return operations_; }
+
+private:
+    std::unordered_map<std::string, std::shared_ptr<Tensor>> tensors_;
+    std::vector<std::shared_ptr<Operation>> operations_;
+    std::vector<std::shared_ptr<Tensor>> inputs_;
+    std::vector<std::shared_ptr<Tensor>> outputs_;
+};
+----
+
+これが中核データ構造です。テンソルと演算を追加し、接続し、どのテンソルがグラフの入出力かをマークしてグラフを構築します。
+
+== グラフを手動で構築
+
+3 レイヤ MNIST ネットワークをグラフとして構築しましょう。
+
+[source,cpp]
+----
+ComputationGraph graph;
+
+// Input tensor
+auto input = graph.addTensor("input", {1, 784});
+graph.addInput(input);
+
+// First dense layer
+auto fc1_weights = graph.addTensor("fc1_weights", {128, 784});
+fc1_weights->setData(weights.fc1_weights);  // Set constant data
+
+auto fc1_bias = graph.addTensor("fc1_bias", {128});
+fc1_bias->setData(weights.fc1_bias);
+
+auto fc1_output = graph.addTensor("fc1_output", {1, 128});
+
+auto fc1_op = graph.addOperation("fc1", OpType::Dense);
+fc1_op->addInput(input);
+fc1_op->addInput(fc1_weights);
+fc1_op->addInput(fc1_bias);
+fc1_op->addOutput(fc1_output);
+
+// Second dense layer (similar pattern)
+auto fc2_output = graph.addTensor("fc2_output", {1, 64});
+// ... create operation, connect tensors
+
+// Third dense layer
+auto fc3_output = graph.addTensor("fc3_output", {1, 10});
+// ... create operation, connect tensors
+
+graph.addOutput(fc3_output);
+----
+
+パターンに注目: テンソルを作成、演算を作成、入出力を接続。グラフに完全なネットワーク構造が含まれます。
+
+== 実行順序
+
+グラフは *何* を実行するかは示しますが *いつ* は示しません。実行順序——どの演算を最初に実行できるか、どれが他を待つか——を決める必要があります。
+
+これは DAG のトポロジカルソートです。依存のない演算（グラフ入力または定数のみを消費）から始め、実行し、依存が満たされた演算を実行し、という流れです。
+
+考え方（簡略化）:
+
+[source,cpp]
+----
+std::vector<std::shared_ptr<Operation>> computeExecutionOrder(
+    const ComputationGraph& graph
+) {
+    std::vector<std::shared_ptr<Operation>> ordered;
+    std::unordered_set<Operation*> executed;
+
+    // Keep trying to execute operations until all are done
+    while (ordered.size() < graph.operations().size()) {
+        for (const auto& op : graph.operations()) {
+            if (executed.count(op.get())) continue;  // Already executed
+
+            // Check if all input tensors are ready
+            bool ready = true;
+            for (const auto& input : op->inputs()) {
+                if (!input->hasData() && !isProducedByExecutedOp(input, executed)) {
+                    ready = false;
+                    break;
+                }
+            }
+
+            if (ready) {
+                ordered.push_back(op);
+                executed.insert(op.get());
+            }
+        }
+    }
+
+    return ordered;
+}
+----
+
+各演算が入力が利用可能になってからのみ実行される順序が得られます。単純な逐次ネットワークでは順序は自明: fc1、fc2、fc3 です。スキップ接続や並列分岐のあるネットワークでは、このアルゴリズムが正しい順序を自動で求めます。
+
+== 得られたもの
+
+グラフ表現は次をもたらします。
+
+**関心の分離**: グラフ構築と実行が分離されます。1 回構築し、何度も実行できます。
+
+**自動順序付け**: トポロジカルソートが実行順序を決めます——ハードコードしません。
+
+**最適化の機会**: グラフ全体が利用可能なので、融合、メモリ再利用、並列化を分析できます。
+
+**デバッグ**: グラフを可視化、出力、実行前に検証できます。
+
+しかしまだグラフを手動で構築しています。実モデルは数十から数百レイヤがあります。手で構築する代わりにモデルファイルからグラフを読み込む必要があります。
+
+次: モデル形式のパースです。
+
+xref:ML_Inference/Building_the_Inference_Engine/03_from_hardcoded_to_flexible.adoc[前へ: ハードコードから柔軟性へ] | xref:ML_Inference/Building_the_Inference_Engine/05_model_formats_as_input.adoc[次へ: 入力としてのモデル形式]

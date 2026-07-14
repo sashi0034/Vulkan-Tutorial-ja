@@ -1,0 +1,190 @@
+:pp: {plus}{plus}
+
+= Khronos Vulkan^®^ Tutorial
+
+== 帰属
+
+Khronos Vulkan^®^ Tutorial は、Alexander Overvoorde による「link:https://vulkan-tutorial.com/[Vulkan Tutorial]」を基にしており、
+link:https://creativecommons.org/licenses/by-sa/4.0/[CC BY-SA 4.0] の下でライセンスされています。
+
+== 相違点
+
+オリジナルのチュートリアルと比較して、本バージョンは最新の概念を教えています。
+
+* ベースラインとしての Vulkan 1.4
+* レンダーパスの代わりにダイナミックレンダリング
+* タイムラインセマフォ
+* 主要なシェーディング言語としての link:https://shader-slang.org/[Slang]
+* モダンな C++（20）
+* link:https://en.wikipedia.org/wiki/Resource_acquisition_is_initialization[RAII] を用いた link:https://github.com/KhronosGroup/Vulkan-Hpp[Vulkan-Hpp]
+
+また、Vulkan の使い方に関する補足、同期の改善、新しいコンテンツも含まれています。
+
+== 概要
+
+このチュートリアルでは、
+https://www.khronos.org/vulkan/[Vulkan] グラフィックスおよびコンピュート API の基本的な使い方を学びます。
+Vulkan は https://www.khronos.org/[Khronos グループ] による API であり、
+現代のグラフィックスカードをより適切に抽象化します。
+この新しいインターフェースにより、アプリケーションが何を意図しているかを
+より正確に記述でき、
+https://en.wikipedia.org/wiki/OpenGL[OpenGL] や
+https://en.wikipedia.org/wiki/Direct3D[Direct3D]
+といった既存の API と比べて、より高いパフォーマンスと、予想外のドライバ挙動の減少につながります。
+Vulkan の背後にある考え方は
+https://en.wikipedia.org/wiki/Direct3D#Direct3D_12[Direct3D 12] や
+https://en.wikipedia.org/wiki/Metal_(API)[Metal] と似ていますが、
+Vulkan には完全なクロスプラットフォームであるという利点があり、
+Windows、Linux、Android 向けに同時に開発できます。
+
+ただし、これらの利点の代償として、はるかに冗長でニュアンスの多い API を
+扱う必要があります。フレームバッファの初期作成や、バッファやテクスチャ画像といった
+オブジェクトのメモリ管理を含め、グラフィックス API に関するあらゆる詳細を
+アプリケーション側で設定する必要があります。
+グラフィックスドライバが手取り足取り助けることは少なくなるため、
+正しい動作を保証するために、アプリケーション側でより多くの作業を行う必要があります。
+
+可能な限り、本チュートリアルではモダンなツールを活用して Vulkan の扱いと学習を
+容易にしています。とはいえ、Vulkan は簡単であることを意図したものではありません。
+
+ここで伝えたいメッセージは、Vulkan がすべての人向けではないということです。
+高性能なコンピュータグラフィックスに熱心で、ある程度の労力を惜しまない
+プログラマを対象としています。
+コンピュータグラフィックスよりもゲーム開発に興味がある場合は、
+OpenGL や Direct3D に留まることを検討してもよいでしょう。これらが
+すぐに Vulkan に置き換えられて非推奨になることはありません。
+ただし、OpenGL に留まる代償として、その API がレイトレーシングや AI のような
+最新機能を得ることは決してない、という点を理解しておく必要があります。
+OpenGL はメンテナンス段階にあり、研究や新機能が提供されるのは Vulkan です。
+別の選択肢として、
+https://en.wikipedia.org/wiki/Unreal_Engine#Unreal_Engine_4[Unreal Engine] や
+https://en.wikipedia.org/wiki/Unity_(game_engine)[Unity]
+のようなエンジンを使う方法もあります。これらは Vulkan を利用しつつ、
+はるかに高レベルな API を提供してくれます。
+
+前置きはここまでとして、このチュートリアルを進めるための前提条件を挙げます。
+
+* Vulkan 対応のデバイスとドライバ
+** ほとんどの GPU ベンダーは、コンシューマ向けドライバ、またはモバイルでは
+ デバイス上で Vulkan をサポートしています。
+macOS および iOS では、
+link:https://github.com/KhronosGroup/MoltenVK[MoltenVK] を通じて Vulkan サポートが利用できます。
+Vulkan サポートの詳細は、コミュニティ主導の
+link:https://vulkan.gpuinfo.org/[Vulkan Hardware Database] で調べられます。
+* C{pp} の経験
+** RAII、初期化リストへの慣れ
+* C{pp}20 機能を十分にサポートするコンパイラ
+** Visual Studio 2017+、GCC 7+、または Clang 5+
+* リアルタイム 3D コンピュータグラフィックスの経験があること
+** 例: OpenGL や Direct3D
+
+
+このチュートリアルでは OpenGL や Direct3D の概念の知識は前提としませんが、
+3D コンピュータグラフィックスの基本は知っている必要があります。
+たとえば、透視投影の背後にある数学は説明しません。
+コンピュータグラフィックスの概念の優れた入門として、
+https://paroj.github.io/gltut/[このオンラインブック] を参照してください。
+その他の優れたコンピュータグラフィックスの資料としては、次のものがあります。
+
+* https://github.com/RayTracing/raytracing.github.io[Ray tracing in one weekend]
+* https://www.pbr-book.org/[Physically Based Rendering book]
+
+希望すれば C を C{pp} の代わりに使うこともできますが、別の線形代数ライブラリを
+使う必要があり、コード構成についても自力で進めることになります。
+本チュートリアルでは、クラスや RAII といった C{pp} の機能を使って、
+ロジックとリソースの寿命を整理します。
+
+Vulkan の学習を容易にするため、新しい
+https://github.com/KhronosGroup/Vulkan-Hpp[Vulkan-Hpp] バインディングを使います。
+これは一部の煩雑な作業を抽象化し、特定のクラスのエラーを防ぐのに役立ちます。
+また、Vulkan RAII と、オプションで Vulkan C{pp}20 モジュールも使います。
+attachments テンプレートでは、最大限の互換性のためモジュールはデフォルトで無効ですが、
+ツールチェーンがサポートしている場合は有効にすることを推奨します。
+この組み合わせにより、C{pp} ライブラリが従来長いビルド時間を引き起こしてきた
+大規模プロジェクトに直接通じる形で Vulkan を使う方法を示しつつ、
+Vulkan を快適に扱うための一つの方法も示します。
+
+== ライセンス
+
+このリポジトリの内容は、特に記載がない限り link:https://creativecommons.org/licenses/by-sa/4.0/[CC BY-SA 4.0] としてライセンスされています。
+このリポジトリに貢献することで、同じライセンスの下で貢献物を公開することに同意したものとします。
+
+== チュートリアルの構成
+
+まず、Vulkan がどのように動作するか、そして最初の三角形を画面に出すために
+必要な作業の概要から始めます。
+全体像における基本的な役割を理解した後の方が、個々の小さなステップの目的が
+より明確になります。
+次に、
+https://lunarg.com/vulkan-sdk/[Vulkan SDK]、
+線形代数操作用の https://glm.g-truc.net/[GLM ライブラリ]、
+ウィンドウ作成用の https://www.glfw.org/[GLFW]
+を使って開発環境を構築します。
+チュートリアルでは、Windows では Visual Studio、Ubuntu Linux では GCC での
+セットアップ方法を扱います。
+
+その後、最初の三角形を描画するために必要な Vulkan プログラムの
+基本コンポーネントをすべて実装します。
+各章はおおむね次の構成に従います。
+
+* 新しい概念とその目的を紹介する
+* 関連する API 呼び出しをすべて使ってプログラムに組み込む
+* 一部をヘルパー関数に抽象化する
+
+各章は前の章の続きとして書かれていますが、特定の Vulkan 機能を紹介する
+独立した記事として読むことも可能です。
+つまり、このサイトはリファレンスとしても役立ちます。
+すべての Vulkan 関数と型は仕様書にリンクされているので、
+クリックしてさらに詳しく学ぶことができます。
+フィードバックは https://github.com/KhronosGroup/Vulkan-Docs[この Khronos リポジトリ] に提出することを推奨します。
+
+前述のとおり、Vulkan API はグラフィックスハードウェアに対する最大限の制御を
+与えるため、多くのパラメータを持つかなり冗長な API です。
+そのため、テクスチャの作成のような基本的な操作でも、毎回繰り返さなければならない
+多くのステップが必要になります。
+したがって、チュートリアル全体を通して独自のヘルパー関数のコレクションを
+作成していきます。
+
+各章の終わりには、その時点までの完全なコード一覧へのリンクもあります。
+コードの構造に疑問がある場合や、バグに対処していて比較したい場合に参照できます。
+すべてのコードファイルは、正しさを検証するために複数ベンダーのグラフィックスカードで
+テストされています。
+
+チュートリアルやサイト自体について、いかなる種類の質問やフィードバックも、
+遠慮なく https://github.com/KhronosGroup/Vulkan-Tutorial[GitHub リポジトリ]
+に issue や pull request を提出してください。
+リポジトリを watch すると、チュートリアルの更新通知を受け取れます。
+
+Vulkan による最初の三角形を画面に描く儀式を終えたら、
+線形変換、テクスチャ、3D モデルを含むようにプログラムを拡張していきます。
+
+以前にグラフィックス API を触ったことがあるなら、最初のジオメトリが画面に
+現れるまでに多くのステップがあることをご存じでしょう。
+Vulkan にもこうした初期ステップは多くありますが、個々のステップは理解しやすく、
+冗長には感じられないことが分かるでしょう。
+また、その地味な三角形ができてしまえば、完全にテクスチャ付きの 3D モデルを
+描くのにそれほど余分な作業は不要で、それ以降の各ステップははるかに報われるものに
+なる、ということも覚えておくとよいでしょう。
+
+チュートリアルを進めている途中で問題に遭遇した場合は、まず FAQ を確認し、
+問題とその解決策がすでに載っていないか調べてください。
+それでも行き詰まった場合は、
+https://github.com/KhronosGroup/Vulkan-Tutorial[GitHub リポジトリ]
+で遠慮なく助けを求めてください。
+
+高性能グラフィックス API の未来へ飛び込む準備はできましたか？
+xref:01_Overview.adoc[さあ、始めましょう！]
+
+== 高度なトピック
+
+Vulkan の使い方を教える基本チュートリアルに加えて、基本を学んだ後に深く掘り下げられる高度なトピック向けの専用章もあります。
+
+* xref:courses/18_Ray_tracing/00_Overview.adoc[レイトレーシング]
+* xref:Building_a_Simple_Engine/introduction.adoc[シンプルなゲームエンジンの構築]
+* xref:Building_a_Simple_Engine/Courses/Opacity_Micromaps/00_introduction.adoc[Opacity Micromaps]
+* xref:Advanced_Vulkan_Compute/introduction.adoc[高度なコンピュート技法]
+* xref:Synchronization/introduction.adoc[新しい同期機能の利用]
+* xref:Advanced_glTF/introduction.adoc[高度な glTF]
+* xref:ML_Inference/introduction.adoc[機械学習推論]
+* xref:OpenXR_Vulkan_Spatial_Computing/introduction.adoc[OpenXR]
+* xref:AI_Assisted_Vulkan/introduction.adoc[AI 支援による Vulkan 開発]

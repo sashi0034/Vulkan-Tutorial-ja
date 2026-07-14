@@ -1,0 +1,246 @@
+= 電力とサーマル最適化: 物理限界の管理
+:pp: {plus}{plus}
+:stem: latexmath
+
+ハイエンドワークステーションには 1000W 電源と液体冷却があります。バッテリ駆動ドローンには 50Wh パワーバンクと受動アルミヒートシンク。デスクトップ AI では **レイテンシ** を最適化します。組み込み AI では **推論あたりのエネルギー** を最適化します。
+
+[latexmath]
+++++
+\text{Mission Life (Hours)} = \frac{\text{Battery Capacity (Wh)}}{\text{Avg Power (W)} + \text{Idle Leakage (W)}}
+++++
+
+Vulkan ML エンジンが 15W を消費すれば、ドローンは数分で墜落します。3W に最適化できれば 3 時間のミッションが可能です。電力最適化は「節約」だけではありません——**不可能なミッション** を可能にします。
+
+本章ではパイプラインのエネルギー消費を測定・最小化する方法を学びます。**DVFS**、**デューティサイクル管理**、**サーマル PID 制御** の数学を探ります。
+
+== 電力の物理学: 推論あたりのジュール
+
+電力エンジニアにとって ML「推論」は電流のバーストに過ぎません。総エネルギー消費は GPU が引く電力と、作業完了まで「起きている」時間の両方に依存します。
+
+[latexmath]
+++++
+\text{Energy (Joules)} = \text{Power (Watts)} \times \text{Inference Time (Seconds)}
+++++
+
+=== 「3 乗」電力則
+CMOS 回路（GPU など）の動的電力は論理ゲートのスイッチングで定義されます。
+
+[latexmath]
+++++
+P_{dynamic} = \alpha \cdot C \cdot V^2 \cdot f
+++++
+
+ここで:
+*   latexmath:[\alpha]: **Activity Factor**（各サイクルで反転するトランジスタの割合）。
+*   latexmath:[C]: **Capacitance**（チップ設計で固定）。
+*   latexmath:[V]: **Voltage**（供給電圧）。
+*   latexmath:[f]: **Frequency**（クロック速度）。
+
+**罠**: 周波数（latexmath:[f]）を上げると、トランジスタが十分速く切り替えられるよう **電圧（latexmath:[V]）** も上げる必要があります。電力は latexmath:[V^2] に依存し、latexmath:[V] はおおよそ latexmath:[f] に比例するため、総電力消費はクロック速度に **3 乗** で増加。周波数を 2 倍にすると、電力引き込みが latexmath:[8\times] 増える可能性があります。
+
+=== 動的 vs 静的電力
+*   **動的電力**: GPU が積極的に計算している間の電力。
+*   **静的（リーク）電力**: シリコンを通電しているだけの電力。サブスレッショルドリーク電流による。
+
+チップが小さくなる（28nm から 5nm など）と、静的リークは総電力予算のはるかに大きな割合になります。「単に遅くする」が常に最良戦略ではない理由です。GPU を 2 倍遅くすると動的電力は節約できるが、チップは 2 倍長く「起きている」ため、静的リークによる総エネルギー損失が 2 倍。
+
+=== 「Race to Sleep」戦略
+現代 SoC は極低電力「スリープ」状態（`C-states`）に入るよう設計——リークを最小化するため電源ドメイン全体をオフ。
+
+*   **戦略 A（ゆっくり着実）**: GPU を 200MHz で 100ms 実行。SoC は全期間アクティブ状態。
+*   **戦略 B（Race to Sleep）**: GPU を 800MHz で 20ms 実行。チップは latexmath:[5\times] 速く作業を終え、残り 80ms は「ディープスリープ」。
+
+**数学**: 800MHz バースト中のエネルギーが、80ms スリープで節約されるエネルギーより少なければ Race to Sleep が勝ちます。Vulkan ではすべてのコマンドバッファを一括投入し、`vkWaitForFences` を非ゼロタイムアウトで使い CPU スレッドを OS スケジューラに譲ります。
+
+== 戦略 1: GPU ガバナのチューニング（DVFS）
+
+組み込み Linux は link:https://docs.kernel.org/admin-guide/pm/cpufreq.html[**Dynamic Voltage and Frequency Scaling（DVFS）**] で性能とバランス。GPU 速度は現在負荷に基づく「ガバナ」カーネルスレッドが決定。
+
+=== ガバナのレイテンシ
+ML ではデフォルト `schedutil` ガバナは遅すぎることが多い。ML 作業の「バースト」を見て、スパイクでないことを数ミリ秒確認してから周波数を上げる。GPU がフル速度になる頃には推論は終わっており、低電圧で遅く実行されていた。
+
+=== 手動周波数ピン留め
+本番では、アクティブ推論中に周波数を「ピン留め」してこの「ランプアップレイテンシ」を回避することが多い。
+
+[source,bash]
+----
+# Find the GPU device tree node
+cd /sys/class/devfreq/*.gpu/
+
+# List supported frequencies (in Hz)
+cat available_frequencies
+
+# Pin to the 'Sweet Spot' (e.g., 600MHz)
+echo 600000000 > min_freq
+echo 600000000 > max_freq
+----
+
+**エキスパートのヒント**: すべての GPU に「効率スイートスポット」——ワットあたり性能が最大化される周波数——があります。異なるクロック速度で電流を測り GFLOPS/Watt 曲線をプロットして見つけられます。通常、最大クロックの約 60% 付近。
+
+== 戦略 2: デューティサイクル管理
+
+30 FPS カメラアプリケーションでは 33.3ms の予算。推論が 10ms なら GPU は 23.3ms アイドル。
+
+*   **間違い**: Vulkan フェンスでビジー待機（`while(!done);`）。CPU コアを 100% 保ち、メモリコントローラが低電力状態に入るのを妨げる。
+*   **プロの方法**: `vkWaitForFences` を使用。カーネル割り込みをトリガー。OS が CPU をディープスリープに入れ DRAM リフレッシュレートを下げ、最大 1W のシステム全体電力を節約。
+
+== 戦略 3: サーマルAware推論（PID ループ）
+
+組み込みデバイスは **サーマル制約** 下にあります。SoC が限界（例: 85°C）に達するとハードウェアは「ハードスロットル」——警告なしに性能を 50% 以上低下。フレームドロップと「ジッター」が発生。
+
+=== ニュートンの冷却法則
+熱損失率は温度差に比例。
+
+[latexmath]
+++++
+\frac{dT}{dt} = -k(T - T_{ambient}) + P_{in}
+++++
+
+latexmath:[P_{in}] は Vulkan シェーダが消費する電力。latexmath:[P_{in}] が散逸能力 latexmath:[k(T - T_{amb})] を超えると過熱。
+
+=== サーマル PID コントローラ
+これを防ぐため **閉ループソフトウェアコントローラ** を実装。link:https://en.wikipedia.org/wiki/PID_controller[PID（比例・積分・微分）コントローラ] が「推論レート」を調整し、温度を安全目標（例: 75°C）に保つ。
+
+.Thermal-Aware Inference PID Loop
+image::images/ML_Inference/Embedded_Applications/thermal_pid_loop.svg[Diagram showing the feedback loop between SoC temperature and inference duty cycle, 800]
+
+[source,cpp]
+----
+// Advanced Software PID for Thermal Management
+struct PIDController {
+    float Kp = 0.5f; // Proportional: Reacts to current error
+    float Ki = 0.1f; // Integral: Corrects long-term drift
+    float Kd = 0.05f; // Derivative: Dampens oscillations
+
+    float integral = 0;
+    float prevError = 0;
+
+    float update(float target, float current, float dt) {
+        float error = target - current;
+        integral += error * dt;
+
+        // Anti-Windup: Limit the integral to prevent runaway
+        integral = std::clamp(integral, -10.0f, 10.0f);
+
+        float derivative = (error - prevError) / dt;
+        float output = (error * Kp) + (integral * Ki) + (derivative * Kd);
+        prevError = error;
+        return output;
+    }
+};
+
+void thermalLoop() {
+    PIDController thermo;
+    float targetTemp = 75.0f; // Target stable operating temp
+
+    while(running) {
+        float currentTemp = readSoCThermalZone(0);
+        float adjustment = thermo.update(targetTemp, currentTemp, 1.0f);
+
+        // Output: Adjusted Sleep Interval (ms)
+        // If it's too hot, we increase the sleep time between frames
+        inferenceSleepMs = std::clamp(inferenceSleepMs - adjustment, 0.0f, 100.0f);
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+----
+
+=== チューニング: ツィーグラー・ニコルス法
+係数の選び方:
+1.  **Ki と Kd をゼロに。**
+2.  **Kp を上げ**、温度が定周期で振動し始めるまで（周期 T）。この Kp が「Ultimate Gain」（Ku）。
+3.  **公式を適用**:
+    *   latexmath:[K_p = 0.6 \cdot K_u]
+    *   latexmath:[K_i = 2 \cdot K_p / T]
+    *   latexmath:[K_d = K_p \cdot T / 8]
+
+== 戦略 4: メモリ帯域の削減（静かな殺し屋）
+
+多くの組み込み SoC では、RAM から GPU へ 1 バイト移動するのは、そのバイトで浮動小数点演算するより **多くのエネルギー** を消費。シェーダが「メモリバウンド」なら、メモリバスでジュールを浪費しています。
+
+=== サブグループ演算
+通常、ワークグループ内の各 Vulkan 呼び出し（スレッド）は独立に動作。4 スレッドが同じデータを必要とすると、すべてが別々にメモリから取得する可能性。
+
+link:https://docs.vulkan.org/guide/latest/subgroups.html[**Sub-groups**]（`VK_KHR_shader_subgroup_basic` などの拡張）を使えば、スレッドは GPU 実行ユニット内で「Shuffle」や「Swizzle」で直接データ共有——キャッシュとメモリバスを完全にバイパス。
+
+[source,glsl]
+----
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+void main() {
+    float val = myData[gl_GlobalInvocationID.x];
+
+    // Instead of every thread writing to RAM to sum values,
+    // we use a subgroup operation to sum in registers.
+    float groupSum = subgroupAdd(val);
+
+    if (subgroupElect()) {
+        // Only one thread writes the result to memory
+        outputData[gl_WorkGroupID.x] = groupSum;
+    }
+}
+----
+
+=== 帯域圧縮（AFBC）
+多くの ARM と Mali GPU は link:https://www.arm.com/technologies/graphics-technologies/arm-frame-buffer-compression[**Arm Frame Buffer Compression（AFBC）**] をサポート。ハードウェアが自動処理する可逆圧縮フォーマット。典型的なカメラフレームで帯域を最大 50% 削減。
+
+Vulkan で有効化するには `VK_EXT_image_compression_control` 拡張を使うか、イメージタイリングを `OPTIMAL` にしドライバがそのフォーマットで AFBC をサポートすることを確認。
+
+== 戦略 5: CPU アフィニティと割り込み
+
+「Big.LITTLE」ARM プロセッサ（Pi 5 や Snapdragon など）では、すべての CPU コアが同等ではありません。
+
+*   **Big コア**: 高性能、高電力。
+*   **LITTLE コア**: 低性能、極めて高効率。
+
+Vulkan ML エンジンの「マネージャ」スレッドは **LITTLE コア** にピン留めすべき。マネージャスレッドは GPU 待ちの時間が大半——Vulkan 割り込み処理のため電力を食う Big コアを起きさせる必要はない。
+
+[source,cpp]
+----
+// Pinning the ML Manager thread to Core 0 (usually a LITTLE core)
+cpu_set_t cpuset;
+CPU_ZERO(&cpuset);
+CPU_SET(0, &cpuset);
+pthread_setaffinity_np(mlThread.native_handle(), sizeof(cpu_set_t), &cpuset);
+----
+
+== ケーススタディ: 1 ワット推論チャレンジ
+
+小さなソーラーパネルで動く野生動物カメラを構築すると想像してください。AI の総電力予算は正確に **1 ワット**。
+
+|===
+| Component | Budget (Watts) | Strategy
+
+| Idle System | 0.4W | Minimal OS (Alpine/Buildroot)
+| Camera Sensor | 0.2W | Low frame rate (5 FPS)
+| **ML Inference** | **0.4W** | **The Goal**
+|===
+
+ML で 0.4W 目標を達成するには:
+1.  **極端な量子化**: GPU がサポートすれば 4 ビット重み（INT4）。
+2.  **フレームスキップ**: カメラが動きを検出しない（安価な PIR センサー使用）場合、GPU はディープスリープ。
+3.  **周波数アンダーボルティング**: 5 FPS 達成に必要な絶対最小まで GPU 周波数を押し下げ。
+
+== エネルギーAwareシェーダ: latexmath:[\alpha] の測定
+
+Activity factor（latexmath:[\alpha]）は各サイクルで GPU トランジスタの何パーセントが反転するかを表します。シェーダでは **乗算累算（MAC）** 演算とロードするデータ量の比で決まります。
+
+1.  **高 latexmath:[\alpha]**: 高密度行列乗算（FP32）。秒あたり最も多くの電力を消費するが、推論あたりは高効率。
+2.  **低 latexmath:[\alpha]**: 疎なメモリバウンドタスク（ReLU、Max Pooling）。電力は少ないがメモリバスをアクティブに保つ。
+
+電力最適化では、ワークロードを低ビット幅へ。 **FP32** から **INT8** へは各 ALU 演算で反転ビット数を **75%** 削減。量子化が組み込み ML で最も効果的な省電力技法である理由。
+
+== まとめ: 電力最適化チェックリスト
+
+1.  **レールを測定**: link:https://github.com/rbonghi/jetson_stats[`jtop`] や link:https://www.raspberrypi.com/documentation/computers/os.html#vcgencmd[`vcgencmd`] など内部センサーでリアルタイム latexmath:[P = V \cdot I] を計算。
+2.  **INT8 に量子化**: 精度低減でビット反転を減らし、演算あたりジュール節約。
+3.  **タイムラインセマフォを使用**: GPU が CPU を起こさず内部依存を自己管理。
+4.  **スレッドを譲る**: `vkGetFenceStatus` でループしない。OS にスレッドをスリープさせる。
+5.  **ソフトスロットル**: PID ループでシリコンのサーマルトリップポイント以下に留まる。
+
+ハードウェアの物理限界を習得すれば、コードを「バッテリキラー」から単一充電で数日動く外科的ツールに変えられます。
+
+次はすべてを **完全な組み込みアプリケーション** に統合します。
+
+xref:ML_Inference/Embedded_Applications/03_camera_integration.adoc[前へ: カメラ統合] | xref:ML_Inference/Embedded_Applications/05_complete_example.adoc[次へ: 完全な例]

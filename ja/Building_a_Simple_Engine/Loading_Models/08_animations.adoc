@@ -1,0 +1,1067 @@
+:pp: {plus}{plus}
+
+= モデルのロード: アニメーションの更新
+
+== アニメーションの理解と実装
+
+=== 3D アニメーションの概要
+
+アニメーションは最新の 3D アプリケーションの重要な側面であり、動きとインタラクティブ性を備えた静的モデルに命を吹き込みます。私たちのエンジンには、glTF ファイルからの骨格アニメーションをサポートする堅牢なアニメーション システムが実装されています。
+
+3D グラフィックスのアニメーションには通常、次のものが含まれます。
+
+* *キーフレーム*: オブジェクトの状態が明示的に定義される特定の時点
+* *補間*: キーフレーム間の中間状態を計算するプロセス
+* *チャンネル*: アニメーション化できるさまざまなプロパティ (位置、回転、スケール)
+* *ボーン/ジョイント*: モデルのパーツがどのように一緒に動くかを定義する階層構造
+
+glTF は、エンジンがロードして再生できるアニメーションを保存および転送するための標準化された方法を提供します。
+
+=== アニメーションデータ構造
+
+xref:Building_a_Simple_Engine/Loading_Models/03_model_system.adoc[モデルシステムの章] で見たように、私たちのエンジンはアニメーションを表現するためにいくつかの構造を使用します。
+
+[source,cpp]
+----
+// Structure for animation keyframes
+struct AnimationChannel {
+    enum PathType { TRANSLATION, ROTATION, SCALE };
+    PathType path;
+    Node* node = nullptr;
+    uint32_t samplerIndex;
+};
+
+// Structure for animation interpolation
+struct AnimationSampler {
+    enum InterpolationType { LINEAR, STEP, CUBICSPLINE };
+    InterpolationType interpolation;
+    std::vector<float> inputs;  // Key frame timestamps
+    std::vector<glm::vec4> outputsVec4;  // Key frame values (for rotations)
+    std::vector<glm::vec3> outputsVec3;  // Key frame values (for translations and scales)
+};
+
+// Structure for animation
+struct Animation {
+    std::string name;
+    std::vector<AnimationSampler> samplers;
+    std::vector<AnimationChannel> channels;
+    float start = std::numeric_limits<float>::max();
+    float end = std::numeric_limits<float>::min();
+    float currentTime = 0.0f;
+};
+----
+
+これらの構造は連携して、アニメーションの保存方法と処理方法を定義します。
+
+* *アニメーション*: 完全なアニメーション シーケンスを表す複数のチャンネルとサンプラーが含まれています
+* *AnimationChannel*: シーン グラフ内のノードを特定のアニメーション プロパティ (移動、回転、スケール) にリンクします。
+* *AnimationSampler*: 特定のチャンネルのキーフレーム間を補間する方法を定義します。
+
+=== アニメーションの再生の仕組み
+
+アニメーション更新プロセスはアニメーション システムの中心であり、時間ベースのアニメーション データをシーン グラフ ノードに適用される実際の変換に変換する役割を果たします。
+
+=== アニメーションの更新: 検証と時間管理
+
+何かを始める前に、有効なアニメーション データがあることを検証し、周期的アニメーションのループ動作を含むアニメーション時間の進行を管理する必要があります。
+
+[source,cpp]
+----
+void Model::updateAnimation(uint32_t index, float deltaTime) {
+    // Validate animation data and index bounds
+    if (animations.empty() || index >= animations.size()) {
+        return;
+    }
+
+    // Update animation timing with automatic looping
+    Animation& animation = animations[index];
+    animation.currentTime += deltaTime;
+    while (animation.currentTime >= animation.end) {
+        animation.currentTime -= (animation.end - animation.start);
+    }
+----
+
+すべてのモデルにアニメーションが含まれているわけではなく、外部コードが存在しないアニメーション インデックスを要求する可能性があるため、アニメーションの検証は堅牢なシステムにとって重要です。このチェックを早期に実行することで、静的モデルや無効なアニメーション リクエストを操作する際のクラッシュや未定義の動作を回避できます。この防御的なプログラミングのアプローチは、さまざまなソースからのコンテンツに一貫性のないアニメーション データが含まれる可能性があるプロダクション ゲーム エンジンでは不可欠です。
+
+時間管理はアニメーション再生の基礎を形成し、deltaTime パラメーターは最後の更新からの経過時間を表します。このフレームレートに依存しないアプローチにより、レンダリング パフォーマンスに関係なく、アニメーションが一貫した速度で再生されます。自動ループ メカニズムは、アニメーションが終了時間に達するとシームレスに再開し、アイドル アニメーション、歩行サイクル、その他の反復的な動きに不可欠な連続モーションを作成します。
+
+=== アニメーションの更新: チャネルの反復とサンプラーへのアクセス
+
+ここで、すべてのアニメーション チャネルを反復処理して、抽象アニメーション データと、変換の更新を受け取るシーン グラフ内の特定のノードとの間の接続を確立します。
+
+[source,cpp]
+----
+    // Process each animation channel to update corresponding scene nodes
+    for (auto& channel : animation.channels) {
+        assert(channel.samplerIndex < animation.samplers.size());
+        AnimationSampler& sampler = animation.samplers[channel.samplerIndex];
+----
+
+チャネルの反復は、アニメーションからシーングラフへのマッピング システムの中心を表します。各チャネルは、シーン階層内の特定のノードの特定の変換タイプ (位置、回転、またはスケール) を定義します。この 1 対多の関係により、複数のノードの複数のプロパティを同時にアニメーション化できる複雑なアニメーションが可能になり、数十の可動部分を持つ洗練されたキャラクター アニメーションが可能になります。
+
+サンプラーのアクセス パターンは、アニメーション アーキテクチャにおける関心の分離を示しています。サンプラーには実際のキーフレーム データと補間ロジックが含まれており、チャンネルは何をアニメーション化するかを定義します。この設計により、複数のチャネルが同じサンプラー データを共有できるため、同じアニメーション カーブが異なるノードに適用される場合、または異なる変換コンポーネントが同じパターンに従う場合にメモリ使用量が削減されます。
+
+=== アニメーションの更新: キーフレームの位置と補間係数の計算
+
+次に、現在のアニメーション時間を囲む適切なキーフレームを見つけて、個別のアニメーション サンプル間のスムーズな移行に必要な正確な補間係数を計算します。
+
+[source,cpp]
+----
+        // Find the current keyframe pair that brackets the animation time using binary search
+        auto nextKeyFrameIt = std::lower_bound(sampler.inputs.begin(), sampler.inputs.end(), animation.currentTime);
+        if (nextKeyFrameIt != sampler.inputs.end() && nextKeyFrameIt != sampler.inputs.begin()) {
+            size_t i = std::distance(sampler.inputs.begin(), nextKeyFrameIt) - 1;
+            // Calculate normalized interpolation factor between keyframes
+            float t = (animation.currentTime - sampler.inputs[i]) / (sampler.inputs[i + 1] - sampler.inputs[i]);
+----
+
+キーフレーム検索アルゴリズムは、std:: lower_bound を使用してバイナリ検索を実行し、現在のアニメーション時間を O(log n) の複雑さで囲むキーフレームのペアを見つけます。この効率的なアプローチは、多くのキーフレームを含むアニメーション データに最適であり、リニア スキャンと比較して最適なパフォーマンスを提供します。二分探索では、時間が現在のアニメーション時間以上である最初のキーフレームへの反復子が返されるため、前のキーフレームを確認することでブラケット ペアを決定できます。
+
+補間係数の計算により、現在の時間が 2 つのキーフレーム間のどこに位置するかを正確に表す 0.0 から 1.0 までの正規化された値が作成されます。 t=0.0 の場合、最初のキーフレームにいます。 t=1.0 の場合、2 番目のキーフレームにいます。その間の値によりスムーズなトランジションが作成されます。この数学的基礎により、線形位置変更や複雑な四元数回転など、その後のすべての補間技術が可能になります。
+
+=== アニメーションの更新: プロパティ固有の補間とノードの更新
+
+最後に、変換タイプに基づいて適切な数学的補間手法を適用し、計算されたアニメーション値で実際のシーン グラフ ノードを更新します。
+
+[source,cpp]
+----
+                // Apply transformation based on the specific animation channel type
+                switch (channel.path) {
+                    case AnimationChannel::TRANSLATION: {
+                        // Linear interpolation for position changes
+                        glm::vec3 start = sampler.outputsVec3[i];
+                        glm::vec3 end = sampler.outputsVec3[i + 1];
+                        channel.node->translation = glm::mix(start, end, t);
+                        break;
+                    }
+                    case AnimationChannel::ROTATION: {
+                        // Spherical linear interpolation for smooth rotation transitions
+                        glm::quat start = glm::quat(sampler.outputsVec4[i].w, sampler.outputsVec4[i].x, sampler.outputsVec4[i].y, sampler.outputsVec4[i].z);
+                        glm::quat end = glm::quat(sampler.outputsVec4[i + 1].w, sampler.outputsVec4[i + 1].x, sampler.outputsVec4[i + 1].y, sampler.outputsVec4[i + 1].z);
+                        channel.node->rotation = glm::slerp(start, end, t);
+                        break;
+                    }
+                    case AnimationChannel::SCALE: {
+                        // Linear interpolation for scaling transformations
+                        glm::vec3 start = sampler.outputsVec3[i];
+                        glm::vec3 end = sampler.outputsVec3[i + 1];
+                        channel.node->scale = glm::mix(start, end, t);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+----
+
+この方法:
+
+1. デルタ時間に基づいてアニメーションの現在時間を更新します。
+2. 最後に到達するとアニメーションをループします
+3. アニメーション内の各チャンネルについて:
+   ａ．現在の時間に基づいて現在のキーフレームを検索します
+   b.現在のキーフレームと次のキーフレームの間の補間係数を計算します。
+   c.チャネル タイプ (移動、回転、またはスケール) に基づいてキーフレーム値の間を補間します。
+   d.対応するノードの変換を更新します
+
+=== アニメーションの更新をメインループに統合する
+
+モデルをアニメーション化するには、フレームごとにアニメーションの状態を更新する必要があります。
+
+[source,cpp]
+----
+void mainLoop() {
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+
+        // Update animation time
+        static auto lastTime = std::chrono::high_resolution_clock::now();
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float deltaTime = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastTime).count();
+        lastTime = currentTime;
+
+        // Update model animations
+        animationTime += deltaTime;
+        if (!model.animations.empty()) {
+            model.updateAnimation(0, deltaTime);
+        }
+
+        drawFrame();
+    }
+
+    device.waitIdle();
+}
+----
+
+このコード:
+
+1. 最後のフレームからの経過時間を計算します (deltaTime)
+2. グローバル アニメーション タイム カウンターを更新します (カスタム アニメーションに役立ちます)
+3. アニメーションがある場合、モデル上で `updateAnimation` を呼び出します
+4. 更新されたアニメーション状態でフレームをレンダリングします。
+
+=== 高度なアニメーション技術
+
+基本的なアニメーション システムは最も一般的な使用例を処理しますが、実装したい高度なテクニックがいくつかあります。
+
+==== アニメーションブレンディング
+
+アニメーション ブレンディングは、複数のアニメーションを組み合わせて、スムーズなトランジションやまったく新しいアニメーションを作成する手法です。これは、キャラクターのリアルな動きや応答性の高いゲームプレイを作成するために不可欠です。
+
+===== アニメーション ブレンディングを理解する
+
+アニメーション ブレンディングの核心は、異なるアニメーション内の対応するボーンまたはノードの変換 (位置、回転、スケール) 間を補間することによって機能します。主要な概念には次のようなものがあります。
+
+* *ブレンド係数*: 各アニメーションが最終結果にどの程度寄与するかを決定する 0.0 ～ 1.0 の値
+* *ブレンド スペース*: パラメーター (速度、方向など) に基づいてアニメーションが配置される多次元スペース
+* *ブレンド ツリー*: 複数のブレンドを複雑なアニメーション システムに編成する階層構造
+
+===== アニメーション ブレンディングの種類
+
+アニメーション ブレンディングには一般的なタイプがいくつかあります。
+
+* *線形ブレンディング*: 2 つのアニメーション間の単純な補間 (例: 歩行から走行への移行)
+* *追加ブレンド*: 1 つのアニメーションを別のアニメーションの上に追加します (例: 動きのアニメーションに「負傷した」足を引きずる動作を追加します)
+* *部分ブレンド*: スケルトンの特定の部分のみに影響を与えるブレンド (例: 歩きながら武器を狙う)
+* *パラメトリック ブレンド*: 連続パラメーター (例: 方向 + 速度) に基づいて複数のアニメーションをブレンドします。
+
+===== 基本的なアニメーション ブレンディングの実装
+
+2 つのアニメーション間の単純な線形ブレンドを実装する方法は次のとおりです。
+
+[source,cpp]
+----
+void blendAnimations(uint32_t fromIndex, uint32_t toIndex, float blendFactor) {
+    // Store original node transformations
+    std::vector<glm::vec3> originalTranslations;
+    std::vector<glm::quat> originalRotations;
+    std::vector<glm::vec3> originalScales;
+
+    for (auto node : model.linearNodes) {
+        originalTranslations.push_back(node->translation);
+        originalRotations.push_back(node->rotation);
+        originalScales.push_back(node->scale);
+    }
+
+    // Apply first animation fully
+    model.updateAnimation(fromIndex, 0.0f);
+
+    // Store intermediate transformations
+    std::vector<glm::vec3> fromTranslations;
+    std::vector<glm::quat> fromRotations;
+    std::vector<glm::vec3> fromScales;
+
+    for (auto node : model.linearNodes) {
+        fromTranslations.push_back(node->translation);
+        fromRotations.push_back(node->rotation);
+        fromScales.push_back(node->scale);
+    }
+
+    // Restore original transformations
+    for (size_t i = 0; i < model.linearNodes.size(); i++) {
+        model.linearNodes[i]->translation = originalTranslations[i];
+        model.linearNodes[i]->rotation = originalRotations[i];
+        model.linearNodes[i]->scale = originalScales[i];
+    }
+
+    // Apply second animation fully
+    model.updateAnimation(toIndex, 0.0f);
+
+    // Blend between the two animations
+    for (size_t i = 0; i < model.linearNodes.size(); i++) {
+        model.linearNodes[i]->translation = glm::mix(fromTranslations[i], model.linearNodes[i]->translation, blendFactor);
+        model.linearNodes[i]->rotation = glm::slerp(fromRotations[i], model.linearNodes[i]->rotation, blendFactor);
+        model.linearNodes[i]->scale = glm::mix(fromScales[i], model.linearNodes[i]->scale, blendFactor);
+    }
+}
+----
+
+この実装:
+
+1. すべてのノードの元の状態をキャプチャします
+2. 最初のアニメーションを適用し、その変換を保存します
+3. 元の状態に戻します
+4. 2 番目のアニメーションを適用します
+5. 位置とスケールには線形補間、回転には球面補間を使用して 2 つのアニメーションをブレンドします。
+
+===== 高度なブレンド技術
+
+より複雑なシナリオの場合は、より洗練されたブレンディングを実装できます。
+
+[source,cpp]
+----
+// Multi-way blending with weights
+void blendMultipleAnimations(const std::vector<uint32_t>& animationIndices,
+                             const std::vector<float>& weights) {
+    if (animationIndices.empty() || weights.empty() ||
+        animationIndices.size() != weights.size()) {
+        return;
+    }
+
+    // Normalize weights using std::accumulate for cleaner code
+    float totalWeight = std::accumulate(weights.begin(), weights.end(), 0.0f);
+
+    std::vector<std::vector<glm::vec3>> allTranslations;
+    std::vector<std::vector<glm::quat>> allRotations;
+    std::vector<std::vector<glm::vec3>> allScales;
+
+    // Store original transformations
+    std::vector<glm::vec3> originalTranslations;
+    std::vector<glm::quat> originalRotations;
+    std::vector<glm::vec3> originalScales;
+
+    // Reserve space to avoid reallocations
+    originalTranslations.reserve(model.linearNodes.size());
+    originalRotations.reserve(model.linearNodes.size());
+    originalScales.reserve(model.linearNodes.size());
+
+    for (auto node : model.linearNodes) {
+        originalTranslations.push_back(node->translation);
+        originalRotations.push_back(node->rotation);
+        originalScales.push_back(node->scale);
+    }
+
+    // Collect transformations from all animations
+    for (uint32_t animIndex : animationIndices) {
+        // Reset to original state
+        for (size_t i = 0; i < model.linearNodes.size(); i++) {
+            model.linearNodes[i]->translation = originalTranslations[i];
+            model.linearNodes[i]->rotation = originalRotations[i];
+            model.linearNodes[i]->scale = originalScales[i];
+        }
+
+        // Apply this animation
+        model.updateAnimation(animIndex, 0.0f);
+
+        // Store transformations
+        std::vector<glm::vec3> translations;
+        std::vector<glm::quat> rotations;
+        std::vector<glm::vec3> scales;
+
+        for (auto node : model.linearNodes) {
+            translations.push_back(node->translation);
+            rotations.push_back(node->rotation);
+            scales.push_back(node->scale);
+        }
+
+        allTranslations.push_back(std::move(translations));
+        allRotations.push_back(std::move(rotations));
+        allScales.push_back(std::move(scales));
+    }
+
+    // Reset to original state
+    for (size_t i = 0; i < model.linearNodes.size(); i++) {
+        model.linearNodes[i]->translation = originalTranslations[i];
+        model.linearNodes[i]->rotation = originalRotations[i];
+        model.linearNodes[i]->scale = originalScales[i];
+    }
+
+    // Apply weighted blend
+    for (size_t nodeIdx = 0; nodeIdx < model.linearNodes.size(); nodeIdx++) {
+        glm::vec3 blendedTranslation(0.0f);
+        glm::quat blendedRotation(0.0f, 0.0f, 0.0f, 0.0f);
+        glm::vec3 blendedScale(0.0f);
+
+        // First pass for translations and scales
+        for (size_t animIdx = 0; animIdx < animationIndices.size(); animIdx++) {
+            float normalizedWeight = weights[animIdx] / totalWeight;
+            blendedTranslation += allTranslations[animIdx][nodeIdx] * normalizedWeight;
+            blendedScale += allScales[animIdx][nodeIdx] * normalizedWeight;
+        }
+
+        // Special handling for quaternions (rotations)
+        // We use nlerp (normalized lerp) for multiple quaternions
+        for (size_t animIdx = 0; animIdx < animationIndices.size(); animIdx++) {
+            float normalizedWeight = weights[animIdx] / totalWeight;
+            if (animIdx == 0) {
+                blendedRotation = allRotations[animIdx][nodeIdx] * normalizedWeight;
+            } else {
+                // Ensure we're interpolating along the shortest path
+                if (glm::dot(blendedRotation, allRotations[animIdx][nodeIdx]) < 0) {
+                    blendedRotation += -allRotations[animIdx][nodeIdx] * normalizedWeight;
+                } else {
+                    blendedRotation += allRotations[animIdx][nodeIdx] * normalizedWeight;
+                }
+            }
+        }
+
+        // Normalize the resulting quaternion
+        blendedRotation = glm::normalize(blendedRotation);
+
+        // Apply the blended transformations
+        model.linearNodes[nodeIdx]->translation = blendedTranslation;
+        model.linearNodes[nodeIdx]->rotation = blendedRotation;
+        model.linearNodes[nodeIdx]->scale = blendedScale;
+    }
+}
+----
+
+このより高度な実装により、異なるウェイトを持つ任意の数のアニメーション間のブレンドが可能になります。これは、移動や顔の表情などの複雑なアニメーション システムにとって不可欠です。
+
+===== ブレンドスペース
+
+キャラクターの動きには、ブレンド スペースが特に便利です。ブレンド スペースは、速度や方向などのパラメータに基づいてアニメーションが配置される 2D または 3D スペースです。
+
+[source,cpp]
+----
+// Simple 2D blend space for locomotion (direction + speed)
+struct BlendSpaceAnimation {
+    uint32_t animationIndex;
+    float directionAngle;  // In degrees, 0 = forward, 180 = backward
+    float speed;           // In units/second
+};
+
+void updateLocomotionBlendSpace(float currentDirection, float currentSpeed) {
+    // Define our blend space animations
+    std::vector<BlendSpaceAnimation> blendSpace = {
+        {0, 0.0f, 0.0f},     // Idle
+        {1, 0.0f, 1.0f},     // Walk Forward
+        {2, 0.0f, 3.0f},     // Run Forward
+        {3, 90.0f, 1.0f},    // Walk Right
+        {4, 90.0f, 3.0f},    // Run Right
+        {5, 180.0f, 1.0f},   // Walk Backward
+        {6, 180.0f, 3.0f},   // Run Backward
+        {7, 270.0f, 1.0f},   // Walk Left
+        {8, 270.0f, 3.0f}    // Run Left
+    };
+
+    // Find the closest animations and their weights
+    std::vector<uint32_t> animIndices;
+    std::vector<float> weights;
+
+    // Normalize direction to 0-360 range
+    currentDirection = fmod(currentDirection + 360.0f, 360.0f);
+
+    // Find the 3 closest animations in the blend space
+    // This is a simplified approach - a real implementation would use triangulation
+    for (const auto& anim : blendSpace) {
+        float distDir = std::min(std::abs(currentDirection - anim.directionAngle),
+                                360.0f - std::abs(currentDirection - anim.directionAngle));
+        float distSpeed = std::abs(currentSpeed - anim.speed);
+
+        // Calculate distance in blend space (weighted combination of direction and speed)
+        float distance = std::sqrt(distDir * distDir * 0.01f + distSpeed * distSpeed);
+
+        // Use inverse distance weighting
+        if (distance < 0.001f) {
+            // If we're very close to an exact animation, just use that one
+            animIndices = {anim.animationIndex};
+            weights = {1.0f};
+            break;
+        }
+
+        float weight = 1.0f / (distance + 0.1f);  // Add small epsilon to avoid division by zero
+        animIndices.push_back(anim.animationIndex);
+        weights.push_back(weight);
+
+        // Limit to 3 closest animations for performance
+        // Note: This works because we're inside the loop - we remove one element each time
+        // the size exceeds 3, maintaining a maximum of 3 elements as we iterate
+        if (animIndices.size() > 3) {
+            // Find the smallest weight
+            auto minIt = std::min_element(weights.begin(), weights.end());
+            size_t minIdx = std::distance(weights.begin(), minIt);
+
+            // Remove the animation with the smallest weight
+            animIndices.erase(animIndices.begin() + minIdx);
+            weights.erase(weights.begin() + minIdx);
+        }
+    }
+
+    // Blend the selected animations
+    blendMultipleAnimations(animIndices, weights);
+}
+----
+
+このブレンド スペースの実装により、キャラクターの現在の方向と速度に基づいて、さまざまな動きアニメーション間のスムーズな移行が可能になります。
+
+アニメーション ブレンディングは、事前に作成されたアニメーションを結合するための強力なツールを提供しますが、場合によってはアニメーションをリアルタイムで動的な環境に適応させる必要があります。たとえば、キャラクターの手でオブジェクトを正確に掴んだり、平らでない地形に足を正しく着地させたりするにはどうすればよいでしょうか?ここで次のテクニックが登場します。
+
+==== インバースキネマティクス (IK)
+
+インバース キネマティクスは、キャラクターのポーズを手続き的に調整できるようにすることで、アニメーション システムを補完します。以前に実装したアニメーションの再生ではフォワード キネマティクス (回転から位置を計算) を使用しますが、IK は逆に動作し、特定の終了位置を達成するために必要なジョイントの回転を決定します。
+
+===== 順運動学と逆運動学
+
+IK を理解するには、フォワード キネマティクスと対比すると役立ちます。
+
+* *順運動学 (FK)*: 与えられた関節角度から、エンドエフェクターの位置を計算します。
+  - 計算が簡単
+  - 予測可能で安定した
+  - ほとんどのアニメーションの再生で使用されます
+
+* *逆運動学 (IK)*: 所望のエンドエフェクター位置を指定して、関節角度を計算します。
+  - 計算がより複雑になる
+  - 複数の解決策があるか、解決策がない可能性があります
+  - アダプティブ アニメーションとインタラクションに不可欠
+
+===== 一般的な IK アプリケーション
+
+アニメーション ブレンディングを使用して事前定義されたアニメーション間のスムーズな移行を作成するのと同じように、IK を使用してそれらのアニメーションを動的な環境に適応させます。 IK は、いくつかの重要な方法でアニメーション システムを強化します。
+
+* *足の配置*: アニメーションがノードの変換をどのように更新するかを覚えていますか? IK を使用すると、これらの変換を調整して、足が平らでない地形に適切に接触するようにし、ゲームでよくある「足が浮いている」問題を防ぐことができます。
+* *手の配置*: 異なるアニメーション間を補間するブレンド スペースの例と同様に、IK を使用すると、キャラクターの手を正確に配置して、任意の位置にあるオブジェクトを掴むことができます。
+* *照準*: IK を使用して、キャラクターの上半身をターゲットの方向に向け、下半身は別のアニメーションに従います。
+* *プロシージャル アニメーション*: IK を使用すると、環境の制約に基づいて新しいアニメーションをその場で生成できます。
+* *ラグドールの物理*: アニメーションから物理駆動の動きに移行するとき (キャラクターが転倒するときなど)、IK はリアルな物理的反応の作成に役立ちます。
+
+===== IK アルゴリズム
+
+アニメーション キーフレームにさまざまな補間方法 (AnimationSampler の LINEAR、STEP、CUBICSPLINE) があるのと同じように、IK 問題を解決するためのさまざまなアルゴリズムがあります。
+
+* *分析方法*: 2 つのボーン チェーン (腕または脚) のような単純なケースでは、2 つのキーフレーム間を直接補間する方法と同様の、閉形式の数学的解決策を使用できます。
+* *巡回座標降下法 (CCD)*: エンド エフェクターから逆方向に作業しながら、一度に 1 つのジョイントを調整する反復的なアプローチ
+* *FABRIK (Forward And Backward Reaching Inverse Kinematics)*: チェーン全体を繰り返し調整することで機能し、多くの場合 CCD よりも高速に収束します。
+* *ヤコビアン逆関数*: 行列演算を使用して、複雑なチェーンの最適なジョイント調整を見つけます。
+
+===== Two-Bone IK の実装
+
+最も単純で最も一般的な IK シナリオには、2 つのボーン チェーン (腕や脚など) が含まれます。以下は、分析用の 2 ボーン IK ソリューションの実装です。
+
+[source,cpp]
+----
+// Two-bone IK solver
+bool solveTwoBoneIK(
+    Node* rootNode,      // The root joint (e.g., shoulder or hip)
+    Node* midNode,       // The middle joint (e.g., elbow or knee)
+    Node* endNode,       // The end effector (e.g., hand or foot)
+    const glm::vec3& targetPosition,  // Target world position
+    const glm::vec3& hingeAxis,       // Axis of rotation for the middle joint
+    float preferredAngle = 0.0f       // Preferred angle for resolving ambiguity
+) {
+    // Get the original global positions
+    glm::mat4 rootGlobal = rootNode->getGlobalMatrix();
+    glm::mat4 midGlobal = midNode->getGlobalMatrix();
+    glm::mat4 endGlobal = endNode->getGlobalMatrix();
+
+    glm::vec3 rootPos = glm::vec3(rootGlobal[3]);
+    glm::vec3 midPos = glm::vec3(midGlobal[3]);
+    glm::vec3 endPos = glm::vec3(endGlobal[3]);
+
+    // Calculate bone lengths
+    float bone1Length = glm::length(midPos - rootPos);
+    float bone2Length = glm::length(endPos - midPos);
+    float totalLength = bone1Length + bone2Length;
+
+    // Calculate the distance to the target
+    float targetDistance = glm::length(targetPosition - rootPos);
+
+    // Check if the target is reachable
+    if (targetDistance > totalLength) {
+        // Target is too far - stretch as far as possible
+        glm::vec3 direction = glm::normalize(targetPosition - rootPos);
+
+        // Set mid node position
+        glm::vec3 newMidPos = rootPos + direction * bone1Length;
+
+        // Convert to local space and update node
+        glm::mat4 rootInv = glm::inverse(rootGlobal);
+        glm::vec3 localMidPos = glm::vec3(rootInv * glm::vec4(newMidPos, 1.0f));
+        midNode->translation = localMidPos;
+
+        // Update mid global matrix after changes
+        midGlobal = midNode->getGlobalMatrix();
+
+        // Set end node position
+        glm::vec3 newEndPos = newMidPos + direction * bone2Length;
+
+        // Convert to local space and update node
+        glm::mat4 midInv = glm::inverse(midGlobal);
+        glm::vec3 localEndPos = glm::vec3(midInv * glm::vec4(newEndPos, 1.0f));
+        endNode->translation = localEndPos;
+
+        return false; // Target not fully reached
+    }
+
+    // Target is reachable - apply cosine law to find the angles
+    float a = bone1Length;
+    float b = targetDistance;
+    float c = bone2Length;
+
+    // Calculate the angle between the first bone and the target direction
+    float cosAngle1 = (b*b + a*a - c*c) / (2*b*a);
+    cosAngle1 = glm::clamp(cosAngle1, -1.0f, 1.0f); // Avoid numerical errors
+    float angle1 = acos(cosAngle1);
+
+    // Calculate the direction to the target
+    glm::vec3 targetDir = glm::normalize(targetPosition - rootPos);
+
+    // Create a rotation that aligns the x-axis with the target direction
+    glm::vec3 xAxis(1.0f, 0.0f, 0.0f);
+    glm::vec3 rotAxis = glm::cross(xAxis, targetDir);
+
+    if (glm::length(rotAxis) < 0.001f) {
+        // Target is along the x-axis, use the up vector
+        rotAxis = glm::vec3(0.0f, 1.0f, 0.0f);
+    } else {
+        rotAxis = glm::normalize(rotAxis);
+    }
+
+    float rotAngle = acos(glm::dot(xAxis, targetDir));
+    glm::quat targetRot = glm::angleAxis(rotAngle, rotAxis);
+
+    // Create a rotation around the target direction by the preferred angle
+    glm::quat prefRot = glm::angleAxis(preferredAngle, targetDir);
+
+    // Combine rotations
+    glm::quat finalRot = prefRot * targetRot * glm::angleAxis(angle1, hingeAxis);
+
+    // Apply the rotation to the root node
+    rootNode->rotation = finalRot;
+
+    // Update the mid node's global matrix after root changes
+    midGlobal = midNode->getGlobalMatrix();
+    midPos = glm::vec3(midGlobal[3]);
+
+    // Calculate the angle for the middle joint
+    float cosAngle2 = (a*a + c*c - b*b) / (2*a*c);
+    cosAngle2 = glm::clamp(cosAngle2, -1.0f, 1.0f); // Avoid numerical errors
+    float angle2 = acos(cosAngle2);
+
+    // The middle joint bends in the opposite direction (PI - angle2)
+    glm::quat midRot = glm::angleAxis(glm::pi<float>() - angle2, hingeAxis);
+    midNode->rotation = midRot;
+
+    return true; // Target reached
+}
+----
+
+この実装:
+
+1. ボーンの位置と長さを計算します
+2. ターゲットに到達可能かどうかを確認します
+3. 余弦の法則を使用して必要な角度を計算します
+4. 目標位置に到達するためにジョイントに回転を適用します
+
+===== CCD (巡回座標降下法) の実装
+
+3 つ以上のボーンを持つチェーンの場合、CCD は一般的な反復アプローチです。
+
+[source,cpp]
+----
+// CCD IK solver
+void solveCCDIK(
+    std::vector<Node*> chain,         // Joint chain from root to end effector
+    const glm::vec3& targetPosition,  // Target world position
+    int maxIterations = 10,           // Maximum iterations
+    float threshold = 0.01f           // Distance threshold for success
+) {
+    if (chain.size() < 2) return;
+
+    // Get the end effector
+    Node* endEffector = chain.back();
+
+    for (int iteration = 0; iteration < maxIterations; iteration++) {
+        // Get current end effector position
+        glm::vec3 endPos = glm::vec3(endEffector->getGlobalMatrix()[3]);
+
+        // Check if we're close enough to the target
+        if (glm::distance(endPos, targetPosition) < threshold) {
+            return; // Success
+        }
+
+        // Work backwards from the second-to-last joint to the root
+        for (int i = chain.size() - 2; i >= 0; i--) {
+            Node* currentJoint = chain[i];
+
+            // Get joint position in world space
+            glm::mat4 jointGlobal = currentJoint->getGlobalMatrix();
+            glm::vec3 jointPos = glm::vec3(jointGlobal[3]);
+
+            // Get updated end effector position
+            endPos = glm::vec3(endEffector->getGlobalMatrix()[3]);
+
+            // Calculate vectors from joint to end effector and target
+            glm::vec3 toEnd = glm::normalize(endPos - jointPos);
+            glm::vec3 toTarget = glm::normalize(targetPosition - jointPos);
+
+            // Calculate rotation to align the vectors
+            float cosAngle = glm::dot(toEnd, toTarget);
+            cosAngle = glm::clamp(cosAngle, -1.0f, 1.0f);
+
+            float angle = acos(cosAngle);
+
+            // If the angle is small enough, skip this joint
+            if (angle < 0.01f) continue;
+
+            // Calculate rotation axis
+            glm::vec3 rotAxis = glm::cross(toEnd, toTarget);
+
+            // Handle the case where vectors are parallel
+            if (glm::length(rotAxis) < 0.001f) {
+                // Find an arbitrary perpendicular axis
+                glm::vec3 tempAxis(0.0f, 1.0f, 0.0f);
+                if (abs(glm::dot(toEnd, tempAxis)) > 0.9f) {
+                    tempAxis = glm::vec3(1.0f, 0.0f, 0.0f);
+                }
+                rotAxis = glm::cross(toEnd, tempAxis);
+            }
+
+            rotAxis = glm::normalize(rotAxis);
+
+            // Create rotation quaternion
+            glm::quat rotation = glm::angleAxis(angle, rotAxis);
+
+            // Apply rotation to the joint
+            currentJoint->rotation = rotation * currentJoint->rotation;
+
+            // Check if we're close enough after this adjustment
+            endPos = glm::vec3(endEffector->getGlobalMatrix()[3]);
+            if (glm::distance(endPos, targetPosition) < threshold) {
+                return; // Success
+            }
+        }
+    }
+}
+----
+
+この CCD 実装:
+
+1. エンドエフェクターからルートに向かって各ジョイントを繰り返し処理します。
+2. 各ジョイントについて、エンドエフェクタをターゲットに近づけるために必要な回転を計算します。
+3. 回転を適用し、次のジョイントに進みます
+4. 目標に到達するか、最大反復回数が終了するまで繰り返します。
+
+===== FABRIK (前方および後方リーチ IK) の実装
+
+FABRIK も一般的な IK アルゴリズムであり、多くの場合 CCD よりも高速に収束します。
+
+[source,cpp]
+----
+// FABRIK IK solver
+void solveFABRIK(
+    std::vector<Node*> chain,         // Joint chain from root to end effector
+    const glm::vec3& targetPosition,  // Target world position
+    bool constrainRoot = true,        // Whether to keep the root fixed
+    int maxIterations = 10,           // Maximum iterations
+    float threshold = 0.01f           // Distance threshold for success
+) {
+    if (chain.size() < 2) return;
+
+    // Store original positions and bone lengths
+    std::vector<glm::vec3> positions;
+    std::vector<float> lengths;
+    glm::vec3 rootOriginalPos;
+
+    // Initialize positions and calculate lengths
+    for (size_t i = 0; i < chain.size(); i++) {
+        glm::vec3 pos = glm::vec3(chain[i]->getGlobalMatrix()[3]);
+        positions.push_back(pos);
+
+        if (i > 0) {
+            lengths.push_back(glm::distance(positions[i], positions[i-1]));
+        }
+    }
+
+    rootOriginalPos = positions[0];
+
+    // Check if the target is reachable
+    float totalLength = 0.0f;
+    for (float length : lengths) {
+        totalLength += length;
+    }
+
+    glm::vec3 rootToTarget = targetPosition - positions[0];
+    float targetDistance = glm::length(rootToTarget);
+
+    if (targetDistance > totalLength) {
+        // Target is unreachable - stretch the chain
+        glm::vec3 direction = glm::normalize(rootToTarget);
+
+        // Set all joints along the line to the target
+        positions[0] = constrainRoot ? rootOriginalPos : positions[0];
+
+        for (size_t i = 1; i < chain.size(); i++) {
+            positions[i] = positions[i-1] + direction * lengths[i-1];
+        }
+    } else {
+        // Target is reachable - apply FABRIK
+        for (int iteration = 0; iteration < maxIterations; iteration++) {
+            // Check if we're already close enough
+            if (glm::distance(positions.back(), targetPosition) < threshold) {
+                break;
+            }
+
+            // BACKWARD PASS: Set the end effector to the target and work backwards
+            positions.back() = targetPosition;
+
+            for (int i = chain.size() - 2; i >= 0; i--) {
+                // Get the direction from this joint to the next
+                glm::vec3 direction = glm::normalize(positions[i] - positions[i+1]);
+
+                // Set the position of this joint
+                positions[i] = positions[i+1] + direction * lengths[i];
+            }
+
+            // FORWARD PASS: Fix the root and work forwards
+            if (constrainRoot) {
+                positions[0] = rootOriginalPos;
+            }
+
+            for (size_t i = 0; i < chain.size() - 1; i++) {
+                // Get the direction from this joint to the next
+                glm::vec3 direction = glm::normalize(positions[i+1] - positions[i]);
+
+                // Set the position of the next joint
+                positions[i+1] = positions[i] + direction * lengths[i];
+            }
+
+            // Check if we're close enough after this iteration
+            if (glm::distance(positions.back(), targetPosition) < threshold) {
+                break;
+            }
+        }
+    }
+
+    // Apply the new positions to the joints by calculating rotations
+    for (size_t i = 0; i < chain.size() - 1; i++) {
+        Node* currentJoint = chain[i];
+
+        // Calculate the original direction in local space
+        glm::mat4 parentGlobal = i > 0 ? chain[i-1]->getGlobalMatrix() : glm::mat4(1.0f);
+        glm::mat4 localToGlobal = currentJoint->getGlobalMatrix() * glm::inverse(parentGlobal);
+        glm::vec3 originalDir = glm::normalize(glm::vec3(localToGlobal * glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)));
+
+        // Calculate the new direction
+        glm::vec3 newDir = glm::normalize(positions[i+1] - positions[i]);
+
+        // Calculate the rotation to align the directions
+        float cosAngle = glm::dot(originalDir, newDir);
+        cosAngle = glm::clamp(cosAngle, -1.0f, 1.0f);
+
+        float angle = acos(cosAngle);
+
+        // If the angle is small, skip this joint
+        if (angle < 0.01f) continue;
+
+        // Calculate rotation axis
+        glm::vec3 rotAxis = glm::cross(originalDir, newDir);
+
+        // Handle the case where vectors are parallel
+        if (glm::length(rotAxis) < 0.001f) {
+            // Find an arbitrary perpendicular axis
+            glm::vec3 tempAxis(0.0f, 1.0f, 0.0f);
+            if (abs(glm::dot(originalDir, tempAxis)) > 0.9f) {
+                tempAxis = glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+            rotAxis = glm::cross(originalDir, tempAxis);
+        }
+
+        rotAxis = glm::normalize(rotAxis);
+
+        // Create rotation quaternion
+        glm::quat rotation = glm::angleAxis(angle, rotAxis);
+
+        // Apply rotation to the joint
+        currentJoint->rotation = rotation * currentJoint->rotation;
+    }
+}
+----
+
+FABRIK アルゴリズム:
+
+1. ジョイント チェーンに沿って前方パスと後方パスを交互に繰り返すことで動作します。
+2. 後方パスでは、エンドエフェクターからルートに向かって動作するジョイントを配置します。
+3. 順方向パスでは、ジョイントをルートからエンドエフェクターに向かって再配置します。
+4. このプロセスは、制約を満たすソリューションにすぐに収束します。
+
+===== IK コンストレイント
+
+実際には、IK システムには現実的な結果を生成するための制約が必要です。
+
+[source,cpp]
+----
+// Apply joint constraints to a node
+void applyJointConstraints(Node* node,
+                          const glm::vec3& minAngles,
+                          const glm::vec3& maxAngles) {
+    // Convert quaternion to Euler angles
+    glm::vec3 eulerAngles = glm::degrees(glm::eulerAngles(node->rotation));
+
+    // Apply constraints
+    eulerAngles.x = glm::clamp(eulerAngles.x, minAngles.x, maxAngles.x);
+    eulerAngles.y = glm::clamp(eulerAngles.y, minAngles.y, maxAngles.y);
+    eulerAngles.z = glm::clamp(eulerAngles.z, minAngles.z, maxAngles.z);
+
+    // Convert back to quaternion
+    glm::quat constrainedRotation = glm::quat(glm::radians(eulerAngles));
+
+    // Apply the constrained rotation
+    node->rotation = constrainedRotation;
+}
+----
+
+===== IK とアニメーションの統合
+
+いくつかの IK アルゴリズムを実装したので、それらがアニメーション システムとどのように統合されるかを見てみましょう。アニメーション システムはキーフレームに基づいてノード変換を更新しますが、場合によっては実行時の条件に基づいてこれらの変換をオーバーライドしたり調整したりする必要があることに注意してください。 IK 調整を既存のアニメーション再生とブレンドする方法は次のとおりです。
+
+[source,cpp]
+----
+// Apply IK on top of an animation
+void applyIKToAnimation(Model* model, uint32_t animationIndex, float deltaTime,
+                       Node* endEffector, const glm::vec3& targetPosition,
+                       float ikWeight = 1.0f) {
+    // First, update the animation normally
+    model->updateAnimation(animationIndex, deltaTime);
+
+    // If IK weight is zero, we're done
+    if (ikWeight <= 0.0f) return;
+
+    // Build the joint chain from end effector to root
+    std::vector<Node*> chain;
+    Node* current = endEffector;
+
+    // Add up to 3 joints to the chain (e.g., hand, elbow, shoulder)
+    while (current && chain.size() < 3) {
+        chain.push_back(current);
+        current = current->parent;
+    }
+
+    // Reverse the chain to go from root to end effector
+    std::reverse(chain.begin(), chain.end());
+
+    // Store original rotations
+    std::vector<glm::quat> originalRotations;
+    for (Node* node : chain) {
+        originalRotations.push_back(node->rotation);
+    }
+
+    // Apply IK
+    solveTwoBoneIK(chain[0], chain[1], chain[2], targetPosition,
+                  glm::vec3(0.0f, 0.0f, 1.0f));
+
+    // Blend between original and IK rotations based on weight
+    if (ikWeight < 1.0f) {
+        for (size_t i = 0; i < chain.size(); i++) {
+            chain[i]->rotation = glm::slerp(originalRotations[i],
+                                          chain[i]->rotation,
+                                          ikWeight);
+        }
+    }
+}
+----
+
+===== 使用例と制限事項
+
+IK は強力ですが、次のような考慮事項があります。
+
+* *パフォーマンス*: 反復 IK アルゴリズムは計算コストが高くなる可能性があります
+* *安定性*: IK は、適切なダンピングと制約がないとジッターのある結果を生成する可能性があります。
+* *リアリズム*: 制約がなければ、IK は物理的に不可能なポーズを生成できます
+* *統合*: IK を既存のアニメーションとブレンドするには、慎重な調整が必要です
+
+これらの課題にもかかわらず、IK は次の場合に不可欠です。
+
+* *環境適応*: キャラクターをさまざまな地形やオブジェクトと対話させる
+* *プロシージャル アニメーション*: 動的な条件に応答するアニメーションの生成
+* *インタラクティブなゲームプレイ*: ゲームプレイの仕組みのためにキャラクターの手足を正確に制御できるようにします
+
+==== アニメーション ステート マシン
+
+これまで、個々のアニメーションを再生する方法、アニメーション間をブレンドする方法、IK を使用してアニメーションを調整する方法について説明してきました。しかし、実際のゲームでは、キャラクターには多くの場合、プレイヤーの入力やゲームの状態に基づいてトリガーする必要があるアニメーションが数十あります。これらすべてのアニメーションとそのトランジションをどのように整理して管理すればよいでしょうか?ここでアニメーション ステート マシンが登場します。
+
+複雑なキャラクターの場合、ステート マシンはアニメーション間の遷移を管理できます。
+
+[source,cpp]
+----
+enum class AnimationState {
+    IDLE,
+    WALKING,
+    RUNNING,
+    JUMPING
+};
+
+class CharacterAnimator {
+private:
+    Model* model;
+    AnimationState currentState = AnimationState::IDLE;
+    float blendTime = 0.3f;
+    float currentBlend = 0.0f;
+
+    struct StateAnimation {
+        uint32_t animationIndex;
+        float speed;
+        bool loop;
+    };
+
+    std::unordered_map<AnimationState, StateAnimation> stateMap;
+
+public:
+    CharacterAnimator(Model* model) : model(model) {
+        // Map states to animations
+        stateMap[AnimationState::IDLE] = {0, 1.0f, true};
+        stateMap[AnimationState::WALKING] = {1, 1.0f, true};
+        stateMap[AnimationState::RUNNING] = {2, 1.0f, true};
+        stateMap[AnimationState::JUMPING] = {3, 1.0f, false};
+    }
+
+    void setState(AnimationState newState) {
+        if (newState != currentState) {
+            // Start blending to new animation
+            currentBlend = 0.0f;
+            currentState = newState;
+        }
+    }
+
+    void update(float deltaTime) {
+        // Handle blending if needed
+        if (currentBlend < blendTime) {
+            currentBlend += deltaTime;
+            float t = currentBlend / blendTime;
+            // Implement blending logic here
+        } else {
+            // Just update current animation
+            StateAnimation& anim = stateMap[currentState];
+            model->updateAnimation(anim.animationIndex, deltaTime * anim.speed);
+        }
+    }
+};
+----
+
+==== 手続き型アニメーション
+
+アニメーションを手続き的に作成することもできます。
+
+[source,cpp]
+----
+void applyProceduralAnimation(float time) {
+    // Find the head node
+    Node* headNode = nullptr;
+    for (auto node : model.linearNodes) {
+        if (node->name == "Head") {
+            headNode = node;
+            break;
+        }
+    }
+
+    if (headNode) {
+        // Apply a simple bobbing motion
+        float bobAmount = sin(time * 2.0f) * 0.05f;
+        headNode->translation.y += bobAmount;
+
+        // Apply a simple looking around motion
+        float lookAmount = sin(time * 0.5f) * 0.2f;
+        glm::quat lookRotation = glm::angleAxis(lookAmount, glm::vec3(0.0f, 1.0f, 0.0f));
+        headNode->rotation = lookRotation * headNode->rotation;
+    }
+}
+----
+
+=== パフォーマンスに関する考慮事項
+
+アニメーションは、特に複雑なモデルの場合、計算コストが高くなる可能性があります。いくつかの最適化テクニックを次に示します。
+
+* *詳細レベル (LOD)*: 遠くのオブジェクトにはよりシンプルなアニメーションを使用します
+* *アニメーション カリング*: 視錐台の外側にあるオブジェクトのアニメーションを更新しません。
+* *キーフレーム削減*: 高い精度を必要としないアニメーションのキーフレームの数を削減します。
+* *並列処理*: 複数のスレッドを使用してアニメーションを並行して更新します。
+
+=== 結論
+
+当社のアニメーション システムは、3D モデルに命を吹き込むための強固な基盤を提供します。 glTF 形式とシーン グラフ構造を活用することで、アニメーションを効率的にロード、再生、ブレンドして、ダイナミックで魅力的なシーンを作成できます。
+
+次の章では、モデル読み込みシステムの探索を終了し、将来の機能拡張について説明します。
+
+xref:Building_a_Simple_Engine/Loading_Models/07_scene_rendering.adoc[前: シーンのレンダリング] | xref:Building_a_Simple_Engine/Loading_Models/09_conclusion.adoc[次へ: 結論]

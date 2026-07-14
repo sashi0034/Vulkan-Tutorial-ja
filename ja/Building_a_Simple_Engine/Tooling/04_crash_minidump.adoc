@@ -1,0 +1,533 @@
+:pp: {plus}{plus}
+
+= ツール: クラッシュ処理と GPU クラッシュ ダンプ
+
+== Vulkan アプリケーションでのクラッシュ処理
+
+徹底的なテストとデバッグを行ったとしても、実稼働環境では依然としてクラッシュが発生する可能性があります。そうした場合、堅牢なクラッシュ処理メカニズムがあれば、問題を迅速に診断して修正することができます。この章では、実用的な GPU クラッシュ診断 (NVIDIA Nsight Aftermath、AMD Radeon GPU Detective など) に焦点を当て、OS プロセスのミニダンプの役割と制限を明確にします。OS プロセスのミニダンプには通常、GPU の状態が含まれておらず、グラフィックスやデバイスの損失の問題を単独で根本原因にするのに十分であることはほとんどありません。
+
+=== Vulkan アプリケーションのクラッシュについて
+
+Vulkan アプリケーションはさまざまな理由でクラッシュする可能性があります。
+
+1. *API 使用エラー*: デバッグ ビルドで検証レイヤーが検出する Vulkan API の誤った使用
+2. *ドライバーのバグ*: 特定のハードウェアまたはワークロードでのみ発生する可能性のある GPU ドライバーの問題
+3. *リソース管理の問題*: メモリ リーク、二重解放、または破壊されたリソースへのアクセス
+4. *シェーダー エラー*: GPU のハングを引き起こすシェーダーのランタイム エラー
+5. *システムレベルの問題*: メモリ不足状態、システムの不安定性など。
+
+これらのクラッシュに対処し、診断情報を収集する方法を検討してみましょう。
+
+=== 基本的なクラッシュ処理の実装
+
+まず、未処理の例外とセグメンテーション フォールトをキャッチできる基本的なクラッシュ ハンドラーを実装しましょう。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+// Global state for crash handling
+namespace crash_handler {
+    std::string app_name;
+    std::string crash_log_path;
+    bool initialized = false;
+
+    // Log basic system information
+    void log_system_info(std::ofstream& log) {
+        log << "Application: " << app_name << std::endl;
+        log << "Timestamp: " << std::chrono::system_clock::now() << std::endl;
+
+        // Log OS information
+        #if defined(_WIN32)
+        log << "OS: Windows" << std::endl;
+        #elif defined(__linux__)
+        log << "OS: Linux" << std::endl;
+        #elif defined(__APPLE__)
+        log << "OS: macOS" << std::endl;
+        #else
+        log << "OS: Unknown" << std::endl;
+        #endif
+
+        // Log CPU information
+        log << "CPU Cores: " << std::thread::hardware_concurrency() << std::endl;
+
+        // Log memory information
+        #if defined(_WIN32)
+        MEMORYSTATUSEX mem_info;
+        mem_info.dwLength = sizeof(MEMORYSTATUSEX);
+        GlobalMemoryStatusEx(&mem_info);
+        log << "Total Physical Memory: " << mem_info.ullTotalPhys / (1024 * 1024) << " MB" << std::endl;
+        log << "Available Memory: " << mem_info.ullAvailPhys / (1024 * 1024) << " MB" << std::endl;
+        #elif defined(__linux__)
+        // Linux-specific memory info code
+        #elif defined(__APPLE__)
+        // macOS-specific memory info code
+        #endif
+    }
+
+    // Log Vulkan-specific information
+    void log_vulkan_info(std::ofstream& log, vk::raii::PhysicalDevice* physical_device = nullptr) {
+        if (physical_device) {
+            auto properties = physical_device->getProperties();
+            log << "GPU: " << properties.deviceName << std::endl;
+            log << "Driver Version: " << properties.driverVersion << std::endl;
+            log << "Vulkan API Version: "
+                << VK_VERSION_MAJOR(properties.apiVersion) << "."
+                << VK_VERSION_MINOR(properties.apiVersion) << "."
+                << VK_VERSION_PATCH(properties.apiVersion) << std::endl;
+        } else {
+            log << "No Vulkan physical device information available" << std::endl;
+        }
+    }
+
+    // Handler for unhandled exceptions
+    void handle_exception(const std::exception& e, vk::raii::PhysicalDevice* physical_device = nullptr) {
+        try {
+            std::ofstream log(crash_log_path, std::ios::app);
+            log << "==== Crash Report ====" << std::endl;
+            log_system_info(log);
+            log_vulkan_info(log, physical_device);
+
+            log << "Exception: " << e.what() << std::endl;
+            log << "==== End of Crash Report ====" << std::endl << std::endl;
+
+            log.close();
+        } catch (...) {
+            // Last resort if we can't even write to the log
+            std::cerr << "Failed to write crash log" << std::endl;
+        }
+    }
+
+    // Signal handler for segfaults, etc.
+    void signal_handler(int signal) {
+        try {
+            std::ofstream log(crash_log_path, std::ios::app);
+            log << "==== Crash Report ====" << std::endl;
+            log_system_info(log);
+
+            log << "Signal: " << signal << " (";
+            switch (signal) {
+                case SIGSEGV: log << "SIGSEGV - Segmentation fault"; break;
+                case SIGILL: log << "SIGILL - Illegal instruction"; break;
+                case SIGFPE: log << "SIGFPE - Floating point exception"; break;
+                case SIGABRT: log << "SIGABRT - Abort"; break;
+                default: log << "Unknown signal"; break;
+            }
+            log << ")" << std::endl;
+
+            log << "==== End of Crash Report ====" << std::endl << std::endl;
+
+            log.close();
+        } catch (...) {
+            // Last resort if we can't even write to the log
+            std::cerr << "Failed to write crash log" << std::endl;
+        }
+
+        // Re-raise the signal for the default handler
+        signal(signal, SIG_DFL);
+        raise(signal);
+    }
+
+    // Initialize the crash handler
+    void initialize(const std::string& application_name, const std::string& log_path) {
+        if (initialized) return;
+
+        app_name = application_name;
+        crash_log_path = log_path;
+
+        // Set up signal handlers
+        signal(SIGSEGV, signal_handler);
+        signal(SIGILL, signal_handler);
+        signal(SIGFPE, signal_handler);
+        signal(SIGABRT, signal_handler);
+
+        initialized = true;
+    }
+}
+
+// Example usage in main application
+int main() {
+    try {
+        // Initialize crash handler
+        crash_handler::initialize("MyVulkanApp", "crash_log.txt");
+
+        // Initialize Vulkan
+        vk::raii::Context context;
+        auto instance = create_instance(context);
+        auto physical_device = select_physical_device(instance);
+        auto device = create_device(physical_device);
+
+        // Main application loop
+        while (true) {
+            try {
+                // Render frame
+                render_frame(device);
+            } catch (const vk::SystemError& e) {
+                // Handle Vulkan errors that we can recover from
+                std::cerr << "Vulkan error: " << e.what() << std::endl;
+            }
+        }
+    } catch (const std::exception& e) {
+        // Handle unrecoverable exceptions
+        crash_handler::handle_exception(e);
+        return 1;
+    }
+
+    return 0;
+}
+----
+
+=== GPU クラッシュ診断 (Vulkan)
+
+OS プロセスのミニダンプは CPU 側の状態を捕捉しますが、GPU クラッシュ（device lost、TDR、ハング）を実用的に扱うには GPU 固有のクラッシュダンプが必要です。実務では、障害付近の GPU 実行状態を記録できるベンダーツーリングの統合が望まれます。
+
+==== NVIDIA: Nsight Aftermath (Vulkan)
+
+概要：
+
+- 最後に実行された描画/ディスパッチ、バインドされたパイプライン/シェーダー、マーカー、リソース識別子に関する情報を含む GPU クラッシュ ダンプを収集します。
+- Vulkan アプリと連携して動作します。 NVIDIA ツールを使用してダンプを分析し、失敗した作業とシェーダーを特定します。
+
+実際の手順:
+
+1. オブジェクト名とラベルを有効にする
+   - VK_EXT_debug_utils を使用して、パイプライン、シェーダー、イメージ、バッファーに名前を付け、メジャー パスおよび描画/ディスパッチ グループのコマンド バッファー ラベルを挿入します。これらの名前はクラッシュ レポートに表示され、トリアージに大いに役立ちます。
+2. フレーム/作品マーカーを追加する
+   - 重要なレンダリング フェーズの前後に意味のあるラベルを挿入します。ターゲットで利用可能な場合は、ベンダー チェックポイント/マーカー拡張機能 (VK_NV_device_diagnostic_checkpoints など) も使用して、きめの細かいブレッドクラムを提供します。
+3. 一意の ID とオプションのデバッグ情報を使用してシェーダーを構築する
+   - 各パイプライン/シェーダーが相関できることを確認します (パイプライン キャッシュとアプリケーション ログに安定したハッシュ/UUID を含めるなど)。分析のために ID からソースへのマッピングを保持します。
+4. GPU クラッシュ ダンプを初期化して有効にする
+   - NVIDIA のドキュメントに従って、Nsight Aftermath Vulkan SDK を統合します。コールバックを登録してクラッシュ ダンプ データを受信し、それをディスクに書き込み、シンボリケーション用のマーカー文字列テーブルを含めます。
+5. デバイスの紛失に対処する
+   - VK_ERROR_DEVICE_LOST (または Windows TDR) では、メモリ内のマーカー ログをフラッシュし、クラッシュ ダンプを永続化し、正常に終了します。レンダリングを続行する試みは未定義です。
+
+参考資料: NVIDIA Nsight Aftermath SDK およびドキュメント。
+
+==== AMD: Radeon GPU Detective (RGD)
+
+- AMD は、RDNA ハードウェア上の GPU クラッシュ情報を取得して分析するツールを提供します。同様の原則が適用されます。オブジェクト名を有効にし、コマンド バッファーにラベルを付け、パイプライン/シェーダー識別子を保持して、RGD がコンテンツを参照できるようにします。
+- Vulkan の統合と分析のワークフローについては、AMD Radeon GPU Detective と関連ドキュメントを参照してください。
+
+==== すべてのツールに役立つベンダーに依存しない基盤
+
+- VK_EXT_debug_utils を介してすべてに名前を付けます。
+- 意味のある境界(フレーム、パス、マテリアルバッチなど)にコマンドバッファラベルを挿入します。
+- ビルド/バージョン、ドライバー、Vulkan API/UUID、パイプライン キャッシュ UUID をログとクラッシュ アーティファクトに保存します。
+- 堅牢なデバイス紛失処理を実装します。送信を停止し、安全に解放/破棄し、アーティファクトを書き込み、終了します。
+
+=== ミニダンプの生成
+
+OS プロセスのミニダンプを使用して、クラッシュ時の CPU 側のコール スタック、スレッド、メモリ スナップショットをキャプチャします。グラフィックスの問題やデバイスの損失については、必要な GPU 実行状態が含まれていることはほとんどありません。ミニダンプは、代替としてではなく、GPU クラッシュ ダンプを補完するものとして扱ってください。
+
+以下は、プラットフォーム API を使用してミニダンプを生成するための簡単な概要です (CPU コンテキストと GPU クラッシュを関連付けるのに役立ちます)。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+namespace crash_handler {
+    std::string app_name;
+    std::string dump_path;
+    bool initialized = false;
+
+    #if defined(_WIN32)
+    // Windows implementation using Windows Error Reporting (WER)
+    LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS* exception_pointers) {
+        // Create a unique filename for the minidump
+        std::string filename = dump_path + "\\" + app_name + "_" +
+            std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".dmp";
+
+        // Create the minidump file
+        HANDLE file = CreateFileA(
+            filename.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+
+        if (file != INVALID_HANDLE_VALUE) {
+            // Initialize minidump info
+            MINIDUMP_EXCEPTION_INFORMATION exception_info;
+            exception_info.ThreadId = GetCurrentThreadId();
+            exception_info.ExceptionPointers = exception_pointers;
+            exception_info.ClientPointers = FALSE;
+
+            // Write the minidump
+            MiniDumpWriteDump(
+                GetCurrentProcess(),
+                GetCurrentProcessId(),
+                file,
+                MiniDumpWithFullMemory,  // Dump type
+                &exception_info,
+                nullptr,
+                nullptr
+            );
+
+            CloseHandle(file);
+
+            std::cerr << "Minidump written to: " << filename << std::endl;
+        } else {
+            std::cerr << "Failed to create minidump file" << std::endl;
+        }
+
+        // Continue with normal exception handling
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    void initialize(const std::string& application_name, const std::string& minidump_path) {
+        if (initialized) return;
+
+        app_name = application_name;
+        dump_path = minidump_path;
+
+        // Create the dump directory if it doesn't exist
+        CreateDirectoryA(dump_path.c_str(), nullptr);
+
+        // Set up the exception handler
+        SetUnhandledExceptionFilter(windows_exception_handler);
+
+        initialized = true;
+    }
+
+    #elif defined(__linux__)
+    // Linux implementation using Google Breakpad
+    // Note: This requires linking against the Google Breakpad library
+
+    #include "client/linux/handler/exception_handler.h"
+
+    // Callback for when a minidump is generated
+    static bool minidump_callback(const google_breakpad::MinidumpDescriptor& descriptor,
+                                 void* context, bool succeeded) {
+        std::cerr << "Minidump generated: " << descriptor.path() << std::endl;
+        return succeeded;
+    }
+
+    google_breakpad::ExceptionHandler* exception_handler = nullptr;
+
+    void initialize(const std::string& application_name, const std::string& minidump_path) {
+        if (initialized) return;
+
+        app_name = application_name;
+        dump_path = minidump_path;
+
+        // Create the dump directory if it doesn't exist
+        std::filesystem::create_directories(dump_path);
+
+        // Set up the exception handler
+        google_breakpad::MinidumpDescriptor descriptor(dump_path);
+        exception_handler = new google_breakpad::ExceptionHandler(
+            descriptor,
+            nullptr,
+            minidump_callback,
+            nullptr,
+            true,
+            -1
+        );
+
+        initialized = true;
+    }
+
+    #elif defined(__APPLE__)
+    // macOS implementation using Google Breakpad
+    // Similar to Linux implementation
+    #endif
+}
+----
+
+=== ミニダンプの分析
+
+ミニダンプは、クラッシュに関する CPU 側の状態 (どのスレッドで障害が発生したか、vkQueueSubmit/vkQueuePresent につながる呼び出しスタック、アロケーターの誤使用など) を理解し、ベンダー ツールからの GPU クラッシュ ダンプと関連付けるために最適です。さまざまなプラットフォームでの簡単なワークフローを次に示します。
+
+==== Windows
+
+Windows では、Visual Studio または WinDbg を使用してミニダンプを分析できます。
+
+1. *ビジュアルスタジオ*:
+   - Visual Studioを開く
+   - [ファイル] > [開く] > [ファイル] に移動し、.dmp ファイルを選択します。
+   - Visual Studio はミニダンプをロードし、クラッシュ時のコール スタックを表示します。
+
+2. *WinDbg*:
+   - WinDbgを開く
+   - ミニダンプファイルを開きます
+   - `.ecxr` などのコマンドを使用して例外コンテキスト レコードを調べます
+   - `k` を使用してコールスタックを表示します
+
+==== Linux と macOS
+
+Linux および macOS では、GDB や LLDB などのツールを使用して、Google Breakpad によって生成されたミニダンプを分析できます。
+
+1. *minidump_stackwalk の使用* (Google Breakpad の一部):
+   ```
+   minidump_stackwalk minidump_file.dmp /path/to/symbols > stacktrace.txt
+   ```
+
+2. *GDB の使用*:
+   ```
+   gdb /path/to/executable
+   (gdb) コアファイル /path/to/minidump
+   (gdb) bt
+   ```
+
+=== Vulkan 固有のクラッシュ情報
+
+Vulkan アプリケーションの場合、クラッシュ レポートに追加情報を含めると役立ちます。
+
+[source,cpp]
+----
+void log_vulkan_detailed_info(std::ofstream& log, vk::raii::PhysicalDevice& physical_device,
+                             vk::raii::Device& device) {
+    // Log physical device properties
+    auto properties = physical_device.getProperties();
+    log << "GPU: " << properties.deviceName << std::endl;
+    log << "Driver Version: " << properties.driverVersion << std::endl;
+    log << "Vulkan API Version: "
+        << VK_VERSION_MAJOR(properties.apiVersion) << "."
+        << VK_VERSION_MINOR(properties.apiVersion) << "."
+        << VK_VERSION_PATCH(properties.apiVersion) << std::endl;
+
+    // Log memory usage
+    auto memory_properties = physical_device.getMemoryProperties();
+    log << "Memory Heaps:" << std::endl;
+    for (uint32_t i = 0; i < memory_properties.memoryHeapCount; i++) {
+        log << "  Heap " << i << ": "
+            << (memory_properties.memoryHeaps[i].size / (1024 * 1024)) << " MB";
+        if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            log << " (Device Local)";
+        }
+        log << std::endl;
+    }
+
+    // Log enabled extensions
+    auto extensions = device.enumerateDeviceExtensionProperties();
+    log << "Enabled Extensions:" << std::endl;
+    for (const auto& ext : extensions) {
+        log << "  " << ext.extensionName << " (version " << ext.specVersion << ")" << std::endl;
+    }
+
+    // Log current pipeline cache state
+    // This can be useful for diagnosing shader-related crashes
+    try {
+        auto pipeline_cache_data = device.getPipelineCacheData();
+        log << "Pipeline Cache Size: " << pipeline_cache_data.size() << " bytes" << std::endl;
+    } catch (const vk::SystemError& e) {
+        log << "Failed to get pipeline cache data: " << e.what() << std::endl;
+    }
+}
+----
+
+=== テレメトリ システムとの統合
+
+運用アプリケーションの場合は、分析のためにクラッシュ レポートをテレメトリ システムに自動的にアップロードすることができます。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+#include <curl/curl.h>
+
+namespace crash_handler {
+    // ... existing code ...
+
+    std::string telemetry_url;
+    bool telemetry_enabled = false;
+
+    // Upload a minidump to the telemetry server
+    bool upload_minidump(const std::string& minidump_path) {
+        if (!telemetry_enabled || telemetry_url.empty()) {
+            return false;
+        }
+
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            std::cerr << "Failed to initialize curl" << std::endl;
+            return false;
+        }
+
+        // Set up the form data
+        curl_mime* form = curl_mime_init(curl);
+
+        // Add the minidump file
+        curl_mimepart* field = curl_mime_addpart(form);
+        curl_mime_name(field, "minidump");
+        curl_mime_filedata(field, minidump_path.c_str());
+
+        // Add application information
+        field = curl_mime_addpart(form);
+        curl_mime_name(field, "product");
+        curl_mime_data(field, app_name.c_str(), CURL_ZERO_TERMINATED);
+
+        // Add version information
+        field = curl_mime_addpart(form);
+        curl_mime_name(field, "version");
+        curl_mime_data(field, "1.0.0", CURL_ZERO_TERMINATED);  // Replace with your version
+
+        // Set up the request
+        curl_easy_setopt(curl, CURLOPT_URL, telemetry_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, form);
+
+        // Perform the request
+        CURLcode res = curl_easy_perform(curl);
+
+        // Clean up
+        curl_mime_free(form);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK) {
+            std::cerr << "Failed to upload minidump: " << curl_easy_strerror(res) << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+    // Enable telemetry
+    void enable_telemetry(const std::string& url) {
+        telemetry_url = url;
+        telemetry_enabled = true;
+
+        // Initialize curl
+        curl_global_init(CURL_GLOBAL_ALL);
+    }
+
+    // Disable telemetry
+    void disable_telemetry() {
+        telemetry_enabled = false;
+
+        // Clean up curl
+        curl_global_cleanup();
+    }
+}
+----
+
+=== クラッシュ処理のベスト プラクティス (Vulkan/GPU 中心)
+
+グラフィックスの問題に対してクラッシュ データを対処できるようにするには、次の具体的な手順を推奨します。
+
+1. 積極的に名前とラベルを付ける
+   - VK_EXT_debug_utils を使用してすべてのオブジェクトに名前を付け、パス/マテリアル境界および大規模な描画/ディスパッチ バッチの前にコマンド バッファ ラベルを挿入します。クラッシュ アーティファクトに含めるために、最近のラベルの小さなメモリ内リング バッファを保持します。
+2. デバイスの紛失に備える
+   - VK_ERROR_DEVICE_LOST の中央ハンドラーを実装します。作業の送信を停止し、ログ/マーカーをフラッシュし、ベンダーの GPU クラッシュ ダンプ データを要求して、終了します。堅牢な再初期化パスがない限り、同じプロセスでリカバリを試行しないでください。
+3. サポートされているハードウェアで GPU クラッシュ ダンプをキャプチャする
+   - 対象ユーザーに応じて、NVIDIA Nsight Aftermath や AMD RGD を統合します。開発/ベータ ビルドではクラッシュ ダンプが有効になった状態で出荷されます。ユーザーにトグルを提供します。
+4. ビルドをシンボルフレンドリーにする
+   - パイプライン/シェーダー ハッシュからソース/IR/SPIR-V およびビルド ID へのマッピングを保持します。診断ビルドで可能な場合は、シェーダー デバッグ情報を有効にします。
+5. 環境情報を記録する
+   - ログ ドライバーのバージョン、Vulkan のバージョン、GPU 名/PCI ID、パイプライン キャッシュ UUID、アプリのビルド/バージョン、および関連する機能の切り替え。これをミニダンプや GPU クラッシュ ダンプと並べて含めます。
+6. 決定論的に再現する
+   - バックグラウンドの変動性 (非同期ストリーミングなど) を無効にし、キャプチャされたコマンド/シーンのシーケンスを再生してクラッシュをローカルで再現する方法を提供します。
+7. プライバシーと配布上の懸念を尊重する
+   - どのようなクラッシュ データ (ミニダンプ、GPU クラッシュ ダンプ、ログ) が収集されるかを明確に文書化し、アップロードにはオプトインを要求します。ユーザーを特定できるデータを削除します。
+
+=== 結論
+
+高品質の Vulkan アプリケーションを維持するには、堅牢なクラッシュ処理が不可欠です。ベンダーの GPU クラッシュ ダンプ (Aftermath、RGD など) を CPU 側のミニダンプおよび徹底的なログと組み合わせて、運用環境の問題を迅速に診断して修正します。ミニダンプを補完的なコンテキストとして扱います。グラフィックス障害の実用的な詳細は、通常、GPU クラッシュ ダンプ ツールから得られます。
+
+次のセクションでは、Vulkan 拡張機能の堅牢性について説明します。これにより、未定義の動作が軽減され、そもそもクラッシュを防ぐことができます。
+
+xref:Building_a_Simple_Engine/Tooling/03_debugging_and_renderdoc.adoc[Previous: VK_KHR_debug_utils と RenderDoc を使用したデバッグ] | xref:Building_a_Simple_Engine/Tooling/05_extensions.adoc[次へ: 堅牢性を高めるための Vulkan 拡張機能]

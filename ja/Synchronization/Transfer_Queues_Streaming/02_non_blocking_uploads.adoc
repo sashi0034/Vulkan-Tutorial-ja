@@ -1,0 +1,98 @@
+:pp: {plus}{plus}
+= ノンブロッキングデータアップロード: 専用転送キューの活用
+
+== なぜ専用キューを使うのか？
+
+単純な Vulkan アプリケーションでは、グラフィックス、コンピュート、転送作業に同じキューを使うことがあります。実装は簡単ですが、効率的ではありません。大きな転送をサブミットするたびに、グラフィックスキューは作業を止めて転送エンジンの完了を待たなければなりません。これがフレームレートの「スタッター」を生みます。
+
+=== 転送キューの特定
+
+真に非同期な転送キューを得るには、`vk::QueueFlagBits::eTransfer` をサポートし、理想的には `vk::QueueFlagBits::eGraphics` や `vk::QueueFlagBits::eCompute` をサポート *しない* キューファミリーを探します。これにより、メイン処理ユニットとリソースを共有しない、メモリコピー用の専用 DMA エンジンがハードウェアにあることが保証されます。
+
+これらの専用転送ファミリーを特定する方法です。
+
+[,cpp]
+----
+uint32_t transferQueueFamilyIndex = std::numeric_limits<uint32_t>::max();
+auto queueFamilies = physicalDevice.getQueueFamilyProperties();
+
+for (uint32_t i = 0; i < queueFamilies.size(); ++i) {
+    // Look for a family that is dedicated to transfer
+    if ((queueFamilies[i].queueFlags & vk::QueueFlagBits::eTransfer) &&
+        !(queueFamilies[i].queueFlags & vk::QueueFlagBits::eGraphics) &&
+        !(queueFamilies[i].queueFlags & vk::QueueFlagBits::eCompute)) {
+        transferQueueFamilyIndex = i;
+        break;
+    }
+}
+
+// Fallback: use any family that supports transfer
+if (transferQueueFamilyIndex == std::numeric_limits<uint32_t>::max()) {
+    for (uint32_t i = 0; i < queueFamilies.size(); ++i) {
+        if (queueFamilies[i].queueFlags & vk::QueueFlagBits::eTransfer) {
+            transferQueueFamilyIndex = i;
+            break;
+        }
+    }
+}
+----
+
+**専用転送キュー** を使うことで、これらのアップロードをバックグラウンドで行えます。転送エンジンは、GPU のコンピュートやグラフィックスコアを使わずにメモリ間でデータを移せる特化ハードウェアです。これらのタスクをオフロードすることで、メインレンダリングパイプラインを全速で走らせ続けられます。
+
+== 転送の実装
+
+専用転送キューを使うときは、コマンドバッファの記録とサブミットの仕方に注意が必要です。通常、転送キューファミリーに紐づく専用の **転送コマンドプール** を使います。
+
+[,cpp]
+----
+// Record a transfer command buffer
+auto cmd = vk::raii::CommandBuffer(device, { .commandPool = *transferPool, .level = vk::CommandBufferLevel::ePrimary });
+cmd.begin({ .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+
+// Copy from staging buffer to GPU-optimal image
+auto region = vk::BufferImageCopy{
+    .bufferOffset = 0,
+    .imageSubresource = { .aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+    .imageExtent = extent
+};
+cmd.copyBufferToImage(*stagingBuffer, *gpuImage, vk::ImageLayout::eTransferDstOptimal, region);
+
+cmd.end();
+----
+
+== 並列実行のためのサブミット
+
+ノンブロッキングアップロードの鍵は、転送作業をメイングラフィックスループから *独立して* 転送キューへサブミットすることです。CPU に転送完了を待たせたくありません。代わりに、転送完了時にシグナルする **タイムラインセマフォ** を使います。
+
+[,cpp]
+----
+// On the background thread
+auto signalInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *transferTimeline,
+    .value = nextTransferValue++,
+    .stageMask = vk::PipelineStageFlagBits2::eAllTransfer
+};
+
+auto submit = vk::SubmitInfo2{
+    .commandBufferInfoCount = 1,
+    .pCommandBufferInfos = &cmdInfo,
+    .signalSemaphoreInfoCount = 1,
+    .pSignalSemaphoreInfos = &signalInfo
+};
+
+transferQueue.submit2(submit);
+----
+
+専用キューを使っているため、GPU はグラフィックスキューでフレーム N や N+1 を同時に描きながら、この転送を処理できます。コマンドプロセッサやシェーダユニットの競合はありません。
+
+== Simple Engine: ストリーミングスレッド
+
+`Simple Engine` には、テクスチャのバックグラウンド読み込みとアップロードを扱う専用の `LoadingThread` があります。このスレッドは、別の `vk::raii::CommandPool` と、ハードウェアで利用可能なら専用の `transferQueue` を使います。新しいテクスチャのアップロードが必要なとき、ローディングスレッドは自身の転送コマンドを記録し、メインレンダリングループから独立して `transferQueue` へサブミットします。
+
+このアーキテクチャにより、Bistro シーンの大きな新エリアを読み込んでいるときでもフレームレートが滑らかに保たれます。メインの `Renderer::Render` 関数は転送エンジンによってブロックされません。代わりに、レンダラは新しいテクスチャを使い始める前に `transferTimeline` の状態を確認するだけです。これは従来の「世界を止める」ロード画面よりはるかにスケーラブルで応答性が高く、`Simple Engine` が幅広いハードウェアで高性能を実現する鍵の一つです。
+
+次の節では、グラフィックスキューが新しくアップロードされたデータをサンプリングする前に転送完了を待つよう、同期をどう協調させるかを見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Transfer_Queues_Streaming/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Transfer_Queues_Streaming/03_staging_sync.adoc[ステージング同期]

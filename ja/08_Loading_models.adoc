@@ -1,0 +1,345 @@
+:pp: {plus}{plus}
+
+= モデルの読み込み
+
+== はじめに
+
+プログラムはテクスチャ付き 3D メッシュを描画する準備が整いましたが、`vertices` と
+`indices` 配列内の現在のジオメトリはまだあまり興味深くありません。
+この章では、実際のモデルファイルから頂点とインデックスを読み込むようプログラムを
+拡張し、グラフィックスカードに本当に仕事をさせます。
+
+多くのグラフィックス API チュートリアルでは、このような章で読者に独自の OBJ ローダを
+書かせます。
+問題は、少しでも興味深い 3D アプリケーションになると、すぐにスケルトンアニメーションの
+ようなこのファイル形式がサポートしない機能が必要になることです。
+この章では OBJ モデルからメッシュデータを _読み込みます_ が、ファイルからの読み込みの
+詳細よりも、メッシュデータをプログラム自体に統合することに焦点を当てます。
+
+== ライブラリ
+
+OBJ ファイルから頂点と面を読み込むために、https://github.com/syoyo/tinyobjloader[tinyobjloader]
+ライブラリを使います。
+高速で、stb_image のような単一ファイルライブラリなので統合が容易です。
+これは xref:02_Development_environment.adoc[開発環境] の章で言及されており、
+チュートリアルのこの部分の依存関係の一部であるべきです。
+
+== サンプルメッシュ
+
+この章ではまだライティングを有効にしないので、テクスチャにライティングがベイクされた
+サンプルモデルを使うと助かります。
+そのようなモデルを見つける簡単な方法は、https://sketchfab.com/[Sketchfab]
+で 3D スキャンを探すことです。
+そのサイトの多くのモデルは OBJ 形式で、寛容なライセンスで利用できます。
+
+本チュートリアルでは、https://sketchfab.com/nigelgoh[nigelgoh] による
+https://sketchfab.com/3d-models/viking-room-a49f1b8e4f5c4ecf9e1fe7d81915ad38[Viking room]
+モデル（https://web.archive.org/web/20200428202538/https://sketchfab.com/3d-models/viking-room-a49f1b8e4f5c4ecf9e1fe7d81915ad38[CC BY 4.0]）を使うことにしました。
+現在のジオメトリの差し替えとして使えるよう、モデルのサイズと向きを調整しました。
+
+* xref:attachment$assets/viking_room.obj[viking_room.obj]
+* xref:attachment$assets/viking_room.png[viking_room.png]
+
+独自のモデルを使っても構いませんが、マテリアルが 1 つだけで、寸法がおよそ
+1.5 x 1.5 x 1.5 単位であることを確認してください。
+それより大きい場合は、ビュー行列を変更する必要があります。
+モデルファイルは `shaders` と `textures` の隣に新しい `models` ディレクトリを置いて
+そこに入れ、テクスチャ画像は `textures` ディレクトリに入れてください。
+
+モデルとテクスチャのパスを定義する 2 つの新しい設定変数をプログラムに追加します。
+
+[,c++]
+----
+constexpr uint32_t WIDTH                = 800;
+constexpr uint32_t HEIGHT               = 600;
+const std::string  MODEL_PATH           = "models/viking_room.obj";
+const std::string  TEXTURE_PATH         = "textures/viking_room.png";
+----
+
+そして、このパス変数を使うよう `createTextureImage` を更新します。
+
+[,c++]
+----
+stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+----
+
+== 頂点とインデックスの読み込み
+
+これからモデルファイルから頂点とインデックスを読み込むので、グローバルな
+`vertices` と `indices` 配列は削除してください。
+それらをクラスメンバの非 const コンテナに置き換えます。
+
+[,c++]
+----
+std::vector<Vertex>    vertices;
+std::vector<uint32_t>  indices;
+vk::raii::Buffer       vertexBuffer       = nullptr;
+vk::raii::DeviceMemory vertexBufferMemory = nullptr;
+vk::raii::Buffer       indexBuffer        = nullptr;
+vk::raii::DeviceMemory indexBufferMemory  = nullptr;
+----
+
+頂点が 65535 を大きく超えることになるため、インデックスの型を `uint16_t` から
+`uint32_t` に変更すべきです。
+やや複雑な構成 `vk::IndexTypeValue<decltype(indices)::value_type>::value` が
+インデックスの型を自動的に取得します。
+
+[,c++]
+----
+commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexTypeValue<decltype(indices)::value_type>::value);
+----
+
+tinyobjloader ライブラリは STB ライブラリと同じ方法でインクルードします。
+`tiny_obj_loader.h` ファイルをインクルードし、関数本体を含めてリンカエラーを避けるため、
+1 つのソースファイルで `TINYOBJLOADER_IMPLEMENTATION` を定義してください。
+
+[,c++]
+----
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
+----
+
+これから、このライブラリを使ってメッシュの頂点データで `vertices` と `indices`
+コンテナを埋める `loadModel` 関数を書きます。
+頂点バッファとインデックスバッファが作成される前のどこかで呼び出すべきです。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    loadModel();
+    createVertexBuffer();
+    createIndexBuffer();
+    ...
+}
+
+...
+
+void loadModel()
+{
+}
+----
+
+モデルは `tinyobj::LoadObj` 関数を呼び出してライブラリのデータ構造に読み込まれます。
+
+[,c++]
+----
+void loadModel()
+{
+		tinyobj::attrib_t                attrib;
+		std::vector<tinyobj::shape_t>    shapes;
+		std::vector<tinyobj::material_t> materials;
+		std::string                      warn, err;
+
+		if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, MODEL_PATH.c_str()))
+		{
+			throw std::runtime_error(warn + err);
+		}
+}
+----
+
+OBJ ファイルは位置、法線、テクスチャ座標、面で構成されます。
+面は任意の数の頂点で構成され、各頂点はインデックスで位置、法線、および/または
+テクスチャ座標を参照します。
+これにより、頂点全体だけでなく、個々の属性も再利用できます。
+
+`attrib` コンテナは、`attrib.vertices`、`attrib.normals`、`attrib.texcoords`
+ベクトルにすべての位置、法線、テクスチャ座標を保持します。
+`shapes` コンテナには、すべての別個のオブジェクトとその面が含まれます。
+各面は頂点の配列で構成され、各頂点には位置、法線、テクスチャ座標属性のインデックスが
+含まれます。
+OBJ モデルは面ごとにマテリアルとテクスチャも定義できますが、それらは無視します。
+
+`err` 文字列にはエラーが、`warn` 文字列にはマテリアル定義の欠落など、ファイル読み込み中に
+発生した警告が含まれます。
+読み込みが本当に失敗するのは、`LoadObj` 関数が `false` を返した場合だけです。
+上述のとおり、OBJ ファイルの面は実際には任意の数の頂点を含み得ますが、私たちの
+アプリケーションは三角形しか描画できません。
+幸い、`LoadObj` にはそのような面を自動的に三角形化するオプションパラメータがあり、
+デフォルトで有効です。
+
+ファイル内のすべての面を単一のモデルに結合するので、すべてのシェイプを反復するだけです。
+
+[,c++]
+----
+for (const auto& shape : shapes)
+{
+}
+----
+
+三角形化機能により、すでに面あたり 3 頂点になっているので、頂点を直接反復して
+`vertices` ベクトルにそのまま投入できます。
+
+[,c++]
+----
+for (const auto& shape : shapes)
+{
+    for (const auto& index : shape.mesh.indices)
+    {
+        Vertex vertex{};
+
+        vertices.push_back(vertex);
+        indices.push_back(indices.size());
+    }
+}
+----
+
+簡潔さのため、当面はすべての頂点がユニークであると仮定し、単純な自動インクリメントの
+インデックスを使います。
+`index` 変数は `tinyobj::index_t` 型で、`vertex_index`、`normal_index`、
+`texcoord_index` メンバを含みます。
+これらのインデックスを使って、`attrib` 配列内の実際の頂点属性をルックアップする
+必要があります。
+
+[,c++]
+----
+vertex.pos = {
+    attrib.vertices[3 * index.vertex_index + 0],
+    attrib.vertices[3 * index.vertex_index + 1],
+    attrib.vertices[3 * index.vertex_index + 2]
+};
+
+vertex.texCoord = {
+    attrib.texcoords[2 * index.texcoord_index + 0],
+    attrib.texcoords[2 * index.texcoord_index + 1]
+};
+
+vertex.color = {1.0f, 1.0f, 1.0f};
+----
+
+残念ながら、`attrib.vertices` 配列は `glm::vec3` のようなものではなく `float` 値の配列なので、
+インデックスに `3` を掛ける必要があります。
+同様に、エントリあたり 2 つのテクスチャ座標コンポーネントがあります。
+オフセット `0`、`1`、`2` は、X、Y、Z コンポーネント、またはテクスチャ座標の場合は
+U と V コンポーネントにアクセスするために使われます。
+
+今プログラムを実行すると、次のようなものが見えるはずです。
+
+image::/images/inverted_texture_coordinates.png[]
+
+素晴らしい、ジオメトリは正しく見えますが、テクスチャはどうなっているのでしょうか？
+OBJ 形式は垂直座標 `0` が画像の下を意味する座標系を仮定していますが、私たちは画像を
+`0` が画像の上を意味する上から下への向きで Vulkan にアップロードしています。
+テクスチャ座標の垂直コンポーネントを反転して解決します。
+
+[,c++]
+----
+vertex.texCoord = {
+    attrib.texcoords[2 * index.texcoord_index + 0],
+    1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+};
+----
+
+再度プログラムを実行すると、正しい結果が見えるはずです。
+
+image::/images/drawing_model.png[]
+
+これまでのハードワークが、ようやくこのようなデモで報われ始めます！
+
+____
+モデルが回転するにつれ、背面（壁の裏側）が少しおかしく見えることに気づくかもしれません。
+これは正常で、単にそのモデルがその側から見るようには本当に設計されていないからです。
+____
+
+== 頂点の重複排除
+
+残念ながら、まだインデックスバッファを十分に活用していません。
+多くの頂点が複数の三角形に含まれるため、`vertices` ベクトルには重複した頂点データが
+大量に含まれています。
+ユニークな頂点だけを保持し、出てくるたびにインデックスバッファで再利用すべきです。
+これを実装する素直な方法は、`map` または `unordered_map` を使ってユニークな頂点と
+それぞれのインデックスを追跡することです。
+
+[,c++]
+----
+#include <unordered_map>
+
+...
+
+std::unordered_map<Vertex, uint32_t> uniqueVertices{};
+
+for (const auto& shape : shapes)
+{
+    for (const auto& index : shape.mesh.indices)
+    {
+        Vertex vertex{};
+
+        ...
+
+				auto [it, inserted] = uniqueVertices.insert({vertex, static_cast<uint32_t>(vertices.size())});
+				if (inserted)
+				{
+            vertices.push_back(vertex);
+				}
+
+				indices.push_back(it->second);
+    }
+}
+----
+
+OBJ ファイルから頂点を読むたびに、`{ vertex, index }` ペアを挿入します。ここで
+インデックスは `vertices` 配列の現在のサイズです。
+頂点が実際に `inserted` された場合にのみ、インデックス値も設定されます。そうでなければ、
+マップ内のその `vertex` のインデックスは変更されません。
+そして頂点が `inserted` された場合、それを `vertices` に格納します。
+いずれの場合も、`vertices` ベクトル内のその頂点のインデックスが `indices` ベクトルに
+追加されます。
+
+今すぐにはプログラムはコンパイルに失敗します。なぜなら、ハッシュテーブルのキーとして
+`Vertex` 構造体のようなユーザー定義型を使うには、等価テストとハッシュ計算の 2 つの関数を
+実装する必要があるからです。
+前者は `Vertex` 構造体で `==` 演算子をオーバーライドすれば簡単に実装できます。
+
+[,c++]
+----
+bool operator==(const Vertex& other) const
+{
+    return pos == other.pos && color == other.color && texCoord == other.texCoord;
+}
+----
+
+`Vertex` のハッシュ関数は、`std::hash<T>` のテンプレート特殊化を指定して実装します。
+ハッシュ関数は複雑なトピックですが、https://en.cppreference.com/w/cpp/utility/hash[cppreference.com は]
+構造体のフィールドを組み合わせて妥当な品質のハッシュ関数を作る次のアプローチを推奨しています。
+
+[,c++]
+----
+namespace std
+{
+    template<> struct hash<Vertex>
+    {
+        size_t operator()(Vertex const& vertex) const
+        {
+            return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
+        }
+    };
+}
+----
+
+このコードは `Vertex` 構造体の外に置くべきです。
+GLM 型のハッシュ関数は、次のヘッダを使ってインクルードする必要があります。
+
+[,c++]
+----
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/hash.hpp>
+----
+
+ハッシュ関数は `gtx` フォルダで定義されており、技術的にはまだ GLM の実験的拡張であることを
+意味します。
+したがって、使うには `GLM_ENABLE_EXPERIMENTAL` を定義する必要があります。
+将来の GLM の新バージョンで API が変わる可能性があることを意味しますが、実際には API は
+非常に安定しています。
+
+これでプログラムを正常にコンパイルして実行できるはずです。
+`vertices` のサイズを確認すると、11,484 から 3,566 に減っていることが分かるでしょう！
+つまり、各頂点は平均しておよそ 3 つの三角形で再利用されています。
+これは GPU メモリを確実に大幅に節約します。
+
+xref:09_Generating_Mipmaps.adoc[次の章] では、テクスチャレンダリングを改善する技法を学びます。
+
+link:/attachments/28_model_loading.cpp[C{pp} コード] /
+link:/attachments/27_shader_depth.slang[slang シェーダ] /
+link:/attachments/27_shader_depth.vert[GLSL 頂点シェーダ] /
+link:/attachments/27_shader_depth.frag[GLSL フラグメントシェーダ]

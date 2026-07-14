@@ -1,0 +1,538 @@
+:pp: {plus}{plus}
+
+= イメージ
+
+== はじめに
+
+これまでのジオメトリは頂点ごとの色で彩色されてきましたが、これはかなり限られたアプローチです。
+チュートリアルのこのパートでは、ジオメトリをより面白く見せるためにテクスチャマッピングを実装します。
+これにより、今後の章で基本的な 3D モデルの読み込みと描画も可能になります。
+
+アプリケーションにテクスチャを追加するには、次のステップが必要です。
+
+* デバイスメモリで裏打ちされたイメージオブジェクトを作成する
+* 画像ファイルからのピクセルで埋める
+* イメージサンプラーを作成する
+* テクスチャから色をサンプリングする結合イメージサンプラーディスクリプタを追加する
+
+イメージオブジェクトは以前にも扱いましたが、それらはスワップチェーン拡張によって自動的に作成されたものでした。
+今度は自分で作成する必要があります。
+イメージの作成とデータの充填は頂点バッファの作成に似ていますが、GPU がイメージを扱う方法のため複雑さが増します。
+まずステージングリソースを作成してピクセルデータで埋め、それを描画に使う最終的なイメージオブジェクトへコピーします。
+この目的でステージングイメージを作成することも可能ですが、Vulkan ではバッファからイメージへピクセルを直接コピーすることもできます。そちらの方が冗長性が少なく、制限も少なく、通常は https://developer.nvidia.com/vulkan-memory-management[高速] です。
+そのために、まずホストからアクセス可能なバッファを作成してピクセル値で埋め、その後ピクセルのコピー先となるイメージを作成します。
+イメージの作成はバッファの作成と大きくは変わりません。
+これまで見てきたように、メモリ要件の問い合わせ、デバイスメモリの割り当て、バインドが必要です。
+
+ただし、イメージを扱うときに追加で気を付けることがあります。
+イメージは、メモリ上でピクセルがどう並ぶかに影響する異なる _レイアウト_ を持てます。
+グラフィックスハードウェアの動作上、単にピクセルを行ごとに格納しても最良の性能にならないことがあるためです。
+イメージに対して何らかの操作を行うときは、その操作に最適なレイアウトになっていることを確認する必要があります。
+レンダーパスを指定したときに、これらのレイアウトの一部はすでに見ています。
+
+* `vk::ImageLayout::ePresentSrcKHR`: プレゼンテーションに最適
+* `vk::ImageLayout::eColorAttachmentOptimal`: フラグメントシェーダから色を書き込むアタッチメントとして最適
+* `vk::ImageLayout::eTransferSrcOptimal`: `vk::raii::CommandBuffer::copyImageToBuffer` のような転送操作のソースとして最適
+* `vk::ImageLayout::eTransferDstOptimal`: `vk::raii::CommandBuffer::copyBufferToImage` のような転送操作のデスティネーションとして最適
+* `vk::ImageLayout::eShaderReadOnlyOptimal`: シェーダからのサンプリングに最適
+
+イメージのレイアウトを遷移する最も一般的な方法の 1 つが _パイプラインバリア_ です。
+パイプラインバリアは主に、イメージが読まれる前に書き込みが完了していることを保証するなど、リソースへのアクセスを同期するために使われますが、レイアウト遷移にも使えます。
+この章では、この目的でパイプラインバリアがどう使われるかを見ていきます。
+バリアは加えて、`vk::SharingMode::eExclusive` を使うときにキューファミリーの所有権を転送するためにも使えます。
+
+== 画像の読み込み
+
+画像ライブラリを次のようにインクルードします。
+
+[,c++]
+----
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+----
+
+このヘッダはデフォルトでは関数のプロトタイプだけを定義します。
+リンクエラーを避けるため、1 つのコードファイルで `STB_IMAGE_IMPLEMENTATION` 定義付きでヘッダをインクルードし、関数本体を含める必要があります。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createCommandPool();
+    createTextureImage();
+    createVertexBuffer();
+    ...
+}
+
+...
+
+void createTextureImage()
+{
+}
+----
+
+画像を読み込んで Vulkan イメージオブジェクトへアップロードする新しい関数 `createTextureImage` を作成します。
+コマンドバッファを使うので、`createCommandPool` の後に呼び出すべきです。
+
+テクスチャ画像を格納するため、`shaders` ディレクトリの隣に新しいディレクトリ `textures` を作成します。
+そのディレクトリから `texture.jpg` という画像を読み込みます。
+次の https://pixabay.com/en/statue-sculpture-fig-historically-1275469/[CC0 ライセンス画像] を 512 x 512 ピクセルにリサイズしたものを使いますが、好きな画像を選んで構いません。
+ライブラリは JPEG、PNG、BMP、GIF など、よくある画像ファイル形式のほとんどをサポートします。
+
+image::/images/texture.jpg[]
+
+このライブラリでの画像読み込みは非常に簡単です。
+
+[,c++]
+----
+void createTextureImage()
+{
+    int            texWidth, texHeight, texChannels;
+    stbi_uc       *pixels    = stbi_load("textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+    vk::DeviceSize imageSize = texWidth * texHeight * 4;
+
+    if (!pixels)
+    {
+        throw std::runtime_error("failed to load texture image!");
+    }
+}
+----
+
+`stbi_load` 関数は、ファイルパスと読み込むチャンネル数を引数に取ります。
+`STBI_rgb_alpha` 値は、アルファチャンネルがなくても画像をアルファ付きで読み込むよう強制し、将来の他のテクスチャとの一貫性に役立ちます。
+真ん中の 3 つのパラメータは、幅、高さ、画像内の実際のチャンネル数の出力です。
+返されるポインタは、ピクセル値配列の最初の要素です。
+ピクセルは行ごとに並び、`STBI_rgb_alpha` の場合はピクセルあたり 4 バイトで、合計 `texWidth * texHeight * 4` 値になります。
+
+== ステージングバッファ
+
+次に、シェーダ読み取り時の最適なアクセスのため、画像を GPU へアップロードする必要があります。そのために、マップしてピクセルをコピーできるホスト可視メモリ上のバッファを作成します。このバッファが、そのデータを GPU へコピーするソースになります。
+
+NOTE: イメージは常に GPU メモリに置くべきです。ホストのみ可視のメモリに置いたままにすると、GPU が毎フレーム PCI インタフェース経由でデータを読む必要があり、GPU メモリより帯域がかなり狭いため、大きな性能影響が出ます。ステージングは、画像データを GPU のメモリへ入れる処理です。デバイスがホスト可視かつデバイスローカルなメモリタイプを提供する場合は、必ずしも必要ではありません。そのような構成ではステージングを省略できます。
+
+バッファはマップできるようホスト可視メモリ（`eHostVisible`）にあるべきです。また、書き込んだデータがすぐに利用可能になる（何らかの形でキャッシュされない）よう、ホストコヒーレント（`eHostCoherent`）であるべきです。さらに、後でイメージへコピーできるよう、転送ソース（`eTransferSrc`）として使えるべきです。
+自動型付けされた戻り値は、それぞれ vk::raii::Buffer と vk::raii::DeviceMemory です。
+
+[,c++]
+----
+auto [stagingBuffer, stagingBufferMemory] =
+    createBuffer(imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+createBuffer(imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, stagingBuffer, stagingBufferMemory);
+----
+
+その後、画像読み込みライブラリから得たピクセル値をバッファへ直接コピーできます。
+
+[,c++]
+----
+void* data = stagingBufferMemory.mapMemory(0, imageSize);
+memcpy(data, pixels, imageSize);
+stagingBufferMemory.unmapMemory();
+----
+
+元のピクセル配列をクリーンアップすることを忘れないでください。
+
+[,c++]
+----
+stbi_image_free(pixels);
+----
+
+== テクスチャイメージ
+
+バッファ内のピクセル値にシェーダからアクセスするよう設定することもできますが、この目的では Vulkan のイメージオブジェクトを使う方がよいです。
+イメージオブジェクトなら、例えば 2D 座標を使えるため、色の取得がより簡単かつ高速になります。
+イメージオブジェクト内のピクセルはテクセルと呼ばれ、これ以降その名前を使います。
+次の新しいクラスメンバを追加します。
+
+[,c++]
+----
+vk::raii::Image        textureImage       = nullptr;
+vk::raii::DeviceMemory textureImageMemory = nullptr;
+----
+
+イメージのパラメータは `vk::ImageCreateInfo` 構造体で指定します。
+
+[,c++]
+----
+vk::ImageCreateInfo imageInfo{.imageType   = vk::ImageType::e2D,
+                              .format      = format,
+                              .extent      = {width, height, 1},
+                              .mipLevels   = 1,
+                              .arrayLayers = 1,
+                              .samples     = vk::SampleCountFlagBits::e1,
+                              .tiling      = tiling,
+                              .usage       = usage,
+                              .sharingMode = vk::SharingMode::eExclusive};
+----
+
+`imageType` フィールドで指定するイメージタイプは、イメージ内のテクセルがどの種類の座標系でアドレスされるかを Vulkan に伝えます。
+1D、2D、3D のイメージを作成できます。
+1 次元イメージはデータ配列やグラデーションの格納に、2 次元イメージは主にテクスチャに、3 次元イメージは例えばボクセルボリュームの格納に使えます。
+`extent` フィールドはイメージの寸法、つまり各軸上にテクセルがいくつあるかを指定します。
+そのため `depth` は `0` ではなく `1` でなければなりません。
+テクスチャは配列ではなく、今のところミップマッピングも使いません。
+
+Vulkan は多くの可能なイメージフォーマットをサポートしますが、バッファ内のピクセルと同じフォーマットをテクセルに使うべきです。そうしないとコピー操作が失敗します。
+
+`tiling` は、テクセルがメモリ上でどう並ぶかを指定します。Vulkan はこのために根本的に異なる 2 つのモードをサポートします。
+
+* `vk::ImageTiling::eOptimal`: テクセルは実装依存の並びに配置される。より効率的なメモリアクセスになる
+* `vk::ImageTiling::eLinear`: テクセルは行優先順でメモリに配置され、各行にパディングがある場合もある
+
+NOTE: 線形タイリングのイメージは非常に制限されています。例えば 2D イメージにしか使えず、深度／ステンシルには使えず、複数のミップレベルやレイヤも持てません。GPU アクセスも最適タイリングのイメージよりかなり遅いです。そのため用途はほとんどありません。
+
+したがって、シェーダからの効率的なアクセスのために `vk::ImageTiling::eOptimal` を使います。
+
+イメージの `initialLayout` には可能な値が 2 つだけあります。
+
+* `vk::ImageLayout::eUndefined`: GPU では使えず、最初の遷移でテクセルは破棄される
+* `vk::ImageLayout::ePreinitialized`: GPU では使えないが、最初の遷移でテクセルは保持される
+
+最初の遷移中にテクセルを保持する必要がある状況はほとんどありません。
+ただし一例として、線形タイリングのイメージをステージングイメージとして使いたい場合があります。
+その場合、テクセルデータをアップロードしたあと、データを失わずに転送ソースへ遷移させたいでしょう。
+
+ただし今回は、まずイメージを転送デスティネーションへ遷移させ、バッファオブジェクトからテクセルデータをコピーするので、このプロパティは不要で、`vk::ImageLayout::eUndefined` を安全に使えます。
+
+`usage` フィールドの意味はバッファ作成時と同じです。
+イメージはバッファコピーのデスティネーションとして使われるので、転送デスティネーションとして設定すべきです。
+メッシュを彩色するためにシェーダからイメージにアクセスできるようにもしたいので、usage には `vk::ImageUsageFlagBits::eSampled` も含めるべきです。
+
+イメージは 1 つのキューファミリーだけが使います。グラフィックス（したがって転送も）操作をサポートするものです。
+
+`samples` フラグはマルチサンプリングに関係します。
+これはアタッチメントとして使うイメージにのみ関係するので、サンプル数は 1 のままにします。
+
+[,c++]
+----
+image = vk::raii::Image(device, imageInfo);
+----
+
+イメージは `vk::raii::Image` コンストラクタで作成され、特に注目すべきパラメータはありません。
+`vk::Format::eR8G8B8A8Srgb` フォーマットがグラフィックスハードウェアでサポートされていない可能性もあります。
+受け入れ可能な代替の一覧を持ち、サポートされる最良のものを選ぶべきです。
+ただし、この特定のフォーマットのサポートは非常に広く、このステップは省略します。
+異なるフォーマットを使うと面倒な変換も必要になります。
+このようなシステムは深度バッファの章で実装するときに戻ります。
+
+[,c++]
+----
+vk::MemoryRequirements memRequirements = image.getMemoryRequirements();
+vk::MemoryAllocateInfo allocInfo{.allocationSize  = memRequirements.size,
+                                 .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties)};
+imageMemory = vk::raii::DeviceMemory(device, allocInfo);
+image.bindMemory(imageMemory, 0);
+----
+
+イメージへのメモリ割り当ては、バッファへのメモリ割り当てとまったく同じ方法で動作します。
+デフォルトの `vk::raii::DeviceMemory` コンストラクタを使い、`image` に対して `bindMemory` を使います。
+
+この関数はすでにかなり大きくなり、後の章でさらにイメージを作成する必要があるので、バッファのときと同様にイメージ作成を `createImage` 関数へ抽象化すべきです。
+関数を作成し、イメージオブジェクトの作成とメモリ割り当てをそこに移します。
+
+[,c++]
+----
+std::pair<vk::raii::Image, vk::raii::DeviceMemory> createImage(
+  uint32_t width, uint32_t height, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties )
+{
+  vk::ImageCreateInfo imageInfo{.imageType   = vk::ImageType::e2D,
+                                .format      = format,
+                                .extent      = {width, height, 1},
+                                .mipLevels   = 1,
+                                .arrayLayers = 1,
+                                .samples     = vk::SampleCountFlagBits::e1,
+                                .tiling      = tiling,
+                                .usage       = usage,
+                                .sharingMode = vk::SharingMode::eExclusive};
+
+  vk::raii::Image image = vk::raii::Image(device, imageInfo);
+
+  vk::MemoryRequirements memRequirements = image.getMemoryRequirements();
+  vk::MemoryAllocateInfo allocInfo{.allocationSize  = memRequirements.size,
+                                   .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties)};
+  vk::raii::DeviceMemory imageMemory = vk::raii::DeviceMemory(device, allocInfo);
+  image.bindMemory(imageMemory, 0);
+
+  return {std::move(image), std::move(imageMemory)};
+}
+----
+
+幅、高さ、フォーマット、タイリングモード、usage、メモリプロパティをパラメータにしました。これらはチュートリアル全体で作成するイメージごとに変わるからです。
+
+`createTextureImage` 関数は次のように簡略化できます。
+
+[,c++]
+----
+void createTextureImage()
+{
+  int            texWidth, texHeight, texChannels;
+  stbi_uc       *pixels    = stbi_load("textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+  vk::DeviceSize imageSize = texWidth * texHeight * 4;
+
+  if (!pixels)
+  {
+    throw std::runtime_error("failed to load texture image!");
+  }
+
+  auto [stagingBuffer, stagingBufferMemory] =
+      createBuffer(imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+  void *data = stagingBufferMemory.mapMemory(0, imageSize);
+  memcpy(data, pixels, imageSize);
+  stagingBufferMemory.unmapMemory();
+
+  stbi_image_free(pixels);
+
+  std::tie(textureImage, textureImageMemory) = createImage(texWidth,
+                                                           texHeight,
+                                                           vk::Format::eR8G8B8A8Srgb,
+                                                           vk::ImageTiling::eOptimal,
+                                                           vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+                                                           vk::MemoryPropertyFlagBits::eDeviceLocal);
+}
+----
+
+== レイアウト遷移
+
+前述のとおり、Vulkan のイメージは、ピクセルデータがメモリ上でどう並ぶかに影響する異なるレイアウトで存在できます。これらのレイアウトは特定の操作向けに最適化されています。シェーダからの読み取りに適したもの、レンダーターゲットになるもの、転送操作のソースやデスティネーションになるものなどがあります。
+
+レイアウト遷移は、これらのメモリ構成を明示的に制御できる Vulkan 設計の重要な側面です。ドライバがこれらの遷移を自動的に処理する他のグラフィックス API とは異なり、Vulkan では明示的に管理する必要があります。このアプローチにより、必要なときに正確に遷移をスケジュールし、操作を効率的にバッチできるため、より良い性能最適化が可能です。
+
+テクスチャイメージでは、いくつかの遷移を行う必要があります。
+1. 初期の未定義レイアウトから、データを受け取るのに最適なレイアウト（転送デスティネーション）へ
+2. 転送デスティネーションから、フラグメントシェーダがサンプリングできるようシェーダ読み取りに最適なレイアウトへ
+
+これらの遷移はパイプラインバリアで行われ、イメージレイアウトを変更するだけでなく、イメージにアクセスする操作間の適切な同期も保証します。適切な同期がないと、コピー操作が完了する前にシェーダがテクスチャを読もうとする競合状態が起きる可能性があります。
+
+これから書く関数は、再びコマンドバッファの記録と実行を伴うので、そのロジックをヘルパー関数に移すのに良いタイミングです。
+
+[,c++]
+----
+vk::raii::CommandBuffer beginSingleTimeCommands()
+{
+  vk::CommandBufferAllocateInfo allocInfo{.commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1};
+  vk::raii::CommandBuffer       commandBuffer = std::move(vk::raii::CommandBuffers(device, allocInfo).front());
+
+  vk::CommandBufferBeginInfo beginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit};
+  commandBuffer.begin(beginInfo);
+
+  return std::move(commandBuffer);
+}
+
+void endSingleTimeCommands(vk::raii::CommandBuffer &&commandBuffer)
+{
+  commandBuffer.end();
+
+  vk::SubmitInfo submitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandBuffer};
+  queue.submit(submitInfo, nullptr);
+  queue.waitIdle();
+}
+----
+
+これらの関数のコードは、`copyBuffer` 内の既存コードに基づいています。
+その関数は次のように簡略化できます。
+
+[,c++]
+----
+void copyBuffer(vk::raii::Buffer &srcBuffer, vk::raii::Buffer &dstBuffer, vk::DeviceSize size)
+{
+  vk::raii::CommandBuffer commandCopyBuffer = beginSingleTimeCommands();
+  commandCopyBuffer.copyBuffer(*srcBuffer, *dstBuffer, vk::BufferCopy{.size = size});
+  endSingleTimeCommands(std::move(commandCopyBuffer));
+}
+----
+
+まだバッファを使っているなら、仕上げに `copyBufferToImage` を記録・実行する関数を書けますが、このコマンドはイメージがまず正しいレイアウトになっている必要があります。
+レイアウト遷移を扱う新しい関数を作成します。
+
+[,c++]
+----
+void transitionImageLayout(vk::raii::CommandBuffer &commandBuffer, const vk::raii::Image &image, vk::ImageLayout oldLayout, vk::ImageLayout newLayout)
+{
+}
+----
+
+レイアウト遷移を行う最も一般的な方法の 1 つが _イメージメモリバリア_ の使用です。
+そのようなパイプラインバリアは一般に、バッファへの書き込みが読む前に完了することを保証するなど、リソースへのアクセスを同期するために使われますが、イメージのレイアウト遷移や、`vk::SharingMode::eExclusive` 使用時のキューファミリー所有権の転送にも使えます。
+バッファに対して同じことをする同等の _バッファメモリバリア_ もあります。
+
+[,c++]
+----
+vk::ImageMemoryBarrier barrier{.oldLayout           = oldLayout,
+                               .newLayout           = newLayout,
+                               .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+                               .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+                               .image               = image,
+                               .subresourceRange    = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}};
+----
+
+`oldLayout` と `newLayout` はレイアウト遷移を指定します。
+イメージの既存内容を気にしない場合は、`oldLayout` に `vk::ImageLayout::eUndefined` を使えます。
+
+バリアをキューファミリー所有権の転送に使う場合は、`srcQueueFamilyIndex` と `dstQueueFamilyIndex` フィールドをキューファミリーのインデックスにするべきです。
+これを行わない場合は `vk::QueueFamilyIgnored` に設定する必要があります（デフォルト値ではありません！）。
+
+`image` と `subresourceRange` は、影響を受けるイメージとその特定の部分を指定します。
+イメージは配列ではなくミップマッピングレベルもないので、レベルとレイヤは 1 つだけ指定します。
+
+バリアは主に同期目的で使われるので、リソースに関わるどの種類の操作がバリアの前に起きる必要があるか、またどの操作がバリアを待つ必要があるかを指定する必要があります。
+正しい値は古いレイアウトと新しいレイアウトに依存するので、どの遷移を使うかが分かったら戻ります。
+
+[,c++]
+----
+commandBuffer.pipelineBarrier(sourceStage, destinationStage, {}, {}, {}, barrier);
+----
+
+すべての種類のパイプラインバリアは同じ関数でサブミットされます。
+最初のパラメータは、バリアの前に起きるべき操作がどのパイプラインステージで起きるかを指定します。
+2 つ目のパラメータは、バリアを待つ操作があるパイプラインステージを指定します。
+バリアの前後で指定してよいパイプラインステージは、バリアの前後でリソースをどう使うかに依存します。
+許可される値は仕様の https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-access-types-supported[この表] に列挙されています。
+例えば、バリアの後にユニフォームから読む場合は、`vk::AccessFlagBits::eUniformRead` の usage と、ユニフォームを読む最も早いシェーダをパイプラインステージとして指定します。例えば `vk::PipelineStageFlagBits::eFragmentShader` です。
+この種類の usage に非シェーダのパイプラインステージを指定するのは意味がなく、usage の種類と一致しないパイプラインステージを指定するとバリデーションレイヤが警告します。
+
+3 つ目のパラメータは `{}` または `vk::DependencyFlagBits::eByRegion` です。
+後者はバリアをリージョンごとの条件にします。
+つまり、例えばリソースのこれまでに書き込まれた部分からの読み取りを、実装がすでに開始してよいことを意味します。
+
+最後の 3 つのパラメータは、利用可能な 3 種類のパイプラインバリア（メモリバリア、バッファメモリバリア、ここで使っているようなイメージメモリバリア）の配列を参照します。
+
+== バッファからイメージへのコピー
+
+`createTextureImage` に戻る前に、もう 1 つヘルパー関数 `copyBufferToImage` を書きます。
+
+[,c++]
+----
+void copyBufferToImage(vk::raii::CommandBuffer &commandBuffer, const vk::raii::Buffer &buffer, vk::raii::Image &image, uint32_t width, uint32_t height)
+{
+}
+----
+
+バッファコピーと同様に、バッファのどの部分をイメージのどの部分へコピーするかを指定する必要があります。
+これは `vk::BufferImageCopy` 構造体で行います。
+
+[,c++]
+----
+vk::BufferImageCopy region{.bufferOffset      = 0,
+                           .bufferRowLength   = 0,
+                           .bufferImageHeight = 0,
+                           .imageSubresource  = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+                           .imageOffset       = {0, 0, 0},
+                           .imageExtent       = {width, height, 1}};
+----
+
+これらのフィールドのほとんどは自明です。
+`bufferOffset` は、ピクセル値が始まるバッファ内のバイトオフセットを指定します。
+`bufferRowLength` と `bufferImageHeight` フィールドは、ピクセルがメモリ上でどう並ぶかを指定します。
+例えば、イメージの行のあいだにパディングバイトがある場合があります。
+両方に `0` を指定すると、今回のようにピクセルが単に密に詰まっていることを示します。
+`imageSubresource`、`imageOffset`、`imageExtent` フィールドは、ピクセルをイメージのどの部分へコピーするかを示します。
+
+バッファからイメージへのコピー操作は、`vk::raii::CommandBuffer::copyBufferToImage` 関数でキューに入れます。
+
+[,c++]
+----
+commandBuffer.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal, region);
+----
+
+3 つ目のパラメータは、イメージが現在使っているレイアウトを示します。
+ここでは、イメージがすでにピクセルコピーに最適なレイアウトへ遷移済みだと仮定しています。
+今はピクセルの 1 チャンクをイメージ全体へコピーしているだけですが、`vk::BufferImageCopy` の配列を指定して、このバッファからイメージへの多くの異なるコピーを 1 回の操作で行うことも可能です。
+
+== テクスチャイメージの準備
+
+テクスチャイメージのセットアップを仕上げるために必要なツールはすべて揃ったので、`createTextureImage` 関数に戻ります。
+そこで最後に行ったのはテクスチャイメージの作成でした。
+次のステップは、ステージングバッファをテクスチャイメージへコピーすることです。
+これには 2 つのステップがあります。
+
+* テクスチャイメージを `vk::ImageLayout::eTransferDstOptimal` へ遷移する
+* バッファからイメージへのコピー操作を実行する
+
+先ほど作成した関数なら簡単にできます。
+
+[,c++]
+----
+vk::raii::CommandBuffer commandBuffer = beginSingleTimeCommands();
+transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
+copyBufferToImage(commandBuffer, stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+----
+
+イメージは `vk::ImageLayout::eUndefined` レイアウトで作成されたので、`textureImage` を遷移するときの古いレイアウトとしてそれを指定すべきです。
+コピー操作の前の内容は気にしないので、こうできることを思い出してください。
+
+シェーダでテクスチャイメージからのサンプリングを開始できるようにするには、シェーダアクセス用に準備する最後の遷移がもう 1 つ必要です。
+最後に、単発のコマンドバッファを終了できます。
+
+[,c++]
+----
+transitionImageLayout(commandBuffer, textureImage, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal);
+endSingleTimeCommands(std::move(commandBuffer));
+----
+
+== 遷移バリアマスク
+
+バリデーションレイヤを有効にしてアプリケーションを実行すると、`transitionImageLayout` 内のアクセスマスクとパイプラインステージが無効だと文句を言うのが分かるでしょう。
+遷移内のレイアウトに基づいて、それらをまだ設定する必要があります。
+
+扱う必要がある遷移は 2 つあります。
+
+* Undefined → 転送デスティネーション: 何も待つ必要のない転送書き込み
+* 転送デスティネーション → シェーダ読み取り: シェーダ読み取りは転送書き込みを待つべき。具体的にはフラグメントシェーダでのシェーダ読み取り。テクスチャをそこで使うから
+
+これらのルールは、次のアクセスマスクとパイプラインステージで指定します。
+
+[,c++]
+----
+vk::PipelineStageFlags sourceStage;
+vk::PipelineStageFlags destinationStage;
+
+if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eTransferDstOptimal)
+{
+  barrier.srcAccessMask = {};
+  barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+
+  sourceStage      = vk::PipelineStageFlagBits::eTopOfPipe;
+  destinationStage = vk::PipelineStageFlagBits::eTransfer;
+}
+else if (oldLayout == vk::ImageLayout::eTransferDstOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal)
+{
+  barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+  barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+
+  sourceStage      = vk::PipelineStageFlagBits::eTransfer;
+  destinationStage = vk::PipelineStageFlagBits::eFragmentShader;
+}
+else
+{
+  throw std::invalid_argument("unsupported layout transition!");
+}
+commandBuffer.pipelineBarrier(sourceStage, destinationStage, {}, {}, nullptr, barrier);
+----
+
+前述の表のとおり、転送書き込みはパイプラインの転送ステージで起きる必要があります。
+書き込みは何も待つ必要がないので、バリア前の操作には空のアクセスマスクと、可能な最も早いパイプラインステージ `vk::PipelineStageFlagBits::eTopOfPipe` を指定してよいです。
+`vk::PipelineStageFlagBits::eTransfer` は、グラフィックスおよびコンピュートパイプライン内の _実際の_ ステージではないことに注意してください。
+転送が起きる疑似ステージに近いものです。
+詳細と他の疑似ステージの例は https://docs.vulkan.org/spec/latest/chapters/synchronization.html#VkPipelineStageFlagBits[ドキュメント] を参照してください。
+
+イメージは同じパイプラインステージで書き込まれ、その後フラグメントシェーダによって読まれるため、フラグメントシェーダのパイプラインステージでシェーダ読み取りアクセスを指定します。
+
+将来さらに遷移が必要になれば、関数を拡張します。
+アプリケーションは今や正常に実行されるはずですが、もちろん見た目の変化はまだありません。
+
+注意点として、コマンドバッファのサブミットは先頭で暗黙的な `vk::AccessFlagBits::eHostWrite` 同期を生じます。
+`transitionImageLayout` 関数は単一コマンドだけのコマンドバッファを実行するので、レイアウト遷移で `vk::AccessFlagBits::eHostWrite` 依存が必要なら、この暗黙的同期を使って `srcAccessMask` を `0` にできます。
+明示するかどうかは好みですが、こうした OpenGL 的な「隠れた」操作に頼るのは個人的には好みません。
+
+実際には、すべての操作をサポートする特別な種類のイメージレイアウト `vk::ImageLayout::eGeneral` もあります。
+ただし、チュートリアルでは使わない特定の拡張を使う場合を除き、一般レイアウトの使用は一部の GPU で特定の最適化を無効にする可能性があり、性能ペナルティを伴うことがあります。
+イメージを入力と出力の両方に使う場合や、preinitialized レイアウトを抜けたあとイメージを読む場合など、特別なケースでは必要です。
+
+イメージにはテクスチャが入っていますが、グラフィックスパイプラインからアクセスする手段がまだ必要です。
+xref:./01_Image_view_and_sampler.adoc[次の章]でそれに取り組みます。
+
+link:/attachments/24_texture_image.cpp[C{pp} code] /
+link:/attachments/22_shader_ubo.slang[slang shader] /
+link:/attachments/22_shader_ubo.vert[GLSL Vertex shader] /
+link:/attachments/22_shader_ubo.frag[GLSL Frag shader]

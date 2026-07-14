@@ -1,0 +1,58 @@
+:pp: {plus}{plus}
+= バリデーションレイヤ: 環境の設定
+
+== 同期バリデーションの有効化
+
+**LunarG Synchronization Validation** レイヤは、すべてのプラットフォームで標準の `VK_LAYER_KHRONOS_validation` の一部とは限りません。多くの環境では、`vk_layer_settings.txt` ファイルまたはエンジンの `vk::InstanceCreateInfo` を通じて明示的に有効にする必要があります。
+
+[TIP]
+====
+開発中にこれを管理するはるかに簡単な方法は、**vkconfig**（LunarG Vulkan Configurator）を使うことです。Vulkan SDK に含まれるこの GUI ツールにより、ソースコードやプロジェクト設定を変更せずに、ワンクリックで同期バリデーションをグローバルに有効／無効にできます。
+====
+
+インスタンス経由で有効にするには、`VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` フラグを `vk::ValidationFeaturesEXT` 構造体に追加し、`vk::InstanceCreateInfo` の `pNext` として渡します。
+
+[,cpp]
+----
+auto syncValidationFeature = vk::ValidationFeaturesEXT{
+    .enabledValidationFeatureCount = 1,
+    .pEnabledValidationFeatures = &vk::ValidationFeatureEnableEXT::eSynchronizationValidation
+};
+
+auto instanceCreateInfo = vk::InstanceCreateInfo{
+    .pNext = &syncValidationFeature,
+    // ...
+};
+
+auto instance = vk::raii::Instance(context, instanceCreateInfo);
+----
+
+== vk_layer_settings.txt の利用
+
+より柔軟なアプローチとして、アプリケーションの作業ディレクトリに `vk_layer_settings.txt` ファイルを作成できます。このファイルにより、コードを再コンパイルせずにバリデーションレイヤの多くの側面を設定できます。
+
+----
+# Example vk_layer_settings.txt
+khronos_validation.enables = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+khronos_validation.report_flags = error;warning;perf;info
+----
+
+== レイヤが実際にすること
+
+有効になると、同期バリデーションレイヤはエンジン内のすべてのリソースの追跡を始めます。リソースに最後に書き込んだステージ、現在読んでいるステージ、次に控えているステージの記録を保ちます。
+
+適切なバリアなしに二つのステージが同じメモリにアクセスし得る状況——例えば転送コピーが終わる前にフラグメントシェーダがテクスチャの読み取りを始める——を検出すると、レイヤはバリデーションエラーを出します。
+
+同期バリデーションレイヤには **無視できない性能オーバーヘッド** があることに注意してください。本番やリリースビルドでつけっぱなしにするものではありません。ハザードがバグになる前に捕まえるため、開発とテスト中に専ら使うべきです。
+
+== Simple Engine: 開発ワークフロー
+
+`Simple Engine` では、同期バリデーションをデバッグビルドに直接統合しています。`--debug-sync` コマンドラインフラグでエンジンを実行する（または `renderer_core.cpp` で有効にする）と、インスタンス作成に自動的に `vk::ValidationFeatureEnableEXT::eSynchronizationValidation` を追加します。
+
+これは開発ワークフローの重要な一部です。新しいレンダリングパス——最近の **Forward+ ライティング** や **レイクエリシャドウ** など——を追加するときはいつでも、同期バリデーションを有効にしてエンジンを走らせます。これにより、「Write-After-Read」（WAR）や「Read-After-Write」（RAW）ハザードを、ちらつくピクセルや断続的な GPU ハングとして現れる前に早期に捕まえられます。ツールにハザードを見つけさせることで、捉えにくい同期バグを追う時間を減らし、エンジンの最適化により多くの時間を費やせます。
+
+次の節では、このレイヤが出すエラーメッセージをどう解読するかを見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Synchronization_Validation/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Synchronization_Validation/03_interpreting_vuids.adoc[VUID の解釈]

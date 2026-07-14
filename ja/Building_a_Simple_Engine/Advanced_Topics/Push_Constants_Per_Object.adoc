@@ -1,0 +1,39 @@
+= プッシュ定数 — オブジェクトごとのマテリアルプロパティ
+
+プッシュ定数は、バッファを作ったり更新したりせずにシェーダーへ送れる小さなデータ片です。ドローごとのマテリアル用ノブに最適です。
+
+このエンジンでは、*ドローコールごとに変わる値*（マテリアル係数と「テクスチャがあるか？」フラグ）にプッシュ定数を使います。変化が少ないもの（カメラデータ、ライトリスト、大きな配列）は UBO／SSBO に置きます。
+
+== 使い方
+
+一般的な PBR コントロール（base color factor、metallic／roughness、テクスチャ有無フラグ、emissive strength、transmission、IOR）を単一のプッシュ定数ブロックに詰め、各ドローの前に更新します。
+
+== 参照先
+
+* C++ のプッシュ定数構造体と更新呼び出し:
+** `renderer.h`（`MaterialProperties`）
+** `renderer_rendering.cpp`（ドローごとのマテリアルプロパティを push する箇所）
+* シェーダーのプッシュ定数ブロック:
+** `shaders/pbr.slang`（`[[vk::push_constant]]` ブロック）
+* シェーダーが使う PBR ヘルパー関数:
+** `shaders/pbr_utils.slang`
+** `shaders/lighting_utils.slang`
+
+== ガイドライン
+
+* ブロックは小さく保つ（Vulkan は少なくとも 128 バイトを保証）。このサンプルは余裕で収まる。
+* 毎ドロー変わる値にはプッシュ定数を使う。大きくて変化の少ないデータには UBO／SSBO を使う。
+
+== 今後のアイデア
+
+このパターンを拡張したい場合:
+
+* 「めったに変わらないマテリアルごとのデータ」を GPU マテリアルバッファに分け、プッシュ定数はドローごとのインデックスだけにする。
+* ホットな UBO 経路から外すため、開発専用のデバッグ可視化向けに第 2 のプッシュ定数ブロックを追加する。
+* グローバル UBO を重ねて、シーン全体の roughness／metallic を強制するマテリアルオーバーライド系を追加する。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Rendering_Pipeline_Overview.adoc[レンダリングパイプライン概要]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Descriptor_Indexing_UpdateAfterBind.adoc[Descriptor Indexing UpdateAfterBind]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Ray_Query_Rendering.adoc[Ray Query レンダリング]

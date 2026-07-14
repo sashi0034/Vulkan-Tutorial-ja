@@ -1,0 +1,51 @@
+= VK_EXT_robustness2 — 実世界エンジン向けのより安全なデフォルト
+
+Vulkan は高速でメタルに近い実行を許します。同時に、悪いインデックスや範囲外アクセスは未定義の結果を生み得ます。`VK_EXT_robustness2` はそのあたりを締め、メモリ破損やフリッカーではなく、予測可能な失敗にします。
+
+== 得られるもの
+
+* Robust buffer access 2 — 範囲外のバッファ読みはゼロを返し、書き込みは破棄される。
+* Robust image access 2 — 範囲外のイメージ座標は仕様どおりクランプするかゼロを返す。
+* Null descriptors — ディスクリプタを「null」のままにしておくと、シェーダーは UB ではなく定義されたゼロ値を見る。
+
+これらの振る舞いは、学生が反復しているあいだやテクスチャがストリームインしているあいだ、エンジンをより寛容にします。
+
+== ここでの使い方
+
+* 利用可能なら、デバイス作成時に拡張とフィーチャ構造体を有効化する。
+* シェーダーは合法な範囲を前提に書くが、ストリーミング中のテクスチャやオプションのバインディングが一時的に欠けても、null ディスクリプタのサンプリングは定義済みで安全。
+* Forward+／反射経路はフレーム途中のディスクリプタ編集を避け、robustness2 は追加のセーフティネットとして働く。
+
+== いつ有効にするか
+
+教育用サンプルとツールでは、デバイスがサポートする限り常に有効にします。出荷タイトルでもオンのままにして構いません。現代のドライバではパフォーマンスコストは一般に無視でき、安全性に見合う価値があります。
+
+== コードの参照先
+
+* デバイス拡張／フィーチャの有効化:
+** `renderer_core.cpp`
+** `vulkan_device.cpp`
+* Ray Query シェーダー内の境界チェックと防御的インデックス:
+** `shaders/ray_query.slang`（`geometryInfoCount`／`materialCount` の境界チェック）
+* 安全なディスクリプタ更新パターン（正しさを robustness に依存しない）:
+** `renderer_rendering.cpp`（フレームごとの安全な時点）
+** `Descriptor_Indexing_UpdateAfterBind.adoc`
+
+== 要点
+
+* Robustness は良い同期と寿命ルールの代わりにはならない。補完する。
+* Null descriptors と「安全なゼロ」読みは、ストリーミングと機能トグルをより壊れにくくする。
+
+== 今後のアイデア
+
+エンジンをデバッグツールにせずに robustness を負荷試験したい場合:
+
+* 制御されたシェーダー経路で意図的に範囲外インデックスを与える、開発専用の「fault injection」トグルを追加する。
+* 現在のデバイスで `VK_EXT_robustness2` が有効かどうかを表示する小さなランタイムレポートを追加する。
+* 欠けたテクスチャ／バッファを行使しつつ VVL をきれいに保つ、ユニット風の GPU テストシーンを追加する。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_and_Streaming.adoc[同期とストリーミング]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Descriptor_Indexing_UpdateAfterBind.adoc[Descriptor Indexing UpdateAfterBind]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Ray_Query_Rendering.adoc[Ray Query レンダリング]

@@ -1,0 +1,198 @@
+:pp: {plus}{plus}
+= ルックアットコントローラ
+
+== ルックアットコントローラが行うこと
+
+ルックアットコントローラは、1 つ以上のジョイント—通常は首と頭—を回転させ、キャラクターがワールド内の特定点を見ているように見せるプロシージャルシステムです。エンドエフェクタの位置を補正する足置き IK とは異なり、ルックアットは純粋に回転です。「視線方向がターゲットを指すために、これらのジョイントはどんな回転を持つべきか？」という問いに答えます。
+
+応用範囲は広いです。視界内を横切るプレイヤーを追うために頭を向ける敵兵。市場を歩くプレイヤーキャラクターに頭を向ける店の NPC。首と上脊椎をゆっくり遠方のターゲットへ回すスナイパー。興味深い音に向けて頭を向ける馬。いずれもベースの身体アニメーションは再生され続け—歩く、話す、呼吸する—一方でルックアットシステムが頭ジョイントを独立に回転させます。
+
+ルックアットコントローラは IK の特殊ケース（エフェクタが位置ではなく視線方向）として実装することも、直接回転計算として実装することもできます。より単純で制御しやすく、実用上の大多数のユースケースに十分なため、直接アプローチを実装します。
+
+== 座標空間問題の理解
+
+ルックアットコントローラの難所は数学ではありません—数学は単純です—座標空間を正しく揃えることです。各ジョイントには glTF 階層で定義されたローカル座標系があります。頭ジョイントの「前」方向は必ずしもワールド Y や Z 軸ではなく、Blender でアーティストがリグを組んだ方法に依存します。頭ジョイントのどのローカル軸が「前」（顔方向）で、どれが「上」かを知る必要があります。これらが揃える軸だからです。
+
+Blender の一般的な慣習に従う標準的なヒューマノイドリグでは、頭のローカル +Y が通常上（頭頂）を指し、+Z が前（鼻）を指します。しかしこれは慣習であって法則ではありません—Blender でジョイント向きを調べ、特定リグで確認すべきです。ルックアット実装では前方向と上方向の軸をパラメータ化し、リグの慣習に関わらず動くようにします。
+
+== ルックアット回転
+
+頭ジョイントの現在のワールド位置・向きと、ターゲットのワールド位置が与えられたとき、ルックアット回転は次のように計算されます。
+
+1. 望む前方向を計算: `desired_forward = normalize(target - head_world_pos)`。
+2. 現在の前方向を取り出す: `current_forward = normalize(head_world_rotation * local_forward_axis)`。
+3. 現在から望む方向への回転を計算: CCD で使ったのと同じ「1 ベクトルを別のベクトルへ回す」クォータニオンです。
+4. 任意で、IK ソルバーと同様にワールド空間から親空間へ戻して、シーングラフのローカル回転に適用します。
+
+再利用可能な関数として実装します。
+
+[source,cpp]
+----
+struct LookAtController {
+    uint32_t  head_node_idx;           // The primary head/neck joint
+    glm::vec3 local_forward_axis;      // The "forward" axis in the joint's local space
+    glm::vec3 local_up_axis;           // The "up" axis in the joint's local space
+    float     max_angle_degrees;       // Maximum deviation from the rest pose
+    float     weight;                  // Blend weight: 0 = no look-at, 1 = full
+};
+
+void apply_look_at(
+    std::vector<Node>&     nodes,
+    const LookAtController& controller,
+    const glm::vec3&        target_world)
+{
+    Node& head = nodes[controller.head_node_idx];
+
+    // World position of the head joint
+    glm::vec3 head_world_pos = glm::vec3(head.world_matrix[3]);
+
+    glm::vec3 to_target = target_world - head_world_pos;
+    float dist = glm::length(to_target);
+    if (dist < 1e-4f) return; // Target is inside the head; ignore
+    to_target /= dist;
+
+    // Current world-space forward direction of the head joint
+    glm::quat head_world_rot = head.get_world_rotation();
+    glm::vec3 current_forward = head_world_rot * controller.local_forward_axis;
+
+    float dot = glm::clamp(glm::dot(current_forward, to_target), -1.0f, 1.0f);
+    if (dot > 0.9999f) return; // Already looking at target
+
+    float angle = std::acos(dot);
+
+    // Clamp the rotation to the maximum allowed angle.
+    // This prevents the head from twisting 180 degrees around.
+    float clamped_angle = std::min(angle, glm::radians(controller.max_angle_degrees));
+
+    // Apply the weight: a weight of 0.5 would only rotate halfway to the target.
+    // This is useful for blending the look-at in and out smoothly.
+    clamped_angle *= controller.weight;
+    if (clamped_angle < 1e-5f) return;
+
+    glm::vec3 rotation_axis = glm::cross(current_forward, to_target);
+    if (glm::length(rotation_axis) < 1e-6f) {
+        // Vectors are anti-parallel; choose an arbitrary perpendicular axis.
+        // Use the joint's up axis as the rotation axis to avoid gimbal issues.
+        rotation_axis = head_world_rot * controller.local_up_axis;
+    } else {
+        rotation_axis = glm::normalize(rotation_axis);
+    }
+
+    glm::quat world_correction  = glm::angleAxis(clamped_angle, rotation_axis);
+    glm::quat new_world_rot     = world_correction * head_world_rot;
+
+    glm::quat parent_world_rot = (head.parent_index != INVALID_NODE_INDEX)
+        ? nodes[head.parent_index].get_world_rotation()
+        : glm::quat(1, 0, 0, 0);
+
+    head.local_rotation = glm::inverse(parent_world_rot) * new_world_rot;
+    head.mark_dirty();
+    update_world_matrices_subtree(nodes, controller.head_node_idx);
+}
+----
+
+== 複数ジョイントへの回転分配
+
+頭ジョイントだけに適用する単一ジョイントのルックアットは動きますが、自然には見えません。実際の人は何かを見るために頭だけ回すわけではなく、首も回し、角度差が大きいときは上脊椎も回します。ルックアット回転は脊椎から頭までのジョイントチェーンに**分配**され、各ジョイントが総回転の一部を担います。
+
+この分配には 2 つの目的があります。第一に、固定された首の上でだけ回る頭の機械的な見た目を避けます—人間の首は柔らかく回転に参加します。第二に、複数ジョイントがそれぞれ小さな分を担うため、頭単体の可動域を超える総ルックアット角を許します。
+
+分配は素直です。頭ジョイントに全角度を適用する代わりに、脊椎から頭へチェーン上の各ジョイントにその分数を適用します。分数の和は 1 で、任意に重み付けできます—通常、頭が最大、脊椎が最小です。
+
+[source,cpp]
+----
+struct LookAtChain {
+    std::vector<uint32_t> joints;      // Ordered from root (spine) to tip (head)
+    std::vector<float>    weights;     // Per-joint share of the total rotation (must sum to 1)
+    glm::vec3 local_forward_axis;      // Forward axis in the *head joint's* local space
+    glm::vec3 local_up_axis;           // Up axis in the *head joint's* local space
+    float     max_total_angle_degrees; // Maximum total look-at angle across all joints
+    float     blend_weight;            // Global blend weight (0 = none, 1 = full)
+};
+
+void apply_look_at_chain(
+    std::vector<Node>&    nodes,
+    const LookAtChain&    chain,
+    const glm::vec3&      target_world)
+{
+    if (chain.joints.empty()) return;
+    uint32_t head_idx = chain.joints.back();
+
+    // Compute the total desired rotation (same as single-joint look-at)
+    glm::vec3 head_world_pos  = glm::vec3(nodes[head_idx].world_matrix[3]);
+    glm::vec3 to_target       = target_world - head_world_pos;
+    float dist = glm::length(to_target);
+    if (dist < 1e-4f) return;
+    to_target /= dist;
+
+    glm::quat head_world_rot   = nodes[head_idx].get_world_rotation();
+    glm::vec3 current_forward  = head_world_rot * chain.local_forward_axis;
+
+    float dot   = glm::clamp(glm::dot(current_forward, to_target), -1.0f, 1.0f);
+    float angle = std::acos(dot);
+    if (angle < 1e-5f) return;
+
+    float total_angle = std::min(angle, glm::radians(chain.max_total_angle_degrees));
+    total_angle *= chain.blend_weight;
+    if (total_angle < 1e-5f) return;
+
+    glm::vec3 rotation_axis = glm::cross(current_forward, to_target);
+    if (glm::length(rotation_axis) < 1e-6f) {
+        rotation_axis = head_world_rot * chain.local_up_axis;
+    } else {
+        rotation_axis = glm::normalize(rotation_axis);
+    }
+
+    // Distribute the rotation across the chain, applying each joint's share
+    for (size_t i = 0; i < chain.joints.size(); ++i) {
+        uint32_t joint_idx    = chain.joints[i];
+        float    joint_angle  = total_angle * chain.weights[i];
+        if (joint_angle < 1e-5f) continue;
+
+        Node& joint = nodes[joint_idx];
+        glm::quat world_correction = glm::angleAxis(joint_angle, rotation_axis);
+        glm::quat new_world_rot    = world_correction * joint.get_world_rotation();
+
+        glm::quat parent_world_rot = (joint.parent_index != INVALID_NODE_INDEX)
+            ? nodes[joint.parent_index].get_world_rotation()
+            : glm::quat(1, 0, 0, 0);
+
+        joint.local_rotation = glm::inverse(parent_world_rot) * new_world_rot;
+        joint.mark_dirty();
+        update_world_matrices_subtree(nodes, joint_idx);
+    }
+}
+----
+
+首から頭まで 3 ジョイントのチェーンでは、典型的な重み配分は `[0.2, 0.3, 0.5]` かもしれません。下首 20%、上首 30%、頭 50% です。これらは美的選択—視覚的にプロファイルし、キャラクターで自然に見えるまで調整してください。
+
+== ルックアットターゲットの平滑化
+
+足置きと同様、ルックアットコントローラも時間的平滑化が必要です。そうでなければ毎フレーム頭が新ターゲットへ直進します。平滑化は同じ指数移動平均です。生ターゲットを毎フレーム追う平滑化ターゲット位置を保持します。
+
+[source,cpp]
+----
+struct LookAtState {
+    glm::vec3 smoothed_target;  // The temporally-smoothed look-at target
+    bool initialized = false;
+};
+
+void update_look_at_target(
+    const glm::vec3& raw_target,
+    float            speed,      // Higher = faster tracking; typical range 3–15
+    float            delta_time,
+    LookAtState&     state)
+{
+    if (!state.initialized) {
+        state.smoothed_target = raw_target;
+        state.initialized     = true;
+        return;
+    }
+    float t = glm::clamp(speed * delta_time, 0.0f, 1.0f);
+    state.smoothed_target = glm::mix(state.smoothed_target, raw_target, t);
+}
+----
+
+`speed` パラメータは頭追従の「硬さ」を制御します。3 なら遠くのものをのんびり見るキャラクター向けの遅い追従。12 なら脅威を探す警戒兵向けの素早い追従です。キャラクターの状態—落ち着き対警戒—に応じて speed を変えると、カットシーンで効く subtle な表現力の層が加わります。
+
+xref:Advanced_glTF/Procedural_Animation_IK/04_foot_placement.adoc[前へ: 凹凸地形上の足置き] | xref:Advanced_glTF/Procedural_Animation_IK/06_physics_driven_lean.adoc[次へ: 物理駆動リーン]

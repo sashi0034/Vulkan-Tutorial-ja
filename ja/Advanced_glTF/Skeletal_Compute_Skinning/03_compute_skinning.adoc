@@ -1,0 +1,373 @@
+:pp: {plus}{plus}
+= コンピュートスキニングパイプライン
+
+== なぜコンピュートシェーダーか？
+
+従来のレンダリングパイプラインでは、頂点シェーダーはラスタライゼーションの最初のステージとして頂点ごとに一度実行されます。これによりスキニングの自然な候補となります—頂点シェーダーはすでに各頂点の位置と属性へアクセスでき、三角形組み立てとラスタライゼーションのステージが処理を行う前にそれらを変換できます。
+
+しかし頂点シェーダーには根本的な制約があります。出力は一時的です。頂点シェーダー起動の結果は、その描画呼び出しの間だけ存在します。フレームがレンダリングされると、変換後の位置は消えます。物理エンジンでもレイトレーサーでも—他のどのシステムも頂点シェーダーが生成したものを読めません。これこそはじめに指摘した「二重に支払う」問題です。
+
+**コンピュートシェーダー** はラスタライゼーションパイプラインの外で実行される汎用 GPU プログラムです。**Shader Storage Buffer Object（SSBO）** から読み取り、結果を別の SSBO に書き戻します。これらの出力バッファは GPU 上に残り、後続の任意のパイプラインステージや描画呼び出しで使えます。コンピュートシェーダーはフレームごとに一度実行され、メッシュをスキニングし、アニメーション頂点データを、下流のすべての利用者が追加コストなしで読めるバッファに格納します。
+
+これが中核のアーキテクチャ転換です。スキニングを *レンダリングの副作用* から、フレームパイプラインにおける *専用の第一級ステップ* へ移します。
+
+== バッファアーキテクチャ
+
+シェーダーコードを一行書く前に、バッファレイアウトを慎重に設計する価値があります。スキニングされたキャラクターのコンピュートパイプラインには四つの主要バッファが必要です。
+
+**入力頂点バッファ（読み取り専用）**: glTF ファイルから読み込んだとおりのレストポーズでメッシュ頂点を格納します。初期アップロード後は変更されません。位置、法線、接線、テクスチャ座標、各頂点のジョイントインデックスとウェイトを含みます。
+
+**ジョイント行列バッファ（フレームごとに一度書き込み）**: 前節で CPU 上で計算した事前計算済みジョイント行列の配列を格納します。アニメーションシステムとシーングラフが更新された後、各フレームの冒頭で GPU にアップロードされます。内容は毎フレーム変わります。
+
+**出力頂点バッファ（コンピュートが書き込み、他がすべて読み取り）**: これが鍵となるバッファです。コンピュートシェーダーがアニメーション後の位置・法線・接線をここに書き込みます。ラスタライザの描画呼び出しはこれを頂点入力として使います。レイトレーサーの BLAS 更新はここから読み取ります。物理システムは表面クエリ用にこれを参照できます。
+
+**間接描画バッファ（任意だが推奨）**: 多数のアニメーションキャラクターを含む複雑なシーンでは、GPU 駆動の間接描画コマンド用バッファも欲しくなるかもしれませんが、それは後章で扱うより高度な話題です。
+
+このセットアップの C{pp} 側は次のとおりです。
+
+[source,cpp]
+----
+struct SkinComputeResources {
+    // The mesh's original, unchanging rest-pose vertices
+    VkBuffer input_vertex_buffer;
+    VkDeviceMemory input_vertex_memory;
+    uint32_t vertex_count;
+
+    // Updated each frame with the current joint matrices
+    VkBuffer joint_matrix_buffer;
+    VkDeviceMemory joint_matrix_memory;
+    uint32_t joint_count;
+
+    // Written by compute, read by rasterizer/raytracer/physics
+    VkBuffer output_vertex_buffer;
+    VkDeviceMemory output_vertex_memory;
+
+    // Descriptor set referencing all three buffers
+    VkDescriptorSet descriptor_set;
+};
+----
+
+入力と出力の両方の頂点バッファは、コンピュートシェーダーが SSBO バインディング経由で読み書きできるよう `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` フラグで作成すべきです。出力バッファにはさらに `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT` が必要で、ラスタライザが直接頂点入力ソースとして使えるようにします。
+
+[source,cpp]
+----
+// Output buffer usage flags - the key to "skin once, use everywhere"
+VkBufferUsageFlags output_usage =
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |    // Compute shader can write to it
+    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT  |    // Rasterizer can read from it
+    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | // Ray tracing BLAS can reference it
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT;       // Can be read back to CPU if needed
+----
+
+== コンピュートシェーダー
+
+いよいよ実際のスキニングシェーダーを書きます。**Slang**—C{pp} に近い構文と優れたクロスコンパイルサポートを持つ現代的 GPU シェーディング言語—を使います。
+
+=== なぜ Slang か？
+「シンプルなエンジン」で GLSL に慣れているかもしれませんが、複雑なキャラクターパイプラインでは Slang にいくつかの利点があります。
+* **自然なアライメント**: Slang は構造体のアライメントを自動処理し SPIR-V 標準に合わせ、GLSL SSBO でよくある「パディングバグ」を減らします。
+* **モダンな構文**: ジェネリクス、インターフェース、演算子オーバーロードをサポートし、複雑なスキニング数学をよりすっきり書けます。
+* **C{pp} 互換**: Slang の構文は C{pp} に非常に近く、エンジンとシェーダー間で構造体定義を共有できることが多いです。
+
+[NOTE]
+====
+**Slang コンパイラ（`slangc`）** は link:https://vulkan.lunarg.com/sdk/home[Vulkan SDK] に同梱されているため、このチュートリアルに従ってすでに SDK をインストールしていれば、追加ダウンロードなしで `slangc` が PATH にあるはずです。スタンドアロンインストールやより新しいバージョンが必要なら、link:https://github.com/shader-slang/slang/releases[Slang GitHub リリースページ] からバイナリも入手できます。
+====
+
+=== Slang シェーダーのコンパイルと読み込み
+Slang は `.slang` ファイルを標準 SPIR-V（`.spv`）にコンパイルし、以前使った GLSL シェーダーとまったく同じように Vulkan エンジンが読み込めます。
+
+[source,cmake]
+----
+# Example CMake integration for Slang
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/skinning.spv
+    COMMAND slangc ${CMAKE_CURRENT_SOURCE_DIR}/shaders/skinning.slang -target spirv -o ${CMAKE_CURRENT_BINARY_DIR}/shaders/skinning.spv
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/skinning.slang
+    COMMENT "Compiling Slang shader to SPIR-V"
+)
+----
+
+シェーダーを読み込むには、既存の `VkShaderModule` 作成コードを使います。
+[source,cpp]
+----
+// Load the compiled .spv file
+auto shaderCode = readFile("shaders/skinning.spv");
+VkShaderModuleCreateInfo createInfo{};
+createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+createInfo.codeSize = shaderCode.size();
+createInfo.pCode = reinterpret_cast<const uint32_t*>(shaderCode.data());
+vkCreateShaderModule(device, &createInfo, nullptr, &skinningShaderModule);
+----
+
+[source,slang]
+----
+// skinning.slang
+
+// Both structs use C-style arrays to match the binary layout of the GPU buffers
+// uploaded from the CPU (see OutputVertex in renderer_advanced_types.h).
+struct InputVertex {
+    float p[3];
+    float n[3];
+    float uv[2];
+    float t[4]; // tangent; t[3] is handedness (-1 or +1)
+};
+
+struct OutputVertex {
+    float p[3];
+    float n[3];
+    float uv[2];
+    float t[4];
+};
+
+// Joint data is stored in two separate buffers rather than being embedded in
+// InputVertex, so the rest-pose geometry buffer never needs to change.
+[[vk::binding(0, 0)]] StructuredBuffer<InputVertex>    input_vertices;
+[[vk::binding(1, 0)]] RWStructuredBuffer<OutputVertex> output_vertices;
+[[vk::binding(2, 0)]] StructuredBuffer<float4x4>       joint_matrices;
+[[vk::binding(3, 0)]] StructuredBuffer<uint4>          joint_indices;
+[[vk::binding(4, 0)]] StructuredBuffer<float4>         joint_weights;
+
+// Push constants for per-dispatch data
+struct SkinPushConstants {
+    uint vertex_count;
+};
+[[vk::push_constant]] SkinPushConstants push_constants;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint vertex_id = dispatchThreadID.x;
+    if (vertex_id >= push_constants.vertex_count) return;
+
+    InputVertex v = input_vertices[vertex_id];
+    uint4  j_idx  = joint_indices[vertex_id];
+    float4 j_w    = joint_weights[vertex_id];
+
+    // Build the blended skin matrix from the four joint influences.
+    // This is the core of the Linear Blend Skinning (LBS) equation:
+    // SkinMatrix = sum(weight_i * JointMatrix_i) for i in [0, 3]
+    float4x4 skin_matrix =
+        j_w.x * joint_matrices[j_idx.x] +
+        j_w.y * joint_matrices[j_idx.y] +
+        j_w.z * joint_matrices[j_idx.z] +
+        j_w.w * joint_matrices[j_idx.w];
+
+    float3 v_pos = float3(v.p[0], v.p[1], v.p[2]);
+    float3 v_nrm = float3(v.n[0], v.n[1], v.n[2]);
+    float4 v_tan = float4(v.t[0], v.t[1], v.t[2], v.t[3]);
+
+    // Transform the position using the full 4x4 skin matrix
+    float4 animated_pos = mul(skin_matrix, float4(v_pos, 1.0));
+
+    // Normals and tangents use only the 3x3 rotational portion (no translation).
+    float3x3 skin_rot = float3x3(
+        skin_matrix[0].xyz,
+        skin_matrix[1].xyz,
+        skin_matrix[2].xyz);
+
+    float3 animated_normal  = normalize(mul(skin_rot, v_nrm));
+    float3 animated_tangent = normalize(mul(skin_rot, v_tan.xyz));
+
+    // Write the animated data to the output buffer element-by-element
+    // (required because OutputVertex uses C-style arrays, not vector types).
+    OutputVertex out_v;
+    out_v.p[0] = animated_pos.x;
+    out_v.p[1] = animated_pos.y;
+    out_v.p[2] = animated_pos.z;
+
+    out_v.n[0] = animated_normal.x;
+    out_v.n[1] = animated_normal.y;
+    out_v.n[2] = animated_normal.z;
+
+    out_v.t[0] = animated_tangent.x;
+    out_v.t[1] = animated_tangent.y;
+    out_v.t[2] = animated_tangent.z;
+    out_v.t[3] = v_tan.w; // preserve handedness
+
+    out_v.uv[0] = v.uv[0]; // UV coordinates are not affected by skinning
+    out_v.uv[1] = v.uv[1];
+
+    output_vertices[vertex_id] = out_v;
+}
+----
+
+このシェーダーの構造は前節で構築した数学に直接対応します。各スレッドはちょうど一頂点を処理します。頂点の四つのジョイント行列を参照し、それらからブレンドされたスキン行列を構築し、位置・法線・接線に適用します。出力は共有バッファへ入ります。
+
+スレッドグループサイズ 64 は頂点処理コンピュートシェーダーの一般的な出発点です。現代 GPU アーキテクチャは 32 または 64 のスレッドグループ（NVIDIA では「ワープ」、AMD では「ウェーブ」）でスレッドを処理します。スレッドグループをこれらのハードウェア境界に合わせることで、処理レーンの無駄を避けられます。
+
+== コンピュートパイプラインのセットアップ
+
+シェーダーを実行するには `VkComputePipeline` を作成する必要があります。シェーダーのバインディングに一致するディスクリプタセットレイアウトの定義が必要です。
+
+[source,cpp]
+----
+// 1. Create Descriptor Set Layout
+// Must match the five bindings declared in skinning.slang.
+VkDescriptorSetLayoutBinding bindings[5] = {};
+// binding 0: input vertices (rest-pose, read-only)
+bindings[0].binding         = 0;
+bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+bindings[0].descriptorCount = 1;
+bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+// binding 1: output vertices (animated, read-write)
+bindings[1].binding         = 1;
+bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+bindings[1].descriptorCount = 1;
+bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+// binding 2: joint matrices (float4x4 per joint, updated each frame)
+bindings[2].binding         = 2;
+bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+bindings[2].descriptorCount = 1;
+bindings[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+// binding 3: joint indices (uint4 per vertex)
+bindings[3].binding         = 3;
+bindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+bindings[3].descriptorCount = 1;
+bindings[3].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+// binding 4: joint weights (float4 per vertex)
+bindings[4].binding         = 4;
+bindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+bindings[4].descriptorCount = 1;
+bindings[4].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+VkDescriptorSetLayoutCreateInfo layoutInfo{};
+layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+layoutInfo.bindingCount = 5;
+layoutInfo.pBindings    = bindings;
+vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &computeLayout);
+
+// 2. Create Pipeline Layout (including push constants)
+VkPushConstantRange pushRange{};
+pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+pushRange.offset = 0;
+pushRange.size = sizeof(SkinPushConstants);
+
+VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+pipelineLayoutInfo.setLayoutCount = 1;
+pipelineLayoutInfo.pSetLayouts = &computeLayout;
+pipelineLayoutInfo.pushConstantRangeCount = 1;
+pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
+
+// 3. Create Compute Pipeline
+VkComputePipelineCreateInfo pipelineInfo{};
+pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+pipelineInfo.layout = pipelineLayout;
+pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+pipelineInfo.stage.module = skinningShaderModule;
+pipelineInfo.stage.pName = "main";
+vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &computePipeline);
+----
+
+== コンピュートシェーダーのディスパッチ
+
+CPU 側では、スキニングされたメッシュごとにフレームごとに一度、このシェーダーをディスパッチし、すべての頂点をカバーする十分なスレッドグループ数を指定する必要があります。
+
+[source,cpp]
+----
+void dispatch_skinning(
+    VkCommandBuffer cmd,
+    const SkinComputeResources& skin,
+    VkPipeline compute_pipeline,
+    VkPipelineLayout pipeline_layout)
+{
+    // Bind the compute pipeline and its descriptor set
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
+    vkCmdBindDescriptorSets(cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline_layout,
+        0, 1, &skin.descriptor_set,
+        0, nullptr);
+
+    // Upload the vertex count as a push constant
+    SkinPushConstants constants;
+    constants.vertex_count = skin.vertex_count;
+    vkCmdPushConstants(cmd, pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        sizeof(SkinPushConstants), &constants);
+
+    // Calculate the number of thread groups needed.
+    // Each group processes 64 vertices; round up to cover all vertices.
+    uint32_t group_count = (skin.vertex_count + 63) / 64;
+    vkCmdDispatch(cmd, group_count, 1, 1);
+}
+----
+
+== 同期: パイプラインバリア
+
+見落としやすい重要な詳細があります。コンピュートシェーダーが出力頂点バッファに書き込んだ後、他のパイプラインステージが読み取る前に **パイプラインバリア** を挿入しなければなりません。このバリアがないと、GPU はコンピュートシェーダーが現在フレームの結果を書き込んでいる最中に、前フレームの古いデータでラスタライゼーションを開始する可能性があります。
+
+[source,cpp]
+----
+void insert_skinning_barrier(VkCommandBuffer cmd, VkBuffer output_vertex_buffer)
+{
+    VkBufferMemoryBarrier2 barrier{};
+    barrier.sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    barrier.buffer        = output_vertex_buffer;
+    barrier.offset        = 0;
+    barrier.size          = VK_WHOLE_SIZE;
+
+    // The compute stage writes to the buffer...
+    barrier.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+
+    // ...and both the vertex input stage and the ray tracing stage need to read it.
+    barrier.dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                            VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                            VK_ACCESS_2_SHADER_READ_BIT;
+
+    VkDependencyInfo dep_info{};
+    dep_info.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_info.bufferMemoryBarrierCount = 1;
+    dep_info.pBufferMemoryBarriers    = &barrier;
+
+    vkCmdPipelineBarrier2(cmd, &dep_info);
+}
+----
+
+このバリアは Vulkan 1.3 の `VkPipelineBarrier2` API を使い、単一呼び出しでソースとデスティネーションステージを細かく表現できます。GPU スケジューラは、頂点入力やレイトレーシングの読み取りが始まる前にコンピュートの書き込みが完了することを保証します。
+
+== フレームループ
+
+すべての部品が揃ったら、フレームごとのコンピュートスキニングループは次のようになります。
+
+[source,cpp]
+----
+void frame_update(VkCommandBuffer cmd, Scene& scene)
+{
+    // 1. Update animations (CPU): advance time, sample keyframes
+    scene.animation_system.update(delta_time);
+
+    // 2. Update scene graph (CPU): propagate dirty flags, recalculate world matrices
+    scene.scene_graph.update();
+
+    // 3. Upload joint matrices to GPU (CPU->GPU transfer)
+    for (auto& skinned_mesh : scene.skinned_meshes) {
+        compute_joint_matrices(skinned_mesh.skin, scene.nodes, joint_matrices_staging);
+        upload_joint_matrices(cmd, joint_matrices_staging, skinned_mesh.compute_resources);
+    }
+
+    // 4. Dispatch compute skinning for each skinned mesh
+    for (auto& skinned_mesh : scene.skinned_meshes) {
+        dispatch_skinning(cmd, skinned_mesh.compute_resources,
+            skinned_pipeline, skinned_pipeline_layout);
+    }
+
+    // 5. Insert barrier: compute writes must complete before rasterizer/raytracer reads
+    for (auto& skinned_mesh : scene.skinned_meshes) {
+        insert_skinning_barrier(cmd, skinned_mesh.compute_resources.output_vertex_buffer);
+    }
+
+    // 6. Now rasterize, ray trace, and run physics queries — all reading from the same output buffer
+    render_scene(cmd, scene);
+}
+----
+
+次節では、ステップ 6 以降を詳しく見ます—ラスタライザ、レイトレーシング加速構造、物理システムがそれぞれ同じ出力頂点バッファをどう消費するか、各利用者のセットアップはどうなるかです。
+
+xref:Advanced_glTF/Skeletal_Compute_Skinning/02_skinning_math.adoc[前へ: スキニングの数学] | xref:Advanced_glTF/Skeletal_Compute_Skinning/04_shared_vertex_buffer.adoc[次へ: 一度スキンしてどこでも使う]

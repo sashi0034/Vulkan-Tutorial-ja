@@ -1,0 +1,170 @@
+:pp: {plus}{plus}
+
+= 最終プロジェクト: 「AI 駆動」グラフィックスラボ
+
+== はじめに: 協調キャップストーン
+
+おめでとうございます！ 環境を構築し、モデルを特化し、「設計-実装-レビュー」サイクルをマスターし、デバッグとデプロイの法医技術を探りました。今こそ、新しいツールベルトのすべてのツールを最終的な包括的挑戦——**AI 駆動グラフィックスラボ**——のためにまとめるときです。
+
+このキャップストーンプロジェクトでは、**Simple Engine**（Building a Simple Engine チュートリアルの `attachments/simple_engine/` ディレクトリ）内で作業します。AI を単に「使う」だけではなく、複雑なグラフィックス機能をゼロから設計・実装・デバッグ・最適化する手助けをするデジタルスペシャリストのチームを **指揮** します。これが **協調エンジニアリング** の最終試験です。
+
+== プロジェクト: Dual-Filtering Blur システム
+
+高性能 **Dual-Filtering Blur** システム（現代 AAA エンジンで使われる技法に基づく）を実装します。これは標準ガウシアンブラーより複雑で、ダウンサンプルとアップサンプルパスのチェーン、複雑な同期バリア、精密なテクスチャサンプリング論理が必要です。
+
+== チュートリアル: グラフィックスラボのセットアップ
+
+最終プロジェクトを始めるには、クリーンなワークスペースをセットアップし、必要なエンジンコンテキストで AI アシスタントを準備しなければなりません。システム設計フェーズを開始する次のステップに従ってください。
+
+=== ステップ 1: エンジンコンテキストの読み込み
+AI アシスタント（Goose または IDE Chat）に **Simple Engine** のコアファイルを与えます。これにより AI が特定の RAII ラッパ、リソース管理論理、確立されたコーディングパターンを理解することを保証します。始める前に、設定で **mcp-Vulkan** と **GPUInfo** MCP サーバがアクティブであることを確認してください。これによりアシスタントがコードを公式仕様とハードウェアリミットとリアルタイムでクロス参照できます。
+
+[source,bash]
+----
+# Example: Loading context and MCP tools into Goose
+goose session --instruction "Analyze renderer.h and vulkan_device.h. We are implementing a Dual-Filtering Blur system. Use the 'vulkan' MCP to verify spec compliance for all synchronization logic."
+----
+
+=== ステップ 2: アーキテクチャ設計プロンプト
+高推論モデル（**Claude 4.6** や **GPT-5.3** など）を使いシステムを設計します。リソースライフサイクルと同期チェーンを含む **技術ロードマップ** を求め、特にエンジンで使われる `vk::raii`（Vulkan-HPP）ラッパをターゲットにします。**モデルに応答を簡潔な技術『契約』としてフォーマットし、この出力をローカルに `LLM_NOTES.md` として保存するよう指示してください。**
+
+[source,text]
+----
+We are implementing a Dual-Filtering Blur system in our
+Vulkan 1.4 engine (Simple Engine). Based on our
+'vk::raii::Image' and 'vk::raii::Buffer' usage in
+'renderer.h', design a roadmap for:
+
+1. Resource Lifecycle: How many downsample/upsample images
+   do we need for a 5-tap blur?
+2. Synchronization: Define the 'vk::ImageMemoryBarrier2'
+   transitions between each pass using the 'vulkan-raii'
+   paradigm. Use the 'search-vulkan-docs' MCP tool to confirm
+   the latest layout transition rules for Vulkan 1.4.
+3. Hardware Constraints: Use the 'query_gpu_limit' tool (via
+   the 'gpuinfo' MCP) to verify if 'maxDescriptorSetSampledImages'
+   on common mobile GPUs supports our proposed strategy.
+4. Shader Logic: Suggest a Slang/HLSL implementation
+   for the downsample tap.
+
+Format this entire response as a technical contract
+for an implementation model and save it to LLM_NOTES.md.
+----
+
+=== ステップ 3: 実装とリファクタリング
+設計がレビューされ `LLM_NOTES.md` の準備ができたら、ローカルスペシャリスト（**Qwen 3-Coder** など）に `BlurRenderer` ヘッダと実装を生成するようタスクを与えます。ノートを直接コンテキストとして与えることで、大量実装フェーズに高推論クラウドアクセスなしで、ローカルモデルが確立されたアーキテクチャ契約に従うことを保証します。
+
+[source,bash]
+----
+# Example: Using Goose with the local Qwen specialist and design notes
+goose session --instruction "Read LLM_NOTES.md. Based on this technical contract, implement the 'BlurRenderer' class. Ensure you use 'vk::raii' structures and follow the engine's modular pattern."
+----
+
+[source,cpp]
+----
+// Example: AI-generated pipeline creation based on the contract
+vk::raii::Pipeline BlurRenderer::createDownsamplePipeline() {
+    vk::GraphicsPipelineCreateInfo pipelineInfo = {};
+    // AI will fill in the shader stages, vertex input, etc.
+    // using the engine's existing resource managers.
+}
+----
+
+=== ステップ 4: パフォーマンス監査
+最後に、自律エージェント（**Goose** など）を使い、新機能のパフォーマンススキャンを実行します。
+
+[source,text]
+----
+Goose, audit 'BlurRenderer::recordCommands'.
+Look for redundant descriptor set updates or any
+barriers that are preventing GPU overlap between
+the downsample and upsample stages.
+----
+
+=== ステップ 5: 自律 CI/CD とユニットテスト
+新機能が将来のエンジン更新にわたって安定し続けることを保証するには、継続的インテグレーションパイプラインへ統合しなければなりません。自律エージェントを使い `BlurRenderer` 向け包括的ユニットテストを生成し、次にすべてのプッシュでこれらのテストを実行するよう CI 設定を更新します。
+
+[source,text]
+----
+Goose, create a new unit test file 'tests/blur_renderer_test.cpp'.
+The test should verify the 'BlurRenderer' resource allocation
+and ensure that the downsample mip-chain dimensions are calculated
+correctly for a 1080p input. Once created, update our
+GitHub Actions workflow in '.github/workflows/main.yml' to
+include a new step that compiles and runs this test.
+----
+
+テスト作成とパイプライン更新を AI にタスクとして与えることで、テストの「技術的負債」が実装と同時に扱われ、手動オーバーヘッドなしに高いエンジニアリング標準を維持することを保証します。
+
+=== ステップ 6: GFXReconstruct によるマルチフレーム分析
+ブラーシステムのパスチェーン全体にわたる同期論理を真に検証するには、単一フレームを超えて見なければなりません。**GFXReconstruct** を使い API 呼び出しのストリームをキャプチャし、自律エージェントに「タイムライン監査」をタスクとして与えます。これは、断続的に、または初期化の最初の数フレーム中にだけ現れる競合条件や不正なイメージレイアウト遷移を捕まえるのに特に効果的です。
+
+[source,bash]
+----
+# 1. Capture the trace of your new blur implementation
+VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_gfxreconstruct ./SimpleEngine
+
+# 2. Convert a specific frame range to JSON for the AI to reason about
+# We focus on a small range to stay within the model's context window
+gfxrecon-convert --to-json --frames 5-10 capture.gfxr blur_trace.json
+----
+
+[source,text]
+----
+Goose, I have provided 'blur_trace.json' which contains
+the API stream for our Dual-Filtering Blur system.
+Perform a 'Synchronization Audit':
+
+1. Identify all 'vkCmdPipelineBarrier2' calls related to
+   the 'Blur_Downsample_Mip' images.
+2. Verify that the 'oldLayout' in frame 6 matches the
+   'newLayout' set at the end of frame 5.
+3. Use the 'vulkan' MCP to confirm that we aren't
+   performing any redundant 'UNDEFINED' transitions
+   that would discard tile memory on mobile GPUs.
+
+If you find a hazard, suggest the specific line in
+'BlurRenderer.cpp' that needs adjustment.
+----
+
+「真実のストリーム」を監査することで、エンジンが現在の開発者ドライバで「たまたま」動いているだけではなく、時間にわたって Vulkan 仕様に厳密に準拠していることを保証します。
+
+=== ステップ 7: RenderDoc による視覚フレーム検査
+GFXReconstruct がマルチフレームの「真実のタイムライン」を提供する一方、**RenderDoc** は単一フレームの視覚状態への深い掘り下げを可能にします。**RenderDoc コマンドラインツール（`renderdoccmd`）** を自律エージェントと併せて使い、ブラーシステムの各ダウンサンプルとアップサンプルパスが期待される視覚出力を生成していることを検証します。これは、不正なサンプラ設定から生じる「黒いテクスチャ」や「サンプリングアーティファクト」の特定に特に有用です。
+
+[source,bash]
+----
+# 1. Capture a frame from your blur implementation
+# (Assuming RenderDoc is configured to capture on 'F12' or similar)
+./SimpleEngine --capture-frame 60
+
+# 2. Command Goose to perform a visual state audit
+# Note: We use rdc-cli to export the draw call list and pipeline state
+----
+
+[source,text]
+----
+Goose, analyze 'capture_frame_60.rdc' using 'renderdoccmd'.
+We are looking for the 'Blur_Downsample_Pass_2' draw call.
+
+1. List all draw calls and find the one that binds
+   the 'downsample_mip_1' texture as an input.
+2. Export the 'VkSampler' state for this draw call.
+3. Compare the 'minLod' and 'maxLod' settings in the
+   capture against our 'SamplerBuilder' in 'renderer_utils.cpp'.
+4. Check if the 'fragment shader' output is consistently zero.
+
+If you find a mismatch, explain how to refactor the
+'createSampler' logic to ensure we aren't sampling
+beyond the available mip-levels.
+----
+
+RenderDoc を AI エージェントと統合することで、テクスチャが黒い「なぜ」を「推測」する段階を超えます。AI は特定の状態不一致（誤設定の LOD クランプなど）を特定し、故障リソースを作成したエンジン内のコード行へ直接相関させます。
+
+== まとめ: 協調エンジニアリングワークフローのマスター
+
+このラボを完了することで、アーキテクチャには高推論クラウドモデル、実装にはローカルスペシャリスト、検証には RenderDoc と GFXReconstruct のような確立ツールを組み合わせる **協調エンジニアリング** アプローチで、現代 Vulkan 機能の複雑さを管理する実践をしました。
+
+AI 支援は Vulkan を理解する必要を置き換えません。ボイラープレートと反復的ルックアップに費やす時間を減らし、重要な決定に集中できるようにします。Vulkan 仕様はなお権威ある参照であり、エンジニアとしての判断はなお重要な要素です。変わるのは、その仕様をどれだけ効率的にナビゲートし、実装を反復できるかです。
+
+次へ: xref:conclusion.adoc[メイントゥートリアル結論]

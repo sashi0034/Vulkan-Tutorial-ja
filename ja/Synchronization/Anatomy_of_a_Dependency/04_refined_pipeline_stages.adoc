@@ -1,0 +1,59 @@
+:pp: {plus}{plus}
+= 洗練されたパイプラインステージ: 精密さは性能である
+
+== はじめに
+
+前節では、Synchronization 2 が API をどう統一するかを見ました。しかし本当の性能向上は、使い方にあります。`vk::PipelineStageFlagBits2` と `vk::AccessFlagBits2` の習得は精密さの問題です。レガシー Vulkan では、多くの開発者が `eAllCommands`（あるいはさらに悪いことに `eTopOfPipe` と `eBottomOfPipe`）を万能薬として使う罠に落ちました。データ破壊を防ぐという意味では「動きます」が、一人の歩行者が道を渡るために街中の車をすべて止めるようなデジタル版です。
+
+=== パイプラインバブル
+
+過度に広いステージマスクを使うと、いわゆる **パイプラインバブル** が生まれます。現代の GPU は、ラスタライザ、コンピュートコア、固定機能のブリットエンジンなど、できるだけ多くの特化ハードウェアユニットを忙しく保つよう設計されています。`eAllCommands` で待つよう GPU に伝えると、実質的にパイプライン全体を空にしています。次の操作の最も小さな部分を開始する前に、先行するすべての操作が完全に終わるのを GPU が待たなければなりません。
+
+image::/images/vulkan_pipeline_block_diagram.png[Vulkan パイプラインブロック図, width=800, alt="Vulkan グラフィックスパイプラインの各ステージを示すブロック図"]
+
+Synchronization 2 では、はるかに精密に狙えます。ストレージバッファへのコンピュートシェーダの書き込みが終わってからフラグメントシェーダが読むことだけを保証したいなら、`eComputeShader` と `eFragmentShader` を具体的に指定できます。ジオメトリエンジンやラスタライザなど、GPU の他の部分は独立したタスクで働き続けられます。
+
+=== 適切なステージの選択
+
+適切なステージマスクを選ぶには、データがどこから来てどこへ行くかのしっかりした理解が必要です。エンジンでよく使うパターンをいくつか挙げます。
+
+*   **Render to Texture**: 後のパスでサンプリングできるようカラーアタッチメントを遷移させる場合、ソースステージは `eColorAttachmentOutput` であるべきです。
+*   **コンピュート後処理**: フラグメントシェーダが使うパスをコンピュートシェーダが終えたとき、ソースに `eComputeShader`、宛先に `eFragmentShader` を使います。
+*   **転送からグラフィックスへ**: 転送キューでバッファやイメージのアップロードが終わったとき、ソースステージは `eTransfer` です。
+
+=== アクセスフラグの力
+
+ステージフラグは GPU に *いつ* 待つべきかを伝えますが、**アクセスフラグ** は *なぜ* かを伝えます。「実行依存とメモリ依存」の節で述べたキャッシュのフラッシュと無効化を制御します。
+
+ステージと正しいアクセスフラグの組み合わせは重要です。例えばコンピュートシェーダでストレージバッファを読むなら、`eShaderRead` または `eShaderStorageRead` が必要です。書き込むなら、`eShaderWrite` または `eShaderStorageWrite` が必要です。ここで具体的であるほど、ハードウェアは必要なキャッシュ操作だけを行え、バリア自体のオーバーヘッドを大きく減らせます。
+
+=== まとめ
+
+非同期コンピュートやアセットストリーミングなど、シリーズのより複雑な部分に進むときも、この「精密さ優先」の考え方を保ってください。バリアで立てるビットの一つひとつがハードウェアへのヒントです。ヒントが正確であるほど、フレームレートは滑らかになります。
+
+== Simple Engine: 適切なユニットを狙う
+
+`Simple Engine` では、この精密さ優先のアプローチを `Renderer::Render` ループに適用しています。例えば、デプスバッファを「Depth-Only」パス（シャドウマップ生成やデプスプリパスなど）から「Depth-Test」パス（メインの不透明パスなど）へ遷移させるとき、次を使います。
+
+[,cpp]
+----
+// Depth transition in Renderer::Render
+vk::ImageMemoryBarrier2 depthToRead2{
+  .srcStageMask = vk::PipelineStageFlagBits2::eLateFragmentTests,
+  .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+  .dstStageMask = vk::PipelineStageFlagBits2::eEarlyFragmentTests,
+  .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+  .oldLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+  .newLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+  // ...
+  .image = *depthImage,
+};
+----
+
+`eLateFragmentTests` と `eEarlyFragmentTests` を指定することで、次のパスの読み取りを開始する前に待つ必要があるのは固定機能のデプスユニットの書き込み完了だけだと GPU に伝えます。次のパスの頂点シェーダは実際に走り始め、前のパスのデプス書き込みがまだ確定中でもジオメトリ処理を始められます。このオーバーラップが「パイプラインバブル」を防ぎ、複雑なシーンでもフレームレートを高く保ちます。
+
+次は、これらの基礎概念を、Vulkan で最も一般的な同期タスクであるイメージレイアウト遷移に適用します。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Anatomy_of_a_Dependency/03_sync2_advantage.adoc[Synchronization 2 の利点] | 次へ: xref:Synchronization/Pipeline_Barriers_Transitions/01_introduction.adoc[パイプラインバリアと遷移 - はじめに]

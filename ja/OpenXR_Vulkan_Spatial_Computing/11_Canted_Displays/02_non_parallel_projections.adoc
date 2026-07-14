@@ -1,0 +1,69 @@
+:pp: {plus}{plus}
+= キャンテッドディスプレイ向けの非対称フラスタム
+
+`xrLocateViews` を問い合わせると、OpenXR は各目について `pose` と `fov` を返します。キャンテッド（回転した）レンズを持つヘッドセットでは、これらの値は目ごとに固有であり、専用の行列構築が必要です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan の併用**。
+
+ランタイムが提供する FOV タンジェントから投影行列を正しく計算することは、最新の広 FOV ヘッドセットをサポートするための必須ステップです。Vulkan の描画が物理ハードウェアと揃うよう、ランタイムのビューメタデータを使う必要があります。
+
+== タンジェントフラスタム: 角度からピクセルへ
+
+OpenXR がなぜタンジェントを使うのかを理解するには、カメラが世界をどう見るかを見る必要があります。GPU は **-1 から 1 のボックス**である **クリップ空間（Clip Space）** で動作します。3D 世界から 2D ボックスへ写すには、FOV 角のタンジェントが必要です。
+
+`xrLocateViews` が提供する `fov` は、4 つのタンジェントとして表されます: `angleLeft`、`angleRight`、`angleUp`、`angleDown`。
+
+*   **対称（デスクトップ）**: Left = -Right、Up = -Down。光学中心は中央にある。
+*   **非対称（XR）**: Left != -Right。光学中心は物理レンズに合わせてずれている。
+
+ランタイムは、ヘッドセットの工場キャリブレーションに基づき、ディスプレイパネルの傾きとレンズ–目距離を考慮してこれらのタンジェントを計算します。
+
+== 行列の構築
+
+これらのタンジェントから正しい 4x4 投影行列を構築するには、次のロジックを使います。
+
+[source,cpp]
+----
+// Constructing an asymmetric projection matrix from OpenXR FOV tangents
+glm::mat4 createProjectionMatrix(const XrFovf& fov, float zNear, float zFar) {
+    const float tanLeft = std::tan(fov.angleLeft);
+    const float tanRight = std::tan(fov.angleRight);
+    const float tanUp = std::tan(fov.angleUp);
+    const float tanDown = std::tan(fov.angleDown);
+
+    const float tanWidth = tanRight - tanLeft;
+    const float tanHeight = tanUp - tanDown;
+
+    glm::mat4 projection(0.0f);
+    projection[0][0] = 2.0f / tanWidth;
+    projection[1][1] = 2.0f / tanHeight;
+
+    // The "Shift" components align the frustum with the lens optical center
+    projection[2][0] = (tanRight + tanLeft) / tanWidth;
+    projection[2][1] = (tanUp + tanDown) / tanHeight;
+
+    projection[2][2] = zFar / (zNear - zFar);
+    projection[2][3] = -1.0f;
+    projection[3][2] = -(zFar * zNear) / (zFar - zNear);
+    return projection;
+}
+----
+
+== キャンテッドディスプレイ: 回転の問題
+
+Valve Index のようなヘッドセットでは、ディスプレイパネルが外側に回転（キャンテッド）しています。これは **ビュー行列** も目ごとに異なることを意味します。
+
+**Multiview** を使う場合、固有の投影行列とビュー行列をシェーダーに渡す必要があります。固定オフセットの単一「ステレオ」行列を使おうとすると、GPU が非直線ディスプレイ向けに直線世界を描くため、世界が歪んで見えます。
+
+== 発展: 透視補正補間と動的 FOV
+
+Vulkan は、生の OpenXR データだけでは扱えない幾何学的精度を可能にします。
+
+*   **透視補正補間（Perspective-Correct Interpolation）**: Vulkan の **Dynamic State** と **Push Constants** を使い、目固有のクリップ平面データをシェーダーに渡し、極端なパネル回転のヘッドセットでもライティングとシャドウ計算を安定させる。
+*   **ビューポートスウィズル（Viewport Swizzling）**: Vulkan の **Viewport Swizzling** を使い、リアルタイムの光学変化に基づいて各目の描画領域を動的に調整し、固定の OpenXR ビュー構成よりも応答性の高い体験を提供する。
+
+TIP: 非対称投影の詳細については、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#projection-matrices[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/11_Canted_Displays/01_introduction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/11_Canted_Displays/03_viewport_swizzling.adoc[Next]

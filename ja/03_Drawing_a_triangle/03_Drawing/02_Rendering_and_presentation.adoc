@@ -1,0 +1,359 @@
+:pp: {plus}{plus}
+
+= レンダリングとプレゼンテーション
+
+すべてが結びつく章です。メインループから呼び出して画面に三角形を出す`drawFrame`関数を書きます。まず関数を作成し、`mainLoop`から呼び出します。
+
+[,c++]
+----
+void mainLoop()
+{
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        drawFrame();
+    }
+}
+
+...
+
+void drawFrame()
+{
+}
+----
+
+== フレームの概要
+
+高レベルでは、Vulkanでのフレームレンダリングは共通の一連のステップからなります。
+
+* 前のフレームの完了を待つ
+* スワップチェーンから画像を取得する
+* その画像にシーンを描画するコマンドバッファを記録する
+* 記録したコマンドバッファを投入する
+* スワップチェーン画像をプレゼンテーションする
+
+描画関数は後の章で拡張しますが、いまはこれがレンダーループの核心です。
+
+// Add an image that shows an outline of the frame
+
+== 同期
+
+// Maybe add images for showing synchronization
+
+Vulkanの中核的な設計思想は、GPU上の実行の同期が明示的であることです。操作の順序は、ドライバに望む実行順を伝えるさまざまな同期プリミティブを使って私たちが定義します。つまり、GPU上で作業の実行を開始する多くのVulkan API呼び出しは非同期であり、操作が終わる前に関数は戻ります。
+
+この章では、GPU上で起きるため明示的に順序づける必要があるイベントがいくつかあります。たとえば次のとおりです。
+
+* スワップチェーンから画像を取得する
+* 取得した画像に描画するコマンドを実行する
+* プレゼンテーションのためその画像を画面に提示し、スワップチェーンに戻す
+
+これらのイベントはそれぞれ単一の関数呼び出しで動き出しますが、すべて非同期に実行されます。関数呼び出しは操作が実際に終わる前に戻り、実行順も未定義です。それは都合が悪く、各操作は前の操作の完了に依存します。そのため、望む順序を実現するために使えるプリミティブを探る必要があります。
+
+=== セマフォ
+
+バイナリセマフォは、キュー操作間に順序を付けるために使います。キュー操作とは、コマンドバッファ内、または後で見るように関数内からキューに投入する作業を指します。キューの例はグラフィックスキューとプレゼンテーションキューです。セマフォは、同じキュー内の作業の順序づけと、異なるキュー間の順序づけの両方に使われます。
+
+Vulkanにはバイナリとタイムラインの2種類のセマフォがあります。本チュートリアルではバイナリセマフォだけを使うため、タイムラインセマフォは扱いません。以降のセマフォという用語は、専らバイナリセマフォを指します。
+
+バイナリセマフォは非シグナル状態かシグナル状態のいずれかです。作成時は非シグナルです。バイナリセマフォでキュー操作を順序づける方法は、あるキュー操作では同じセマフォを「シグナル」セマフォとして、別のキュー操作では「ウェイト」セマフォとして渡すことです。たとえば、セマフォSと、順序どおり実行したいキュー操作AとBがあるとします。Vulkanに伝えるのは、操作Aは実行完了時にセマフォSを「シグナル」し、操作Bは実行開始前にセマフォSを「ウェイト」する、ということです。操作Aが終わるとセマフォSはシグナルされ、操作BはSがシグナルされるまで始まりません。操作Bが実行を始めると、セマフォSは自動的に非シグナルにリセットされ、再利用できます。
+
+いま説明したことの疑似コードです。
+
+----
+vk::raii::CommandBuffer A, B = ... // record command buffers
+vk::raii::Semaphore S = ...        // create a semaphore
+
+// enqueue A, signal S when done - starts executing immediately
+queue.submit(work: A, signal: S, wait: None)
+
+// enqueue B, wait on S to start
+queue.submit(work: B, signal: None, wait: S)
+----
+
+このコード片では、`queue.submit()`への両方の呼び出しはすぐに戻ることに注意してください。待ちはGPU上でのみ起きます。CPUはブロックせずに実行を続けます。CPUを待たせるには、別の同期プリミティブが必要で、次にそれを説明します。
+
+=== フェンス
+
+フェンスも実行の同期に使われるという点で似た目的を持ちますが、ホストとも呼ばれるCPU上の実行を順序づけるためのものです。具体的には、ホストがGPUの何かが終わったことを知る必要があるときにフェンスを使います。
+
+セマフォと同様、フェンスもシグナル状態か非シグナル状態です。実行する作業を投入するとき、その作業にフェンスを付けられます。作業が終わるとフェンスはシグナルされます。その後、ホストにフェンスのシグナルを待たせ、ホストが続く前に作業が終わったことを保証できます。
+
+具体例はスクリーンショットの取得です。GPU上で必要な作業はすでに済んだとします。次に画像をGPUからホストへ転送し、メモリをファイルに保存する必要があります。転送を実行するコマンドバッファAとフェンスFがあります。コマンドバッファAをフェンスF付きで投入し、すぐにホストにFのシグナルを待たせます。これにより、コマンドバッファAの実行が終わるまでホストはブロックします。したがって、メモリ転送が完了しているので、ホストにファイルをディスクへ保存させて安全です。
+
+説明したことの疑似コードです。
+
+----
+vk::raii::CommandBuffer A = ... // record command buffer with the transfer
+vk::raii::Fence F = ...         // create the fence
+
+// enqueue A, start work immediately, signal F when done
+queue.submit(work: A, fence: F)
+
+device.waitForFences(F) // blocks execution until A has finished executing
+
+save_screenshot_to_disk() // can't run until the transfer has finished
+----
+
+セマフォの例とは異なり、この例はホスト実行を_ブロックします_。つまりホストは実行が終わるまで待つ以外何もしません。このケースでは、スクリーンショットをディスクに保存する前に転送が完了していることを確かめる必要がありました。
+
+一般に、必要でない限りホストをブロックしない方が望ましいです。GPUとホストに有用な作業を与えたいのです。フェンスのシグナル待ちは有用な作業ではありません。そのため、作業の同期にはセマフォ、またはまだ扱っていない他の同期プリミティブを優先します。
+
+フェンスは非シグナル状態に戻すために手動でリセットする必要があります。フェンスはホストの実行制御に使われるため、フェンスをいつリセットするかはホストが決めるからです。ホストを介さずにGPU上の作業を順序づけるセマフォとは対照的です。
+
+まとめると、セマフォはGPU上の操作の実行順を指定するために使い、フェンスはCPUとGPUを互いに同期させるために使います。
+
+=== 何を選ぶか？
+
+使う同期プリミティブが2つあり、都合よく同期を適用する場所も2つあります。スワップチェーン操作と、前のフレームの完了待ちです。スワップチェーン操作にはセマフォを使いたいです。GPU上で起きるため、可能ならホストを待たせたくないからです。前のフレームの完了待ちには、逆の理由でフェンスを使いたいです。ホストに待つ必要があるからです。一度に1フレームより多く描画しないためです。毎フレームコマンドバッファを再記録するため、現在のフレームの実行が終わるまで次のフレームの作業をコマンドバッファに記録できません。GPUが使っている間にコマンドバッファの現在の内容を上書きしたくありません。
+
+== 同期オブジェクトの作成
+
+スワップチェーンから画像が取得されレンダリング準備ができたことをシグナルするセマフォが1つ、レンダリングが終わりプレゼンテーションできることをシグナルするセマフォがもう1つ、一度に1フレームだけレンダリングされることを保証するフェンスが必要です。
+
+これらのセマフォオブジェクトとフェンスオブジェクトを格納する3つのクラスメンバを作成します。
+
+[,c++]
+----
+vk::raii::Semaphore presentCompleteSemaphore = nullptr;
+vk::raii::Semaphore renderFinishedSemaphore  = nullptr;
+vk::raii::Fence     drawFence                = nullptr;
+----
+
+セマフォを作成するため、チュートリアルのこの部分の最後の`create`関数`createSyncObjects`を追加します。
+
+[,c++]
+----
+void initVulkan()
+{
+    createInstance();
+    setupDebugMessenger();
+    createSurface();
+    pickPhysicalDevice();
+    createLogicalDevice();
+    createSwapChain();
+    createImageViews();
+    createGraphicsPipeline();
+    createCommandPool();
+    createCommandBuffer();
+    createSyncObjects();
+}
+
+...
+
+void createSyncObjects()
+{
+}
+----
+
+セマフォの作成には`vk::SemaphoreCreateInfo`を埋める必要がありますが、現在のAPIバージョンではチュートリアルに関係するフィールドは実際にはありません。
+
+[,c++]
+----
+void createSyncObjects()
+{
+  presentCompleteSemaphore = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
+  renderFinishedSemaphore  = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
+  drawFence                = vk::raii::Fence(device, {.flags = vk::FenceCreateFlagBits::eSignaled});
+}
+----
+
+将来のVulkan APIバージョンや拡張が、他の構造体と同様に`vk::SemaphoreCreateInfo`の`flags`と`pNext`メンバに機能を追加するかもしれません。
+
+メインの描画関数へ進みましょう。
+
+== 前のフレームを待つ
+
+フレームの開始時に、コマンドバッファとセマフォが使えるようになるよう、前のフレームが終わるまで待ちたいです。そのために`vk::raii::Device::waitForFences`を呼び出します。
+
+[,c++]
+----
+void drawFrame()
+{
+    auto fenceResult = device.waitForFences(*drawFence, vk::True, UINT64_MAX);
+		if (fenceResult != vk::Result::eSuccess)
+		{
+			throw std::runtime_error("failed to wait for fence!");
+		}
+		device.resetFences(*drawFence);
+}
+----
+
+`vk::raii::Device::waitForFences`関数はフェンスの配列を取り、いずれかまたはすべてのフェンスがシグナルされるまでホスト上で待ってから戻ります。ここで渡す`vk::True`はすべてのフェンスを待つことを示しますが、1つだけの場合はどちらでも構いません。この関数にはタイムアウトパラメータもあり、64ビット符号なし整数の最大値`UINT64_MAX`に設定しているため、実質的にタイムアウトは無効です。
+
+前のフレームがすでに起きていればフェンスがリセットされていることを確かめる必要があり、後でそれを待つことになります。
+
+次に、前のフレームが終わったあと、フレームバッファから画像を取得しましょう。
+
+[,c++]
+----
+void drawFrame()
+{
+    ...
+    auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphore, nullptr);
+}
+----
+
+最初のパラメータは、画像が利用可能になるまでのタイムアウトをナノ秒で指定します。64ビット符号なし整数の最大値を使うと、実質的にタイムアウトは無効になります。
+
+次の2つのパラメータは、プレゼンテーションエンジンが画像の使用を終えたときにシグナルされる同期オブジェクトを指定します。そこから描画を始められる時点です。セマフォ、フェンス、または両方を指定できます。ここではその目的で`presentCompleteSemaphore`を使います。
+
+その関数は値のペアを返します。通常の`vk::Result`と、利用可能になったスワップチェーン画像のインデックスです。インデックスは`swapChainImages`配列内の`vk::Image`を指します。そのインデックスを使って`vk::raii::FrameBuffer`を選び、そのフレームバッファに記録します。
+
+== コマンドバッファの記録
+
+使うスワップチェーン画像を指定するimageIndexが手に入ったので、コマンドバッファを記録できます。実行したいコマンドを記録するため、関数`recordCommandBuffer`を呼び出します。
+
+[,c++]
+----
+recordCommandBuffer(imageIndex);
+----
+
+完全に記録されたコマンドバッファがあれば、投入できます。
+
+== コマンドバッファの投入
+
+キューへの投入と同期は、`vk::SubmitInfo`構造体のパラメータで構成します。
+
+[,c++]
+----
+vk::PipelineStageFlags waitDestinationStageMask( vk::PipelineStageFlagBits::eColorAttachmentOutput );
+const vk::SubmitInfo   submitInfo{.waitSemaphoreCount   = 1,
+                                  .pWaitSemaphores      = &*presentCompleteSemaphore,
+                                  .pWaitDstStageMask    = &waitDestinationStageMask,
+                                  .commandBufferCount   = 1,
+                                  .pCommandBuffers      = &*commandBuffer,
+                                  .signalSemaphoreCount = 1,
+                                  .pSignalSemaphores    = &*renderFinishedSemaphore};
+----
+
+最初の3つのパラメータは、実行開始前に待つセマフォと、パイプラインのどのステージで待つかを指定します。画像が利用可能になるまで色の書き込みを待ちたいので、カラーアタッチメントに書き込むグラフィックスパイプラインのステージを指定しています。つまり理論上、画像がまだ利用可能でなくても、実装はすでに頂点シェーダなどの実行を始められます。`waitStages`配列の各エントリは、`pWaitSemaphores`の同じインデックスのセマフォに対応します。
+
+次のパラメータは、実際に実行のために投入するコマンドバッファを指定します。持っている単一のコマンドバッファを投入するだけです。
+
+`pSignalSemaphores`パラメータは、コマンドバッファの実行が終わったときにシグナルするセマフォを指定します。今回はその目的で`renderFinishedSemaphore`を使います。
+
+[,c++]
+----
+queue.submit(submitInfo, *drawFence);
+----
+
+これで`vk::raii::Queue::submit`を使ってコマンドバッファをグラフィックスキューに投入できます。関数は効率のため、作業量がはるかに大きい場合に備えて`vk::SubmitInfo`構造体の配列を引数に取ります。最後のパラメータは、コマンドバッファの実行が終わったときにシグナルされる省略可能なフェンスを参照します。これによりコマンドバッファの再利用が安全なときが分かるので、次のフレームで待つ`*drawFence`を渡したいです。
+
+== サブパス依存関係
+
+この節は省略可能で、必要以上に明示的です。
+
+レンダーパス内のサブパスがイメージレイアウト遷移を自動的に処理することを思い出してください。これらの遷移は_サブパス依存関係_で制御され、サブパス間のメモリと実行の依存関係を指定します。いまはサブパスが1つだけですが、このサブパスの直前と直後の操作も暗黙の「サブパス」とみなされます。
+
+レンダーパスの開始時と終了時の遷移を処理する組み込みの依存関係が2つありますが、前者は正しいタイミングで起きません。遷移がパイプラインの開始時に起きると仮定していますが、その時点ではまだ画像を取得していません。この問題への対処は2通りあります。`presentCompleteSemaphore`の`waitStages`を`vk::PipelineStageFlagBits::eTopOfPipe`に変えて、画像が利用可能になるまでレンダーパスが始まらないようにするか、レンダーパスに`vk::PipelineStageFlagBits::eColorAttachmentOutput`ステージを待たせます。ここでは2つ目の選択肢にしました。サブパス依存関係とその仕組みを見る良い口実になるからです。
+
+サブパス依存関係は`vk::SubpassDependency`構造体で指定します。`createRenderPass`関数に行き、1つ追加します。
+
+[,c++]
+----
+vk::SubpassDependency dependency{
+    .srcSubpass    = vk::SubpassExternal,
+    .dstSubpass    = 0}
+----
+
+最初の2つのフィールドは、依存関係と依存されるサブパスのインデックスを指定します。特別な値`vk::SubpassExternal`は、`srcSubpass`か`dstSubpass`のどちらに指定するかによって、レンダーパスの前または後の暗黙のサブパスを指します。インデックス`0`は私たちのサブパス、つまり最初で唯一のものを指します。依存グラフの循環を防ぐため、`dstSubpass`は常に`srcSubpass`より大きくなければなりません（サブパスの一方が`vk::SubpassExternal`でない限り）。
+
+[,c++]
+----
+vk::SubpassDependency dependency{
+    .srcSubpass    = vk::SubpassExternal,
+    .dstSubpass    = 0,
+    .srcStageMask  = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+    .dstStageMask  = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+    .srcAccessMask = vk::AccessFlagBits::eNone,
+    .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite};
+----
+
+次の2つのフィールドは、待つ操作と、この待ちをすべき操作がカラーアタッチメントステージにあることを指定します。最後の2つのフィールドは、これらの操作が起きるステージを指定し、カラーアタッチメントへの書き込みに関わります。アクセスする前に、スワップチェーンが画像からの読み取りを終えるのを待つ必要があります。これはカラーアタッチメント出力ステージ自体を待つことで達成できます。
+
+これらの設定により、実際に必要（かつ許可）なとき、つまり色を書き込み始めたいときまで遷移が起きなくなります。
+
+[,c++]
+----
+renderPassInfo.dependencyCount = 1;
+renderPassInfo.pDependencies = &dependency;
+----
+
+`vk::RenderPassCreateInfo`構造体には、依存関係の配列を指定するフィールドが2つあります。
+
+以上は完全に省略可能で、link:/attachments/15_hello_triangle.cpp[デモコード]には再現されていません。
+
+== プレゼンテーション
+
+フレーム描画の最後のステップは、最終的に画面に表示されるよう結果をスワップチェーンに戻すことです。プレゼンテーションは`drawFrame`関数の末尾で`vk::PresentInfoKHR`構造体を通じて構成します。
+
+[,c++]
+----
+const vk::PresentInfoKHR presentInfoKHR{
+    .waitSemaphoreCount = 1,
+    .pWaitSemaphores    = &*renderFinishedSemaphore,
+    .swapchainCount     = 1,
+    .pSwapchains        = &*swapChain,
+    .pImageIndices      = &imageIndex};
+----
+
+最初の2つのパラメータは、プレゼンテーションが起きる前に待つセマフォを指定し、`vk::SubmitInfo`と同様です。コマンドバッファの実行完了、つまり三角形の描画を待ちたいので、シグナルされるセマフォを取り、それらを待ちます。したがって`renderFinishedSemaphore`を使います。
+
+次の2つのパラメータは、画像をプレゼンテーションするスワップチェーンと、各スワップチェーンの画像インデックスを指定します。ほぼ常に1つです。
+
+[,c++]
+----
+presentInfo.pResults = nullptr; // Optional
+----
+
+最後に省略可能なパラメータ`pResults`があります。各スワップチェーンについてプレゼンテーションが成功したかを確認する`vk::Result`値の配列を指定できます。スワップチェーンが1つだけなら、present関数の戻り値を使えるため必要ありません。
+
+[,c++]
+----
+result = queue.presentKHR(presentInfoKHR);
+----
+
+`vk::raii::Queue::presentKHR`関数は、スワップチェーンへの画像プレゼンテーション要求を投入します。`vk::raii::SwapchainKHR::acquireNextImage`と`vk::raii::Queue::presentKHR`のエラー処理は次の章で追加します。これまでの関数と違い、失敗しても必ずしもプログラムを終了すべきとは限らないからです。
+
+ここまで正しくできていれば、プログラムを実行すると次のようなものが見えるはずです。
+
+image::/images/triangle.png[]
+
+____
+この色付き三角形は、グラフィックスチュートリアルで見慣れたものと少し違うかもしれません。本チュートリアルではシェーダが線形色空間で補間し、その後sRGB色空間に変換するためです。
+____
+
+やった！残念ながら、バリデーションレイヤが有効だと、閉じた途端にプログラムがクラッシュすることに気づくでしょう。`debugCallback`からターミナルに出力されるメッセージがその理由を教えてくれます。
+
+image::/images/semaphore_in_use.png[]
+
+`drawFrame`内の操作はすべて非同期であることを思い出してください。つまり、`mainLoop`のループを抜けたとき、描画とプレゼンテーション操作がまだ続いていることがあります。それが起きている間にリソースをクリーンアップするのは悪い考えです。
+
+その問題を直すには、`mainLoop`を抜けてウィンドウを破棄する前に、論理デバイスの操作完了を待つべきです。
+
+[,c++]
+----
+void mainLoop() {
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        drawFrame();
+    }
+
+    device.waitIdle();
+}
+----
+
+特定のコマンドキューの操作完了を`vk::raii::Queue::waitIdle`で待つこともできます。これらの関数は非常に原始的な同期の方法として使えます。ウィンドウを閉じても、プログラムは問題なく終了するようになるでしょう。
+
+== まとめ
+
+500行強のコードのあと、ついに画面に何かが現れる段階に到達しました。Vulkanプログラムのブートストラップは確かに多くの作業ですが、持ち帰ってほしいのは、Vulkanが明示性を通じて膨大な制御を与えてくれることです。いまコードを読み直し、プログラム内のすべてのVulkanオブジェクトの目的と、それらがどう関係するかのメンタルモデルを築く時間を取ることをおすすめします。この先はその知識の上に、プログラムの機能を拡張していきます。
+
+また将来の章では、タイムラインセマフォとメモリバリアについて話し、Vulkanの同期の理解をさらに深めます。同期はVulkanの真の力を活かす最大の領域の一つなので、かなり複雑です。最初のうちは理解が難しいですが、次に来るものの本当の基盤です。ツールボックスにもっときめ細かいことをするための道具が増えると、ここからは本当に楽になります。
+
+xref:./03_Frames_in_flight.adoc[次の章]では、複数のフレームインフライトを扱うようレンダーループを拡張します。
+
+link:/attachments/15_hello_triangle.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

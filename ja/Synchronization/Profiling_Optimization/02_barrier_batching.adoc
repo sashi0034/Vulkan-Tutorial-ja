@@ -1,0 +1,52 @@
+:pp: {plus}{plus}
+= バリアのバッチ化: 同期の集約
+
+== 呼び出しのコスト
+
+`commandBuffer.pipelineBarrier2` を呼ぶたびに、CPU コードから Vulkan ドライバへの往復をしています。ドライバは次に `vk::DependencyInfo` をパースし、ステージとアクセスマスクを検証し、実際のハードウェア命令をコマンドバッファへ記録しなければなりません。
+
+遷移させるイメージが十個あり、十個の個別バリアを記録すると、十回のドライバ往復を行っています。このオーバーヘッドは、多くのパスがある複雑なフレームでは特に積み上がり得ます。
+
+== 解決策: バッチ化
+
+**バリアのバッチ化** は、すべてのグローバル・イメージ・バッファバリアを集め、単一の `pipelineBarrier2` 呼び出しでサブミットする実践です。同期コードの CPU オーバーヘッドを減らす最も簡単な方法の一つです。
+
+`vk::DependencyInfo` 構造体はまさにこのため設計されています。各タイプのバリアの配列を渡せます。
+
+[,cpp]
+----
+std::vector<vk::ImageMemoryBarrier2> imageBarriers = { /* ... multiple image transitions ... */ };
+vk::MemoryBarrier2 globalBarrier = { /* ... a broad memory dependency ... */ };
+
+auto dependencyInfo = vk::DependencyInfo{
+    .memoryBarrierCount = 1,
+    .pMemoryBarriers = &globalBarrier,
+    .imageMemoryBarrierCount = static_cast<uint32_t>(imageBarriers.size()),
+    .pImageMemoryBarriers = imageBarriers.data()
+};
+
+// One call into the driver instead of many
+commandBuffer.pipelineBarrier2(dependencyInfo);
+----
+
+== ハードウェア上の利点
+
+バッチ化は CPU オーバーヘッドの削減だけではありません。GPU でも大きな利点があります。単一の呼び出しで複数のバリアを渡すと、ドライバはキャッシュフラッシュとパイプラインストールを集約できます。
+
+パイプラインをストールさせキャッシュを五回別々にフラッシュする代わりに、ハードウェアは潜在的に一度にすべて行えます。これにより GPU が待つ総時間が減り、レンダリングに費やす時間が増えます。
+
+== 実装戦略
+
+エンジンの良い戦略は、パス全体を通じてバリアを集める「バリアマネージャ」を持つことです。同期点——例えば G-Buffer パスの終わり——に達したら、マネージャは集めたすべてのバリアを単一のバッチでフラッシュします。
+
+個々のバリアではなくバッチの観点で考えることで、同期へのより「全体的」なアプローチへ移り、レンダラに複雑さを追加してもエンジンが高性能を保つことを保証できます。次の節では、これらの最適化の影響を可視化するためにプロファイリングツールをどう使うかを見ます。
+
+== Simple Engine: 集約
+
+`Simple Engine` では、このバリアバッチ化の原則を `Renderer::Render` ループに適用しています。例えば、**不透明パス** から **ポストプロセス** への遷移では、シーンカラーとデプスバッファ用のものも含め、必要なすべてのイメージバリアを単一の `vk::DependencyInfo` に集めます。
+
+`Simple Engine` の将来バージョンで計画している最適化の一つは、これをさらに集中化することです。すべてのシステム（Renderer、Physics、Audio）からバリアを集める「バリアマネージャ」を実装することで、フレームあたりの `pipelineBarrier2` 呼び出しの総数を減らせます。これは完全な **レンダーグラフ** システムへのロードマップの重要な一部で、すべての同期が各フレームでグローバルに計算され、冗長なバリアを出さず、すべての遷移が最大ハードウェア性能のためにバッチされることを保証します。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Profiling_Optimization/01_introduction.adoc[はじめに] | 次へ: xref:Synchronization/Profiling_Optimization/03_visualizing_stalls.adoc[ストールの可視化]

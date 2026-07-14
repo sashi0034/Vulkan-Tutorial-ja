@@ -1,0 +1,31 @@
+= SIGGRAPH 2026: 2026 年における Vulkan アプリケーションの書き方 - 帰属表示
+
+このフォルダには、「SIGGRAPH 2026: How to write a Vulkan application in 2026」の教材が含まれています。
+
+SIGGRAPH ページ:
+- https://s2026.conference-schedule.org/presentation/?id=gensub_276&sess=sess202
+
+セッション詳細（SIGGRAPH の掲載より）:
+
+- コースタイトル: How to write a Vulkan application in 2026
+- コース日時: Wed Jul 22, 9am-12:15pm PDT
+- コース場所: Petree D
+- 関心分野: Gaming & Interactive
+- キーワード: Education, Games, Real-Time, Rendering
+
+著者／発表者:
+
+- Iago Calvo Lista（Arm）
+- Jose Emilio Muñoz Lopez（Arm）
+- Ralph Potter（Samsung & Khronos Group）
+
+共著者:
+
+- Elvar Unnthorsson（Arm）
+
+帰属表示:
+
+- ここでの教材の流れとコース内容は、上記 SIGGRAPH 2026 コースから適応したものです。本資料を参照または再利用する際は、上記の著者を引用してください。
+- Vulkan エコシステムへの無数のオープンソース貢献者、ならびに本コースを可能にした vk-bootstrap や Vulkan-Hpp などのライブラリを含む、すべての Khronos Group メンバーに感謝します。
+
+公式の SIGGRAPH 掲載（タイトル、時間、場所、発表者）と食い違いがある場合は、帰属表示を速やかに修正できるよう issue を開いてください。

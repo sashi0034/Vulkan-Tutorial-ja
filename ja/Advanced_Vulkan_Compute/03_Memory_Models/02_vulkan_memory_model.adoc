@@ -1,0 +1,68 @@
+:pp: {plus}{plus}
+
+= Vulkan Memory Model: Availability、Visibility、Domain 操作
+
+GPU では、複数のコンピュートユニットをまたいで何千ものスレッドが並行実行し、それぞれが独自の階層キャッシュ（L1 - Level 1、L2 - Level 2 など）を持ちます。そのため、バッファに値を書いて別のスレッドがすぐに見ることを期待するだけでは不十分です。
+
+代わりに、デバイスのある部分が書いたデータが別の部分に利用可能かつ可視であることを保証するための形式的なプロトコルに従う必要があります。このプロトコルは **Vulkan Memory Model** で定義されています。
+
+== 同期の 3 本柱
+
+2 つの異なる操作間でデータを共有したいとき（例: あるスレッドの書き込みと別スレッドの読み取り）、**Happens-Before** 関係を確立する必要があります。これは次の 3 つの異なる操作を通じて行われます。
+
+1.  **Availability 操作**: ローカルキャッシュに書かれたデータを、他の操作がアクセスできるドメインへ「押し出す」ことを保証します。キャッシュのフラッシュと考えてください。
+2.  **Visibility 操作**: 共有ドメインで利用可能になったデータを、読む必要があるスレッドのローカルキャッシュへ「引き込む」ことを保証します。ローカルキャッシュを無効化し、新しいデータを読むよう強制すると考えてください。
+3.  **Memory Domain**: Availability と Visibility 操作が出会う共通の「待ち合わせ場所」です（通常は L2 キャッシュまたは VRAM）。
+
+=== データの流れ
+
+[source,text]
+----
+Thread A (Write) -> Availability Operation (Make Available)
+                            |
+                     [Memory Domain]
+                            |
+Thread B (Read)  <- Visibility Operation (Make Visible)
+----
+
+== Happens-Before と実行バリア
+
+「Happens-Before」関係は、実行バリア（`vkCmdPipelineBarrier2` など）で 2 つの操作を同期するときに確立されます。このバリアは次を指定します。
+
+*   **srcStageMask/dstStageMask**: 次のステージが始まる前に完了しなければならないパイプラインのステージ。
+*   **srcAccessMask/dstAccessMask**: 行われているメモリ操作（書き込み対読み取り）。
+
+Vulkan 1.4 では、これらのマスクは **Synchronization 2** で簡素化・統一されており、本チュートリアル全体でこれを使います。たとえば、2 つのコンピュートディスパッチ間のバリアは次のようになります。
+
+[source,cpp]
+----
+vk::BufferMemoryBarrier2 bufferBarrier {
+    .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+    .srcAccessMask = vk::AccessFlagBits2::eShaderWrite, // Availability
+    .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead   // Visibility
+};
+
+vk::DependencyInfo dependencyInfo {
+    .bufferMemoryBarrierCount = 1,
+    .pBufferMemoryBarriers = &bufferBarrier
+};
+// ...
+commandBuffer.pipelineBarrier2(dependencyInfo);
+----
+
+== なぜ気にする必要があるか
+
+これらのステップを飛ばすと、ある GPU では動いているように見えて別の GPU では失敗するカーネルになり得ます。アーキテクチャごとにキャッシュコヒーレンシ戦略が異なるためです。NVIDIA のキャッシュは AMD や Intel と振る舞いが違うことがあり——ユニファイドメモリとオンチップタイルバッファを持つ Arm や Qualcomm のモバイルタイルベース GPU はまた別です。適切なバリアなしでディスクリートデスクトップカードで「たまたま動く」カーネルは、特にスマートフォンで壊れやすいです。メモリモデルはモバイルでは*より*重要であり、軽視してよいものではありません。ユニファイドメモリデバイスでのリードバック規律は xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/02_android_compute.adoc[Android 上のコンピュート] で扱います。
+
+Vulkan Memory Model は、必要なことをドライバに正確に伝える手段です。ドライバはデータを安全に保ちつつ性能を犠牲にしない最小のハードウェア命令セットを発行できます。
+
+== データ競合と未定義動作
+
+2 つのスレッドが同じメモリ位置にアクセスし、少なくとも一方が書き込みで、「Happens-Before」関係で同期されていない場合、**データ競合（Data Race）** です。
+
+Vulkan では、データ競合は**未定義動作**になります。間違った値を得るだけではありません。古いデータや部分更新されたデータを読むことも、競合が範囲外アクセスや不正なポインタにつながれば GPU クラッシュもあり得ます。
+
+次に、グローバル VRAM よりはるかに高速な **共有メモリ（LDS）** にこれらの概念をどう適用するかを見ます。
+
+xref:Advanced_Vulkan_Compute/03_Memory_Models/01_introduction.adoc[前へ: はじめに] | xref:Advanced_Vulkan_Compute/03_Memory_Models/03_shared_memory_lds.adoc[次へ: 共有メモリ（LDS）]

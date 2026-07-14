@@ -1,0 +1,330 @@
+:pp: {plus}{plus}
+
+= まとめ
+
+部品は扱いました: ハードコード実行、レイヤ抽象化、グラフ表現、モデル形式。ここではそれらを完全に動作する推論エンジンにつなぎます。
+
+本章では、学習済み MNIST モデルの読み込みから推論実行、予測取得までの全パイプラインを説明します。主要概念を説明しつつ、添付の動作コードを参照します。
+
+== 高レベルフロー
+
+推論実行時に起きることは次のとおりです。
+
+**初期化**（1 回）:
+
+1. ONNX ファイルからモデルを読み込む
+2. ComputationGraph にパースする
+3. すべてのテンソル用 GPU バッファを割り当てる
+4. 学習済み重みを GPU にアップロードする
+5. 各演算型用パイプラインを作成する
+
+**推論**（入力ごと）:
+
+1. 入力画像を GPU にアップロードする
+2. 依存順に演算を実行する
+3. GPU から出力確率をダウンロードする
+4. 結果を解釈する（どの数字が予測されたか）
+
+初期化は起動時に 1 回です。推論は何度も——バッチ処理では秒あたり数千回——実行されます。
+
+== 読み込みとパース
+
+エントリポイントは次のようになります。
+
+[source,cpp]
+----
+class InferenceEngine {
+public:
+    void loadModel(const std::string& onnxPath) {
+        // Parse ONNX file
+        onnx::ModelProto onnxModel = parseONNX(onnxPath);
+
+        // Build our graph representation
+        graph_ = buildGraphFromONNX(onnxModel);
+
+        // Analyze execution order
+        executionOrder_ = computeTopologicalSort(graph_);
+
+        // Allocate GPU resources
+        allocateBuffers(graph_);
+        uploadWeights(graph_);
+        createPipelines(graph_);
+    }
+
+private:
+    ComputationGraph graph_;
+    std::vector<std::shared_ptr<Operation>> executionOrder_;
+    // Vulkan resources...
+};
+----
+
+`buildGraphFromONNX` は前章で述べたことを行います: ONNX ノードを走査し、Operation を作成し、Tensor を接続します。結果は ComputationGraph です。
+
+`computeTopologicalSort` が実行順序を決めます。MNIST では逐次: レイヤ 1、2、3 です。スキップ接続のある ResNet では、トポロジカルソートが複雑さを自動処理します。
+
+== バッファ割り当て
+
+各テンソルに GPU バッファが必要です。中間活性化（レイヤ出力）には新規バッファを割り当てます。重みにはバッファを割り当て、直ちにデータをアップロードします。
+
+[source,cpp]
+----
+void allocateBuffers(const ComputationGraph& graph) {
+    for (const auto& op : graph.operations()) {
+        // Allocate output buffers
+        for (const auto& output : op->outputs()) {
+            size_t size = calculateTensorSize(output);
+
+            vk::BufferCreateInfo bufferInfo{
+                .size = size,
+                .usage = vk::BufferUsageFlagBits::eStorageBuffer
+            };
+            auto buffer = device_.createBuffer(bufferInfo);
+
+            // Allocate and bind memory
+            auto memory = allocateMemory(buffer, /* host visible or device local */);
+            buffer.bindMemory(*memory, 0);
+
+            output->setBuffer(std::move(buffer));
+        }
+    }
+}
+----
+
+簡略化です——本番コードは重ならないテンソル向けにバッファ再利用のメモリ計画を行い、使用量を減らします。基本思想は同じ: 各テンソルにバッファです。
+
+== パイプライン作成
+
+各演算型にコンピュートパイプラインが必要です。事前に作成します。
+
+[source,cpp]
+----
+void createPipelines(const ComputationGraph& graph) {
+    // Gather unique operation types
+    std::set<OpType> types;
+    for (const auto& op : graph.operations()) {
+        types.insert(op->type());
+    }
+
+    // Create pipeline for each type
+    for (OpType type : types) {
+        const char* shaderPath = getShaderPath(type);
+        auto shaderModule = loadShader(shaderPath);
+
+        vk::ComputePipelineCreateInfo pipelineInfo{
+            .stage = {
+                .stage = vk::ShaderStageFlagBits::eCompute,
+                .module = *shaderModule,
+                .pName = "main"
+            },
+            .layout = *pipelineLayout_
+        };
+
+        pipelines_[type] = device_.createComputePipeline(nullptr, pipelineInfo);
+    }
+}
+----
+
+Dense 演算を実行するとき Dense パイプラインをバインドします。Conv2D なら Conv2D パイプラインです。マッピングは自動です。
+
+== 推論ループ
+
+すべて初期化済みなら、推論実行は単純です。
+
+[source,cpp]
+----
+std::vector<float> infer(const std::vector<float>& inputData) {
+    // Upload input
+    auto inputTensor = graph_.inputs()[0];
+    uploadToBuffer(inputTensor->buffer(), inputData);
+
+    // Execute operations
+    vk::CommandBufferBeginInfo beginInfo;
+    cmdBuffer_.begin(beginInfo);
+
+    for (const auto& op : executionOrder_) {
+        executeOperation(cmdBuffer_, op);
+
+        // Barrier between operations
+        insertMemoryBarrier(cmdBuffer_);
+    }
+
+    cmdBuffer_.end();
+
+    // Submit and wait
+    vk::SubmitInfo submitInfo{
+        .commandBufferCount = 1,
+        .pCommandBuffers = &*cmdBuffer_
+    };
+    queue_.submit(submitInfo, fence_);
+    device_.waitForFences(*fence_, true, UINT64_MAX);
+
+    // Download output
+    auto outputTensor = graph_.outputs()[0];
+    return downloadFromBuffer(outputTensor->buffer(), outputTensor->elementCount());
+}
+----
+
+`executeOperation` は演算型を見て、適切なパイプラインをバインドし、入出力バッファを指すディスクリプタを設定し、パラメータをプッシュし、ディスパッチします。
+
+[source,cpp]
+----
+void executeOperation(vk::CommandBuffer& cmd, const Operation& op) {
+    // Bind pipeline for this operation type
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipelines_[op.type()]);
+
+    // Create and bind descriptor set
+    auto descriptorSet = createDescriptorSet(op);
+    cmd.bindDescriptorSets(/*...*/);
+
+    // Push constants (dimensions, parameters)
+    auto params = buildPushConstants(op);
+    cmd.pushConstants(/*...*/, params);
+
+    // Dispatch
+    auto workgroups = calculateWorkgroups(op);
+    cmd.dispatch(workgroups.x, workgroups.y, workgroups.z);
+}
+----
+
+各演算は入出力（グラフ接続）を知っています。それらのバッファをディスクリプタとしてバインドし、パラメータを設定し、ディスパッチします。
+
+== MNIST の実行
+
+実際の動作を見ましょう。
+
+[source,cpp]
+----
+int main() {
+    // Initialize Vulkan
+    VulkanContext vulkan;
+
+    // Create inference engine
+    InferenceEngine engine(vulkan);
+    engine.loadModel("mnist_model.onnx");
+
+    // Load test image
+    auto image = loadImage("test_digit_7.png");  // 28x28 grayscale
+    std::vector<float> input = preprocessImage(image);  // Normalize to [0,1]
+
+    // Run inference
+    auto output = engine.infer(input);  // Returns 10 probabilities
+
+    // Find prediction
+    int predicted = std::max_element(output.begin(), output.end()) - output.begin();
+    float confidence = output[predicted];
+
+    std::cout << "Predicted: " << predicted << "\n";
+    std::cout << "Confidence: " << (confidence * 100) << "%\n";
+
+    return 0;
+}
+----
+
+出力:
+
+[source]
+----
+Predicted: 7
+Confidence: 99.8%
+----
+
+動きます。PyTorch で学習し ONNX にエクスポートし、エンジンに読み込み、Vulkan コンピュートで実行したモデルが、手書き数字を正しく予測します。
+
+== PyTorch との検証
+
+推論が正しいとどう知るか？ 参照実装と比較します。
+
+[source,python]
+----
+import torch
+from train_mnist import MNISTNet
+
+# Load model
+model = MNISTNet()
+model.load_state_dict(torch.load('mnist_model.pth'))
+model.eval()
+
+# Load same test image
+image = load_test_image('test_digit_7.png')
+
+# Run PyTorch inference
+with torch.no_grad():
+    pytorch_output = model(image).numpy()
+
+# Load our engine's output
+our_output = np.loadtxt('vulkan_output.txt')
+
+# Compare
+diff = np.abs(pytorch_output - our_output)
+print(f"Max difference: {np.max(diff):.6f}")
+print(f"Mean difference: {np.mean(diff):.6f}")
+----
+
+出力:
+
+[source]
+----
+Max difference: 0.000012
+Mean difference: 0.000003
+----
+
+出力は浮動小数精度内で一致します。実装は正しいです。
+
+== 性能
+
+中級 GPU（NVIDIA RTX 3060）での MNIST 推論:
+
+- **初回実行（コールド）**: 約 5ms（パイプラインコンパイル含む）
+- **以降の実行**: 約 0.3ms（実行のみ）
+- **100 件バッチ**: 約 8ms（80 推論/ms、大規模並列）
+
+小さな MNIST ネットワークには GPU は過剰です。しかしパターンはスケールします——同じコードで ResNet-50 推論を 15ms で実行でき、CPU では 150ms かかります。
+
+== 構築したもの
+
+次を手に入れました。
+
+**動作する推論エンジン**——ONNX モデルを読み込み Vulkan コンピュートで実行します。
+
+**きれいな抽象化**——モデル表現（ComputationGraph）、実行（演算ディスパッチ）、リソース管理（バッファ、パイプライン）を分離します。
+
+**検証可能な正しさ**——PyTorch 出力と浮動小数精度で一致します。
+
+**拡張性**——新しいレイヤ型の追加が容易——シェーダを実装し、ファクトリに case を追加すれば完了です。
+
+完全な実装は `attachments/ml_inference` にあります。主要ファイル:
+
+- `vulkan_mnist_inference.cpp`: メイン推論エンジン
+- `weight_loader.hpp`: 単純なバイナリ重み形式（ONNX パース前）
+- `mnist_inference.cpp`: エンジン使用例
+- `shaders/`: 各レイヤ型のコンピュートシェーダ
+
+== 制限と今後の課題
+
+これは教育用実装です。本番エンジンには次が必要です。
+
+**より多くの演算子**: Dense、Conv2D、ReLU、MaxPool をサポート。実モデルは BatchNorm、Softmax、Reshape、Concat など数十種を使います。
+
+**最適化**: 演算子融合（複数演算を 1 シェーダに結合）、メモリ計画（バッファ再利用）、FP16/INT8 量子化。
+
+**より良いエラー処理**: 検証、graceful な失敗、有用なエラーメッセージ。
+
+**バッチングサポート**: 複数入力を並列処理し、GPU 利用率を最大化。
+
+しかし中核アーキテクチャは健全です。これらの追加は拡張であり、根本的変更ではありません。拡張可能な動作基盤があります。
+
+== 結論
+
+ハードコードされた順伝播から始め、パターンを特定し、抽象化を構築し、柔軟な推論エンジンで終わりました。その過程で学んだこと:
+
+- ニューラルネットワークの実行方法（レイヤを通る順伝播）
+- ネットワークの表現方法（テンソルと演算のグラフ）
+- モデル形式の仕組み（ONNX と TFLite の構造）
+- レイヤを Vulkan コンピュートシェーダとして実装する方法
+- 適切な同期で実行をオーケストレーションする方法
+
+これが ML 推論を深く理解する知識です。ONNX Runtime を使う場合でも、カスタムソリューションを構築する場合でも、特定ハード向けに性能を最適化する場合でも役立ちます。
+
+コードは添付にあります。コンパイルし、実行し、変更してください。新しいレイヤ型を追加し、別モデルを試し、性能をプロファイルし、壊して直す。それが真に学ぶ方法です。
+
+xref:ML_Inference/Building_the_Inference_Engine/06_nnef_introduction.adoc[前へ: NNEF 入門] | xref:ML_Inference/Debugging_and_Performance/01_introduction.adoc[次へ: デバッグと性能]

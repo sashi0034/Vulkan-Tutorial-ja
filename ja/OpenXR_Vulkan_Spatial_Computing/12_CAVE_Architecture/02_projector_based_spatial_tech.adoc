@@ -1,0 +1,66 @@
+:pp: {plus}{plus}
+= プロジェクタベースの空間アーキテクチャ
+
+ヘッドセットから **CAVE**（Cave Automatic Virtual Environment）へ移行すると、「カメラ」は固定された物理面——壁——になり、ユーザーはその *内部* を動きます。これには高度に専門化された **オフアクシス投影（Off-Axis Projection）** ロジックが必要です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+標準的な HMD ランタイムは、固定面の CAVE 環境向けには設計されていません。Vulkan のフラスタムとマルチデバイス同期に対する低レベル制御を使い、これらの専門的な空間アーキテクチャを実装し、しばしば標準 HMD トラッキングモデルを迂回してカスタムのクラスタベースレンダリングを採用します。
+
+== 観測者のパラドックス: 一つの視点、多くの画面
+
+CAVE レンダリングを理解するには、次のパラドックスを受け入れる必要があります: **3D シーンは一人に対してのみ正しい**。
+
+物理壁は固定されているため、ユーザーが左へ動くと、新しい視点から奥行きの錯覚を保つために、正面壁の画像を歪ませなければなりません。これが **オフアクシス投影** です。
+
+1.  **固定ディスプレイ**: 投影面（壁）は決して動かない。
+2.  **動く目**: ユーザーの目（視点）は常に動く。
+3.  **結果**: 「視界のピラミッド」（フラスタム）は強く非対称で、ユーザー位置に基づき毎フレームスキューが変わる。
+
+== オフアクシスフラスタムの計算
+
+これを計算するには、物理壁をカメラの「ニア平面」として扱います。トラッキングされた目から壁の四隅を通るフラスタムを計算します。
+
+[source,cpp]
+----
+// A representation of a physical projection wall in our engine using designated initializers
+struct ProjectionWall {
+    glm::vec3 bottomLeft;
+    glm::vec3 bottomRight;
+    glm::vec3 topLeft;
+};
+
+// Configure the rendering info for a specific wall view
+vk::RenderingInfo wallRenderingInfo{
+    .renderArea = {{0, 0}, {wallWidth, wallHeight}},
+    .layerCount = 1,
+    .colorAttachmentCount = 1,
+    .pColorAttachments = &colorAttachment
+};
+----
+
+ランタイム（または Monado のようなラッパー）は、各ノードが担当する特定の `viewID` だけを描画し、「Warp and Blend」メッシュ経由でプロジェクタのキーストンを補正することを保証します。
+
+== 分散レンダリングモデル: リーダーとフォロワー
+
+5 面 CAVE を 4K 解像度で駆動するには莫大な GPU パワーが必要で、通常はコンピュータの **クラスタ** を使います。
+
+*   **リーダーノード**: メインシミュレーション、物理、入力処理を実行し、ワールド状態をフォロワーへブロードキャストする。
+*   **フォロワーノード**: **決定論的シミュレーション** を行い、ワールド状態をリーダーに合わせて更新し、割り当てられた壁だけを描画する。
+
+== 発展: マルチデバイス同期とカラーバランシング
+
+Vulkan は、標準 XR API がネイティブに扱わない水準の協調を可能にします。
+
+*   **マルチデバイスバッファスワップ**: Vulkan の **External Semaphores** と **Fences** を使い、マルチ GPU プロジェクタクラスタ全体でレンダリングを同期し、すべての GPU がまさに同じハードウェアクロック周期でバッファをスワップすることを保証する。
+*   **大域照明の一貫性**: Vulkan の **Query Pools** で各プロジェクタの輝度をサンプリングし、エンジンのライティングを動的に調整して、すべての壁で均一な視覚環境を確保する。
+
+== 決定論は必須
+
+クラスタでは、すべてのコンピュータがワールド状態に合意しなければなりません。パーティクルシステムがノード間で異なる乱数シードを使うと、没入感が壊れます。すべての「ランダム」または「時間ベース」の要素は、ネットワーク全体で同期されなければなりません。
+
+TIP: CAVE および大規模空間システムの詳細については、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#spaces[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/12_CAVE_Architecture/01_introduction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/12_CAVE_Architecture/03_hardware_sync.adoc[Next]

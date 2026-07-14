@@ -1,0 +1,522 @@
+:pp: {plus}{plus}
+
+= 深度バッファリング
+
+== はじめに
+
+これまで扱ってきたジオメトリは 3D に投影されていますが、まだ完全に平坦です。
+この章では、3D メッシュに備えて位置に Z 座標を追加します。
+この第 3 の座標を使って、現在の正方形の上にもう一つの正方形を置き、ジオメトリが
+深度でソートされていないときに生じる問題を見ていきます。
+
+== 3D ジオメトリ
+
+`Vertex` 構造体を変更して位置に 3D ベクトルを使い、対応する
+`vk::VertexInputAttributeDescription` の `format` を更新します。
+
+[,c++]
+----
+struct Vertex {
+    glm::vec3 pos;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+    ...
+
+    static std::array<vk::VertexInputAttributeDescription, 3> getAttributeDescriptions() {
+        return {
+            vk::VertexInputAttributeDescription(0, 0, vk::Format::eR32G32B32Sfloat, offsetof(Vertex, pos)),
+            vk::VertexInputAttributeDescription(1, 0, vk::Format::eR32G32B32Sfloat, offsetof(Vertex, color)),
+            vk::VertexInputAttributeDescription(2, 0, vk::Format::eR32G32Sfloat, offsetof(Vertex, texCoord))
+        };
+
+        ...
+    }
+};
+----
+
+次に、頂点シェーダを更新して、`inPosition` の型を `float2` から `float3` に
+変更し、3D 座標を入力として受け取り変換するようにします。
+
+[,glsl]
+----
+struct VSInput {
+    float3 inPosition;
+    ...
+};
+
+...
+
+[shader("vertex")]
+VSOutput vertMain(VSInput input) {
+    VSOutput output;
+    output.pos = mul(ubo.proj, mul(ubo.view, mul(ubo.model, float4(input.inPosition, 1.0))));
+    output.fragColor = input.inColor;
+    output.fragTexCoord = input.inTexCoord;
+    return output;
+}
+----
+
+その後、シェーダを再コンパイルすることを忘れないでください！
+
+最後に、`vertices` コンテナを更新して Z 座標を含めます。
+
+[,c++]
+----
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
+};
+----
+
+今アプリケーションを実行すると、以前とまったく同じ結果が見えるはずです。
+シーンをより興味深くし、この章で取り組む問題を示すために、追加のジオメトリを
+加えるときです。
+頂点を複製して、現在の正方形のすぐ下に正方形の位置を次のように定義します。
+
+image::/images/extra_square.svg[]
+
+Z 座標に `-0.5f` を使い、追加の正方形用の適切なインデックスを追加します。
+
+[,c++]
+----
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
+
+    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
+};
+
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4
+};
+----
+
+今プログラムを実行すると、エッシャーのイラストのようなものが見えるでしょう。
+
+image::/images/depth_issues.png[]
+
+問題は、下の正方形のフラグメントが上の正方形のフラグメントの上に描画されていることです。
+単にインデックス配列で後から来るからです。
+これを解決する方法は 2 つあります。
+
+* すべての描画呼び出しを奥から手前へ深度でソートする
+* 深度バッファを使った深度テストを使う
+
+最初のアプローチは透明オブジェクトの描画によく使われます。なぜなら、順序非依存の
+透明度は解くのが難しい課題だからです。
+しかし、フラグメントを深度で並べる問題は、_深度バッファ_ を使って解くのがはるかに一般的です。
+深度バッファは、カラーアタッチメントが各位置の色を格納するのと同様に、各位置の深度を
+格納する追加のアタッチメントです。
+ラスタライザがフラグメントを生成するたびに、深度テストは新しいフラグメントが
+前のものより近いかどうかを確認します。
+近くなければ、新しいフラグメントは破棄されます。
+深度テストに合格したフラグメントは、自身の深度を深度バッファに書き込みます。
+色出力を操作できるのと同様に、フラグメントシェーダからこの値を操作することも可能です。
+
+[,c++]
+----
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+----
+
+GLM が生成する透視投影行列は、デフォルトで OpenGL の深度範囲 `-1.0` から `1.0` を使います。
+`GLM_FORCE_DEPTH_ZERO_TO_ONE` 定義を使って、Vulkan の範囲 `0.0` から `1.0` を使うよう
+設定する必要があります。
+
+== 深度画像とビュー
+
+深度アタッチメントは、カラーアタッチメントと同様に画像に基づきます。
+違いは、スワップチェーンが深度画像を自動的に作成してくれないことです。
+一度に実行される描画操作は 1 つだけなので、必要な深度画像は 1 つだけです。
+深度画像には再び、画像、メモリ、イメージビューのリソースの三つ組が必要です。
+
+[,c++]
+----
+vk::raii::Image        depthImage       = nullptr;
+vk::raii::DeviceMemory depthImageMemory = nullptr;
+vk::raii::ImageView    depthImageView   = nullptr;
+----
+
+これらのリソースをセットアップする新しい関数 `createDepthResources` を作成します。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createCommandPool();
+    createDepthResources();
+    createTextureImage();
+    ...
+}
+
+...
+
+void createDepthResources()
+{
+}
+----
+
+深度画像の作成はかなり素直です。
+スワップチェーンのエクステントで定義されるカラーアタッチメントと同じ解像度、
+深度アタッチメントに適した画像用途、optimal タイリング、デバイスローカルメモリを
+持つべきです。
+唯一の疑問は、深度画像に適切なフォーマットは何か、です。
+フォーマットには深度コンポーネントが含まれていなければならず、`vk::Format` の
+`_D??_` で示されます。
+
+テクスチャ画像とは異なり、プログラムからテクセルに直接アクセスしないため、
+特定のフォーマットが必ずしも必要なわけではありません。
+妥当な精度があればよく、実世界のアプリケーションでは少なくとも 24 ビットが一般的です。
+この要件に合うフォーマットはいくつかあります。
+
+* `vk::Format::eD32Sfloat`: 深度用 32 ビット浮動小数点
+* `vk::Format::eD32SfloatS8Uint`: 深度用 32 ビット符号付き浮動小数点と 8 ビットステンシルコンポーネント
+* `vk::Format::eD24UnormS8Uint`: 深度用 24 ビット浮動小数点と 8 ビットステンシルコンポーネント
+
+ステンシルコンポーネントは https://en.wikipedia.org/wiki/Stencil_buffer[ステンシルテスト]
+に使われ、深度テストと組み合わせられる追加のテストです。
+これについては将来の章で見ます。
+
+単に `vk::Format::eD32Sfloat` フォーマットを選ぶこともできます。サポートが非常に一般的
+だからです（ハードウェアデータベースを参照）。しかし、可能なところではアプリケーションに
+余分な柔軟性を加えるのも良いことです。
+望ましいものから望ましくないものの順に候補フォーマットのリストを取り、サポートされている
+最初のものを確認する関数 `findSupportedFormat` を書きます。
+
+[,c++]
+----
+vk::Format findSupportedFormat(const std::vector<vk::Format>& candidates, vk::ImageTiling tiling, vk::FormatFeatureFlags features)
+{
+}
+----
+
+フォーマットのサポートはタイリングモードと用途に依存するため、これらもパラメータとして
+含める必要があります。
+フォーマットのサポートは `physicalDevice.getFormatProperties` 関数で問い合わせられます。
+
+[,c++]
+----
+for (const auto format : candidates) {
+    vk::FormatProperties props = physicalDevice.getFormatProperties(format);
+}
+----
+
+`vk::FormatProperties` 構造体には 3 つのフィールドがあります。
+
+* `linearTilingFeatures`: 線形タイリングでサポートされるユースケース
+* `optimalTilingFeatures`: optimal タイリングでサポートされるユースケース
+* `bufferFeatures`: バッファでサポートされるユースケース
+
+ここでは最初の 2 つだけが関連し、確認するものは関数の `tiling` パラメータに依存します。
+
+[,c++]
+----
+if (((tiling == vk::ImageTiling::eLinear) && ((props.linearTilingFeatures & features) == features)) ||
+    ((tiling == vk::ImageTiling::eOptimal) && ((props.optimalTilingFeatures & features) == features)))
+{
+    return format;
+}
+----
+
+候補フォーマットのいずれも望ましい用途をサポートしない場合は、特別な値を返すか、
+単に例外を投げることができます。
+
+[,c++]
+----
+vk::Format findSupportedFormat(const std::vector<vk::Format>& candidates, vk::ImageTiling tiling, vk::FormatFeatureFlags features) {
+    for (const auto format : candidates) {
+        vk::FormatProperties props = physicalDevice.getFormatProperties(format);
+
+        if (((tiling == vk::ImageTiling::eLinear) && ((props.linearTilingFeatures & features) == features)) ||
+            ((tiling == vk::ImageTiling::eOptimal) && ((props.optimalTilingFeatures & features) == features)))
+        {
+          return format;
+        }
+    }
+
+    throw std::runtime_error("failed to find supported format!");
+}
+----
+
+この関数を使って、深度アタッチメントとしての用途をサポートする深度コンポーネントを持つ
+フォーマットを選択するヘルパー関数 `findDepthFormat` を作成します。
+
+[,c++]
+----
+vk::Format findDepthFormat()
+{
+    return findSupportedFormat({vk::Format::eD32Sfloat, vk::Format::eD32SfloatS8Uint, vk::Format::eD24UnormS8Uint},
+                               vk::ImageTiling::eOptimal,
+                               vk::FormatFeatureFlagBits::eDepthStencilAttachment);
+}
+----
+
+この場合は `vk::ImageUsageFlagBits` ではなく `vk::FormatFeatureFlagBits` を使うことを
+確認してください。
+これらの候補フォーマットはすべて深度コンポーネントを含みますが、後者 2 つはステンシル
+コンポーネントも含みます。
+まだ使いませんが、これらのフォーマットの画像でレイアウト遷移を行うときはそれを
+考慮する必要があります。
+`vulkan/vulkan_format_traits.hpp` ヘッダには、`vk::hasDepthComponent` や
+`vk::hasStencilComponent` のような簡単なヘルパー関数があります。
+
+`createDepthResources` から深度フォーマットを見つける関数を呼び出します。
+
+[,c++]
+----
+vk::Format depthFormat = findDepthFormat();
+----
+
+これで、`createImage` と `createImageView` ヘルパー関数を呼び出すのに必要な情報が
+すべて揃いました。
+
+[,c++]
+----
+std::tie(depthImage, depthImageMemory) = createImage(swapChainExtent.width, swapChainExtent.height, depthFormat, vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eDepthStencilAttachment, vk::MemoryPropertyFlagBits::eDeviceLocal);
+depthImageView                         = createImageView(depthImage, depthFormat, vk::ImageAspectFlagBits::eDepth);
+----
+
+しかし、`createImageView` 関数は現在、サブリソースが常に
+`vk::ImageAspectFlagBits::eColor` であると仮定しているため、そのフィールドを
+パラメータにする必要があります。
+
+[,c++]
+----
+vk::raii::ImageView createImageView(vk::raii::Image& image, vk::Format format, vk::ImageAspectFlags aspectFlags)
+{
+    ...
+		vk::ImageViewCreateInfo viewInfo{
+        ...
+		    .subresourceRange = {.aspectMask = aspectFlags, ...}};
+    ...
+}
+----
+
+この関数へのすべての呼び出しを更新して、正しいアスペクトを使うようにします。
+
+[,c++]
+----
+swapChainImageViews.emplace_back(createImageView(image, swapChainSurfaceFormat.format, vk::ImageAspectFlagBits::eColor));
+...
+depthImageView = createImageView(depthImage, depthFormat, vk::ImageAspectFlagBits::eDepth);
+...
+textureImageView = createImageView(*textureImage, vk::Format::eR8G8B8A8Srgb, vk::ImageAspectFlagBits::eColor);
+----
+
+深度画像の作成は以上です。
+カラーアタッチメントと同様にコマンドバッファの開始時にクリアするので、マップしたり
+別の画像をコピーしたりする必要はありません。
+
+== コマンドバッファ
+
+=== クリア値
+
+`vk::AttachmentLoadOp::eClear` でクリアされるアタッチメントが複数（色と深度）になったため、
+複数のクリア値も指定する必要があります。
+`recordCommandBuffer` に行き、`clearDepth` という追加の `vk::ClearValue` 変数を
+作成して追加します。
+
+[,c++]
+----
+vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
+vk::ClearValue clearDepth = vk::ClearDepthStencilValue(1.0f, 0);
+----
+
+Vulkan における深度バッファの深度範囲は `0.0` から `1.0` で、`1.0` は遠いビュー平面、
+`0.0` は近いビュー平面にあります。
+深度バッファの各点の初期値は、最も遠い可能な深度である `1.0` であるべきです。
+
+=== ダイナミックレンダリング
+
+深度画像のセットアップができたので、`recordCommandBuffer` でそれを使う必要があります。
+これはダイナミックレンダリングの一部であり、カラー出力画像のセットアップと似ています。
+
+まず、深度画像用の新しいレンダリングアタッチメントを指定します。
+
+[,c++]
+----
+vk::RenderingAttachmentInfo depthAttachmentInfo = {
+    .imageView   = depthImageView,
+    .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+    .loadOp      = vk::AttachmentLoadOp::eClear,
+    .storeOp     = vk::AttachmentStoreOp::eDontCare,
+    .clearValue  = clearDepth};
+----
+
+そして、ダイナミックレンダリング情報構造体に追加します。
+
+[,c++]
+----
+vk::RenderingInfo renderingInfo = {
+    ...
+    .pDepthAttachment     = &depthAttachmentInfo};
+----
+
+=== 深度画像の明示的な遷移
+
+カラーアタッチメントと同様に、深度アタッチメントも意図した用途に対して正しいレイアウトに
+ある必要があります。そのため、レンダリング中に深度画像を深度アタッチメントとして使えるよう、
+追加のバリアを発行する必要があります。
+深度画像はまず early fragment test パイプラインステージでアクセスされ、
+_クリア_ するロード操作があるため、書き込み用のアクセスマスクを指定すべきです。
+
+追加の画像タイプ（深度）を扱うようになったので、まず `transition_image_layout` 関数に
+画像アスペクト用の新しい引数を追加します。
+
+[,c++]
+----
+void transition_image_layout(
+    ...
+    vk::ImageAspectFlags    image_aspect_flags)
+{
+    vk::ImageMemoryBarrier2 barrier = {
+        ...
+        .subresourceRange    = {
+            .aspectMask     = image_aspect_flags,
+            .baseMipLevel   = 0,
+            .levelCount     = 1,
+            .baseArrayLayer = 0,
+            .layerCount     = 1}};
+}
+----
+
+次に、`recordCommandBuffer` のコマンドバッファ開始時に新しい画像レイアウト遷移を追加します。
+
+[,c++]
+----
+commandBuffers[currentFrame].begin({});
+// Before starting rendering, transition the swapchain image to vk::ImageLayout::eColorAttachmentOptimal
+transition_image_layout(
+    ...
+    vk::ImageAspectFlagBits::eColor);
+    
+// Transition depth image to depth attachment optimal layout
+transition_image_layout(
+    *depthImage,
+    vk::ImageLayout::eUndefined,
+    vk::ImageLayout::eDepthAttachmentOptimal,
+    vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+    vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+    vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+    vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+    vk::ImageAspectFlagBits::eDepth);
+----
+
+カラー画像とは異なり、ここでは複数のバリアは必要ありません。フレームが終わった後の
+深度アタッチメントの内容を気にしないため、常に `vk::ImageLayout::eUndefined` から
+遷移できます。このレイアウトの特別な点は、前に何が起きていてもソースとして常に使えることです。
+
+また、`transition_image_layout` 関数呼び出しへの他のすべての呼び出しも、正しい画像
+アスペクトを渡すよう調整してください。
+
+[,c++]
+----
+// Before starting rendering, transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
+transition_image_layout(
+    ...
+    // Also need to specify this for color images
+    vk::ImageAspectFlagBits::eColor);
+----
+
+== 深度とステンシルの状態
+
+深度アタッチメントを使える準備はできましたが、グラフィックスパイプラインで深度テストを
+まだ有効にする必要があります。
+これは `vk::PipelineDepthStencilStateCreateInfo` 構造体を通じて設定します。
+
+[,c++]
+----
+vk::PipelineDepthStencilStateCreateInfo depthStencil{
+    .depthTestEnable       = vk::True,
+    .depthWriteEnable      = vk::True,
+    .depthCompareOp        = vk::CompareOp::eLess,
+    .depthBoundsTestEnable = vk::False,
+    .stencilTestEnable     = vk::False};
+----
+
+`depthTestEnable` フィールドは、新しいフラグメントの深度を深度バッファと比較して
+破棄すべきかどうかを見るかを指定します。
+`depthWriteEnable` フィールドは、深度テストに合格したフラグメントの新しい深度を
+実際に深度バッファに書き込むかを指定します。
+
+`depthCompareOp` フィールドは、フラグメントを保持するか破棄するかに使われる比較を
+指定します。
+低い深度 = 近い、という慣習に従うので、新しいフラグメントの深度は _より小さく_
+あるべきです。
+
+`depthBoundsTestEnable`、`minDepthBounds`、`maxDepthBounds` フィールドは、任意の
+深度バウンドテストに使われます。
+基本的に、指定した深度範囲内に収まるフラグメントだけを保持できます。
+この機能は使いません。
+
+`stencilTestEnable`、`front`、`back` フィールドはステンシルバッファ操作を設定しますが、
+本チュートリアルでも使いません。
+これらの操作を使いたい場合は、深度/ステンシル画像のフォーマットにステンシル
+コンポーネントが含まれていることを確認する必要があります。
+
+ダイナミックレンダリングのセットアップに深度ステンシルアタッチメントが含まれる場合、
+深度ステンシル状態は常に指定しなければなりません。
+
+先ほど埋めた深度ステンシル状態を参照するよう `pipelineCreateInfoChain` 構造体チェーンを
+更新し、使用している深度フォーマットへの参照も追加します。
+
+[,c++]
+----
+vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+    {.stageCount          = 2,
+     ...
+     .pDepthStencilState  = &depthStencil,
+     ...},
+    {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format, .depthAttachmentFormat = depthFormat}};
+----
+
+今プログラムを実行すると、ジオメトリのフラグメントが正しく順序付けられているのが
+見えるはずです。
+
+image::/images/depth_correct.png[]
+
+== ウィンドウリサイズの処理
+
+ウィンドウがリサイズされたとき、新しいカラーアタッチメントの解像度に合わせて
+深度バッファの解像度も変更すべきです。
+その場合に深度リソースを再作成するよう、`recreateSwapChain` 関数を拡張します。
+
+[,c++]
+----
+void recreateSwapChain()
+{
+    int width = 0, height = 0;
+		while (width == 0 || height == 0)
+		{
+        glfwGetFramebufferSize(window, &width, &height);
+        glfwWaitEvents();
+		}
+
+    device.waitIdle(device);
+
+    cleanupSwapChain();
+    createSwapChain();
+    createImageViews();
+    createDepthResources();
+}
+----
+
+おめでとうございます。アプリケーションはついに任意の 3D ジオメトリを正しく見えるよう
+描画する準備が整いました。
+xref:08_Loading_models.adoc[次の章] で、テクスチャ付きモデルを描画して試してみましょう！
+
+link:/attachments/27_depth_buffering.cpp[C{pp} コード] /
+link:/attachments/27_shader_depth.slang[slang シェーダ] /
+link:/attachments/27_shader_depth.vert[GLSL 頂点シェーダ] /
+link:/attachments/27_shader_depth.frag[GLSL フラグメントシェーダ]

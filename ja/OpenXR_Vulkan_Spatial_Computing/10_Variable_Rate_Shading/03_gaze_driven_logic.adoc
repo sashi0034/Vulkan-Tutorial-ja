@@ -1,0 +1,82 @@
+:pp: {plus}{plus}
+= 視線駆動ロジックとアイトラッキングテレメトリ
+
+静的な周辺最適化は優れたベースラインですが、フォビエイテッドレンダリングの真の力は、高ディテール領域をユーザーの実際の視線に揃えるときに発揮されます。これが **動的フォビエイテッドレンダリング（DFR）** です。これを達成するため、**XR_EXT_eye_gaze_interaction** 拡張経由で OpenXR ランタイムからアイトラッキングデータを取り込みます。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準を超えて**。
+
+OpenXR が拡張経由で生のアイトラッキングテレメトリを提供する一方、そのデータを 2D ビューポート座標へ投影しシェーディングレートマップをリアルタイム更新する複雑なプロセスは、Vulkan 駆動の最適化です。ランタイムの入力とエンジンのシェーディング密度のギャップを埋めるために Vulkan を使います。
+
+== 生物学的な活用: サッカード抑制
+
+動的フォビエイテッドレンダリング（DFR）がこれほど効果的な理由を理解するには、人間の脳が視覚情報をどう処理するかを見る必要があります。眼は常に **サッカード** と呼ばれる小さく急速な動きをしています。サッカード中、脳は視覚入力を「空白にする」——**サッカード抑制** と呼ばれる現象です。
+
+DFR はこれを活用します。高速アイトラッキング（通常 120Hz 以上）を使い、サッカード自体の間に高ディテールの中心窩領域をユーザーの新しい注視点へシフトできます。眼が動いている間は脳が視覚入力を無視するため、ユーザーは低解像度の周辺を「捕まえ」ることがありません。
+
+エンジンがこれらの更新を処理する間、ランタイムは内部 IR カメラを高頻度でサンプリングし、ユーザーの個人キャリブレーションを適用して、可能な限り正確な `XrEyeGaze` ポーズを報告します。
+
+== 視線駆動 VRS の実装
+
+プロセスは 3 ステップです。
+
+1.  **取り込み**: `XrEyeGaze` ポーズを問い合わせ、ユーザーが 3D 空間のどこを見ているかを見つける。
+2.  **投影**: その 3D 視線ベクトルをビューポートの 2D 平面へ投影し、UV 座標で「中心窩中心」を見つける。
+3.  **更新**: コンピュートシェーダーで **Shading Rate Image** を再生成またはシフトする。
+
+[source,cpp]
+----
+// Updating the shading rate image based on projected gaze coordinates
+void updateShadingRateMap(vk::raii::CommandBuffer& cmd, const glm::vec2& gazeCenter) {
+    // We use a simple compute shader to fill a small R8_UINT texture.
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *gazeVrsPipeline);
+    cmd.pushConstants<glm::vec2>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, gazeCenter);
+    cmd.dispatch(shadingRateWidth / 8, shadingRateHeight / 8, 1);
+}
+----
+
+[source,glsl]
+----
+// Simple Compute Shader to generate a Gaze-Driven Shading Rate Map
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, r8ui) uniform writeonly uimage2D shadingRateImage;
+
+layout(push_constant) uniform PushConstants {
+    vec2 gazeCenter; // UV coordinates of the eye gaze
+};
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = vec2(pos) / vec2(imageSize(shadingRateImage));
+
+    float dist = distance(uv, gazeCenter);
+
+    // Shading Rate values: 0 = 1x1, 4 = 2x1, 5 = 2x2
+    uint rate = 0; // 1x1 (Full Quality)
+    if (dist > 0.35) {
+        rate = 5;  // 2x2 (Coarse)
+    } else if (dist > 0.15) {
+        rate = 4;  // 2x1 (Medium)
+    }
+
+    imageStore(shadingRateImage, pos, uvec4(rate));
+}
+----
+
+== 発展: 予測視線と条件付きレンダリング
+
+Vulkan では、標準の視線インタラクションを超えた能動的最適化を実装できます。
+
+*   **予測視線スムージング**: Vulkan の **ML Inference** 拡張を使い、視線点の履歴を解析してサッカード中の次の固視点を予測し、シェーディングレートマップを事前更新して知覚レイテンシを最小化できます。
+*   **まばたき対応最適化**: ユーザーがまばたきすると、Vulkan の **Conditional Rendering** を使い高ディテールの中心窩インセットの描画を即座にスキップし、まばたきイベント中の GPU 電力を節約できます。
+
+== レイテンシ: 没入感の殺し屋
+
+アイトラッキングテレメトリやシェーディングレート更新のレイテンシが大きすぎると、高ディテールパッチが「追いつく」前に視野端のぼけが見えてしまいます。
+
+だからこそ **レイトラッチング**（第 6 章）が重要です。GPU 作業開始のためタイムラインセマフォをシグナルする直前の絶対最後のマイクロ秒で視線をサンプリングしたいのです。このギャップを最小化することで、完璧に高解像度な世界の錯覚を維持します。
+
+TIP: アイトラッキングの詳細は、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#XR_EXT_eye_gaze_interaction[OpenXR Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/10_Variable_Rate_Shading/02_fragment_density_control.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/10_Variable_Rate_Shading/04_incorporating_into_the_engine.adoc[次へ]

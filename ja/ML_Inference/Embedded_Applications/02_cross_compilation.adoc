@@ -1,0 +1,310 @@
+= クロスコンパイル: ARM 帝国向けのビルド
+:pp: {plus}{plus}
+:stem: latexmath
+
+128GB RAM と液体冷却 GPU を備えた強力な x86_64 ワークステーションで開発しています。ターゲットは **Raspberry Pi 5** や **NVIDIA Jetson**——ARM64 プロセッサとごくわずかなリソースです。Vulkan C{pp} コードをデバイス上で直接コンパイルすることもできますが、ONNX Runtime や複雑な Vulkan エンジンのような大規模プロジェクトをマイクロコンピュータでビルドするのは災難のレシピです。
+
+ローカルビルドを試みると **メモリスラッシング** に遭遇します——システムが実際のコンパイルより、遅い SD カードへのメモリページスワップに時間を費やします。最終的に Linux **Out of Memory（OOM）Killer** が目を覚まし、システムのフリーズを防ぐためコンパイラを終了させます。成功しても、ワークステーションなら 2 分で終わるビルドに 8 時間待つことになります。
+
+**クロスコンパイル** がプロの解決策です。ワークステーションの「蛮力」で、完全に異なるアーキテクチャ向けのバイナリコードを生成できます。
+
+本章ではクロスコンパイルプロセスを解き明かします。**Sysroot** のセットアップ、link:https://cmake.org/cmake/help/latest/manual/cmake-toolchains.7.html[**CMake Toolchain**] の設定、ローカル開発と同じくらいシームレスに感じられるリモートデプロイパイプラインの構築を学びます。
+
+多くの OEM は以下で学ぶすべてを提供しており、可能なら自前セットアップの複雑さを避けるため、事前ビルド済みツールチェーンと sysroot を使うべきです。ただしカスタムまたは非標準 ARM デバイスで作業する場合、自前のツールチェーンと sysroot が必要になることがあります。その仕組みを学ぶことで、開発環境セットアップに何を期待すべきか理解できます。
+
+さらに複雑化しないため、IDE セットアップの詳細には踏み込みません——IDE は多数あり、それぞれ独自の癖とセットアップの落とし穴があります。以下に概説するコアパスは、いずれかの形ですべてに共通します。
+
+== 二世界問題: ホスト vs ターゲット
+
+クロスコンパイルでは 2 つの世界に同時に生きます:
+1.  **ビルドホスト**: コンパイラ（`gcc` または `clang`）が実際に動く x86_64 Linux/Windows マシン。
+2.  **ターゲットホスト**: 生成されたバイナリコードが実行される ARM64 デバイス。
+
+.Cross-Compilation Ecosystem
+image::images/ML_Inference/Embedded_Applications/cross_compilation_architecture.svg[Diagram showing the relationship between Build Host, Target Host, and the Sysroot mirror, 800]
+
+初心者が犯す最大の間違いは、ビルドホストのライブラリにリンクしようとすることです。ARM コードを x86 の `libvulkan.so` にリンクすると、リンカは混乱して叫ぶ（"File format not recognized"）か、最初の Vulkan 呼び出しで "Invalid Instruction" エラーでクラッシュするバイナリを生成します。
+
+**ツール**（x86 で動く）と **ライブラリ**（ARM である必要がある）の厳格な分離を維持する必要があります。コンパイラはツール、`.so` ファイルはライブラリです。
+
+== 柱 1: Sysroot（ターゲットの反映）
+
+**Sysroot** はビルドホスト上のフォルダで、ターゲットホストのファイルシステムの完全なコピーを含みます。ARM デバイスが使うすべてのヘッダ（`.h`）とライブラリ（`.so`）が含まれます。
+
+=== `rsync` で Sysroot を作成
+インターネットからランダムなライブラリをダウンロードしないでください。最良の sysroot はハードウェアから直接取得します。`rsync` でターゲット OS の「重要臓器」をクローンします。
+
+[source,bash]
+----
+# On your development machine
+mkdir -p ~/target_sysroot
+
+# Pull the vital organs of the target OS
+# -a: Archive mode (preserves permissions and timestamps)
+# -v: Verbose output so you can see the progress
+# -z: Compress data during transfer to save network bandwidth
+# -L: CRITICAL - Transforms absolute symlinks into relative ones.
+# On Linux, /usr/lib/libvulkan.so often points to /lib/aarch64-linux-gnu/libvulkan.so.1
+# Without -L, that link would point to your workstation's root, not the sysroot!
+rsync -avzL --rsync-path="sudo rsync" \
+    pi@raspberrypi.local:/lib/aarch64-linux-gnu ~/target_sysroot/
+rsync -avzL --rsync-path="sudo rsync" \
+    pi@raspberrypi.local:/usr/include ~/target_sysroot/usr/
+rsync -avzL --rsync-path="sudo rsync" \
+    pi@raspberrypi.local:/usr/lib/aarch64-linux-gnu ~/target_sysroot/usr/lib/
+----
+
+=== 深掘り: リンカの検索パス
+Linux では多くの `.so` ファイルは実際にはテキストスクリプト（リンカスクリプト）か絶対パスを含みます。例えば `/usr/lib/aarch64-linux-gnu/libpthread.so` は次のようなテキストファイルであることが多い:
+`GROUP ( /lib/aarch64-linux-gnu/libpthread.so.0  /usr/lib/aarch64-linux-gnu/libpthread_nonshared.a )`
+
+クロスコンパイル時、その `/lib/...` パスは **Sysroot** のルートではなく **ホスト** のルートを指します。ワークステーションの `libpthread.so.0` は x86 バイナリなのでリンクは失敗します。
+
+**修正**: コンパイラの `--sysroot` フラグでリンカに「リンカスクリプトやライブラリ検索で絶対パスを見たら、先頭に `~/target_sysroot` を付ける」と指示します。
+
+=== シンボリックリンクのトラブルシューティング
+`rsync` ベースの sysroot でよくある失敗点は壊れたシンボリックリンクです。ターゲットデバイスでは `/usr/lib/libvulkan.so` が `../../lib/aarch64-linux-gnu/libvulkan.so.1.2.3` へのシンボリックリンクかもしれません。`rsync` で `-L` フラグを使わないと、ワークステーション上の存在しないパスを指す「宙ぶらりん」のリンクをコピーします。
+
+`-L` を使っても絶対シンボリックリンクが紛れ込むことがあります。`symlinks` ツールで修正できます:
+[source,bash]
+----
+sudo apt install symlinks
+# Convert all absolute symlinks to relative ones within the sysroot
+symlinks -cr ~/target_sysroot
+----
+
+== 柱 2: Docker の利点（再現可能な鍛冶場）
+
+ローカルマシンに sysroot をセットアップする方法は動きますが、脆いです。ワークステーションの OS を更新するとクロスコンパイラのバージョンが変わり、ターゲットの GLIBC との互換性が壊れることがあります。
+
+**Docker** では、チームの全開発者が同一の「凍結された鍛冶場」を作れます。link:https://docs.docker.com/build/building/multi-platform/[マルチアーキテクチャビルド] の管理も一貫した環境で簡素化されます。
+
+=== マルチアーキ Dockerfile
+クロスコンパイラと sysroot が事前設定された Docker イメージを作成できます。
+
+[source,dockerfile]
+----
+# Dockerfile.cross
+FROM ubuntu:22.04
+
+# 1. Install the cross-compilation tools
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    pkg-config \
+    g++-aarch64-linux-gnu \
+    rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Define the sysroot location
+ENV SYSROOT=/opt/sysroot
+RUN mkdir -p ${SYSROOT}
+
+# (Optional) You can copy a pre-built sysroot into the image
+# COPY ./target_sysroot ${SYSROOT}
+
+# 3. Set up environment for CMake
+ENV ARCH=aarch64
+ENV CROSS_COMPILE=aarch64-linux-gnu-
+----
+
+=== Docker 内でビルド
+ソースコードをコンテナにマウントし、ワークステーションを「汚さず」ビルドできます。
+
+[source,bash]
+----
+docker build -t vulkan-cross-builder -f Dockerfile.cross .
+docker run --rm -v $(pwd):/src -w /src vulkan-cross-builder \
+    cmake -B build-arm64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-toolchain.cmake .
+----
+
+== 柱 3: CMake Toolchain ファイル
+
+CMake は教えない限りクロスコンパイルしていることを「知りません」。**Toolchain ファイル** で CMake をワークステーションのシステムフォルダから Sysroot へリダイレクトします。
+
+[source,cmake]
+----
+# cmake/aarch64-toolchain.cmake
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+# 1. Point to the ARM cross-compiler
+# You can install this on Ubuntu via: sudo apt install g++-aarch64-linux-gnu
+set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
+set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+
+# 2. Point to our local Sysroot mirror
+# We use an environment variable so the path can be different in Docker vs Local
+if(NOT DEFINED ENV{SYSROOT})
+    set(CMAKE_SYSROOT $ENV{HOME}/target_sysroot)
+else()
+    set(CMAKE_SYSROOT $ENV{SYSROOT})
+endif()
+
+# 3. CRITICAL: Don't look for libraries on the workstation host!
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER) # Use workstation's 'make', 'ls', 'cmake'
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)  # ONLY look in sysroot for libraries
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)  # ONLY look in sysroot for headers
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)  # ONLY look in sysroot for cmake-packages
+
+# 4. Handle Pkg-Config for ARM
+# Pkg-config is the most common cause of "Header not found" errors.
+# We must prevent it from returning paths like /usr/include (which is your x86 host).
+set(ENV{PKG_CONFIG_DIR} "")
+set(ENV{PKG_CONFIG_LIBDIR} "${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig:${CMAKE_SYSROOT}/usr/share/pkgconfig")
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "${CMAKE_SYSROOT}")
+
+# 5. Staging: Where do we 'install' our ARM binaries?
+set(CMAKE_STAGING_PREFIX $ENV{HOME}/arm64_build_output)
+----
+
+== 柱 4: Vulkan SDK の扱い
+
+Vulkan 向けクロスコンパイルには 2 つ必要です:
+1.  **Vulkan Headers**: アーキテクチャ非依存。ホストのものを使えます。
+2.  **Vulkan Loader（`libvulkan.so`）**: sysroot からの ARM 版である *必要* があります。
+
+=== Vulkan を正しく見つける
+`CMakeLists.txt` ではハードコードパスを使わず `find_package(Vulkan REQUIRED)` を使います。ツールチェーンで `CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY` を設定しているため、CMake はホストの Vulkan をスキップし sysroot のものを自動的に見つけます。
+
+[source,cmake]
+----
+find_package(Vulkan REQUIRED)
+add_executable(vulkan_ml_app main.cpp)
+target_link_libraries(vulkan_ml_app PRIVATE Vulkan::Vulkan)
+----
+
+=== 検証
+ビルド後、`readelf` でバイナリが実際に ARM64 で x86 ではないことを確認:
+[source,bash]
+----
+readelf -h build-arm64/vulkan_ml_app | grep Machine
+# Should output: Machine: AArch64
+----
+
+== 柱 5: CPU 固有の最適化
+
+ARM は巨大なプロセッサファミリーです。汎用 "ARM64" 向けにコンパイルしたバイナリは Raspberry Pi 5 で動きますが、Pi 5 を速くする専用ハードウェア命令を使わないため遅くなります。
+
+=== フラグのチューニング
+本番性能のため、CMake ビルドにアーキテクチャ固有フラグを追加します。NEON SIMD や Dot-Product 命令など特定シリコン機能を有効化します。利用可能なフラグの完全リストは link:https://gcc.gnu.org/onlinedocs/gcc/AArch64-Options.html[GCC AArch64 Options] ドキュメントにあります。
+
+[cols="1,2,2"]
+|===
+| Target SoC | `-march` (Architecture) | `-mtune` (Tuning)
+
+| Raspberry Pi 4 | `armv8-a+crc` | `cortex-a72`
+| Raspberry Pi 5 | `armv8.2-a+fp16+rcpc+dotprod` | `cortex-a76`
+| NVIDIA Jetson Orin | `armv8.2-a+fp16` | `cortex-a78ae`
+| Apple Silicon (M1/M2) | `armv8.5-a+fp16+sha3` | `apple-m1`
+|===
+
+*   **`+fp16`**: 半精度浮動小数点のハードウェアサポートを有効化。Vulkan ML で最も重要な単一フラグ——シェーダのスループットを 2 倍にし、レジスタ圧力を低減。
+*   **`+dotprod`**: 整数ドット積（UDOT/SDOT）向け専用命令を有効化。INT8 量子化モデルに不可欠。
+
+[source,cmake]
+----
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    # Tell the compiler exactly which silicon we are targeting
+    # Note: Using -mcpu is often a shorthand for -march + -mtune
+    add_compile_options(-march=armv8.2-a+fp16+dotprod -mtune=cortex-a76)
+endif()
+----
+
+== 柱 6: GLIBC 互換性の管理
+
+組み込み Linux で最も一般的で frustrating なランタイムエラー:
+`./app: /lib/aarch64-linux-gnu/libc.so.6: version 'GLIBC_2.34' not found`
+
+*   **原因**: *新しい* C ライブラリ（GLIBC）を持つ Sysroot に対してコンパイルしたが、実際のハードウェアで動いているものより新しい。GLIBC は後方互換だが前方互換ではない。
+*   **ルール**: **古い** GLIBC に対してコンパイルしたバイナリは **新しい** システムで常に動くが、逆は決してない。
+*   **エキスパートのヒント**: 古い Debian/Ubuntu リリース（JetPack 4.x など）向け開発なら、古い Ubuntu 版（18.04 など）ベースの Docker イメージを使い、より古い GLIBC にリンクする。
+
+== 柱 7: リモートデプロイとデバッグ
+
+プロの組み込みワークフローは IDE から **Code latexmath:[\to] Build latexmath:[\to] Deploy latexmath:[\to] Run** をワンクリックです。
+
+=== SSH キーによる自動デプロイ
+ビルドのたびにパスワードを入力しないでください。創造の流れを壊します。ワークステーションで SSH キーを生成しターゲットにコピー:
+
+[source,bash]
+----
+ssh-keygen -t ed25519
+ssh-copy-id pi@raspberrypi.local
+----
+
+デプロイスクリプトでミリ秒単位でバイナリを同期できます。`scp` より `rsync` が良いのは、実際に変わったバイトだけ転送するからです。
+
+[source,bash]
+----
+#!/bin/bash
+# deploy.sh
+set -e
+
+TARGET="pi@192.168.1.50"
+DEPLOY_DIR="~/edge_ai"
+
+# 1. Build the project locally
+cmake -B build-arm64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-toolchain.cmake .
+cmake --build build-arm64 -j$(nproc)
+
+# 2. Sync to the target (Only transfers changed files)
+rsync -avz build-arm64/vulkan_ml_app $TARGET:$DEPLOY_DIR/
+
+# 3. Remote Execution
+ssh $TARGET "$DEPLOY_DIR/vulkan_ml_app --model $DEPLOY_DIR/resnet.onnx"
+----
+
+=== 深掘り: GDB によるリモートデバッグ
+ワークステーションの高解像度モニターと IDE を使い、コードは小さなプロセッサ上で実際に実行しながら ARM コードを行単位でデバッグできます。
+
+1.  **ターゲット（ARM デバイス）**:
+    **GDB Server** を起動。プロセッサの「リモコン」として機能。
+    [source,bash]
+    ----
+    # Listen on port 1234
+    gdbserver :1234 ./vulkan_ml_app --model resnet.onnx
+    ----
+
+2.  **ホスト（ワークステーション）**:
+    `gdb-multiarch` を起動。**バイナリのローカルコピー**（デバッグシンボル付き）と **sysroot** を指す必要があります。
+    [source,bash]
+    ----
+    gdb-multiarch ./build-arm64/vulkan_ml_app
+    (gdb) set sysroot ~/target_sysroot
+    (gdb) target remote 192.168.1.50:1234
+    (gdb) continue
+    ----
+
+== 柱 8: ランタイム検索パス（RPATH）
+
+Sysroot の `libonnxruntime.so` のようなライブラリにリンクすると、リンカは `~/target_sysroot/usr/lib/...` パスを記録します。Pi 上ではそのライブラリは `/usr/lib/...` にあります。
+
+*   **問題**: アプリがビルドホストパスでライブラリを探そうとして "Shared library not found" で起動失敗する可能性。
+*   **修正**: `CMAKE_INSTALL_RPATH` を使用。バイナリヘッダに検索パスを埋め込みます。
+
+[source,cmake]
+----
+# Tell the app to look in its own folder ($ORIGIN)
+# and the standard system folders on the target.
+set(CMAKE_INSTALL_RPATH "$ORIGIN;/usr/lib/aarch64-linux-gnu")
+
+# Ensure RPATH is not cleared during installation
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+----
+
+== まとめ: クロスコンパイルチェックリスト
+
+1.  **鍛冶場**: ホストまたは Docker コンテナ内に `g++-aarch64-linux-gnu` クロスコンパイラをインストール。
+2.  **ミラー**: ターゲットの `/usr/include` と `/usr/lib` フォルダの新鮮な `rsync`、絶対シンボリックリンク解決済み。
+3.  **ガイド**: `CMAKE_SYSROOT` を設定し、`pkg-config` をリダイレクトし、`CMAKE_FIND_ROOT_PATH_MODE_*` を構成するツールチェーンファイル。
+4.  **最適化**: 特定シリコン世代（例: `+fp16`）向けのアーキテクチャ固有 `-march` と `-mtune` フラグ。
+5.  **ハンドシェイク**: パスワードレス高速デプロイ用 ed25519 SSH キー設定。
+6.  **顕微鏡**: ターゲットに `gdbserver`、ワークステーションに `gdb-multiarch`。
+
+クロスコンパイルはプロの組み込み開発の「入場料」です。支払えば、液体冷却ワークステーションの全パワーが小さく効率的なシリコンの一点に集中します。
+
+次は **低レイテンシカメラ統合** を使い、このパイプラインに生の高帯域データを供給する方法を見ます。
+
+xref:ML_Inference/Embedded_Applications/01_introduction.adoc[前へ: はじめに] | xref:ML_Inference/Embedded_Applications/03_camera_integration.adoc[次へ: カメラ統合]

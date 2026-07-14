@@ -1,0 +1,169 @@
+:pp: {plus}{plus}
+= FABRIK: Forward And Backward Reaching IK
+
+== 異なる考え方
+
+CCD がジョイントと回転について考えるのに対し、FABRIK—**Forward And Backward Reaching Inverse Kinematics**—は位置について考えます。アプローチの根本的な違いであり、視覚結果も根本的に異なります。
+
+FABRIK は Andreas Aristidou と Joan Lasenby により 2011 年に発表され、多くのシナリオで CCD より視覚的に優れ、驚くほど実装が単純なため、すぐに影響を与えました。中核のアイデアは、各ジョイントを空間上の点、各ボーンを隣接する 2 点を結ぶ剛体ロッドとして扱うことです。エンドエフェクタのターゲットが与えられると、FABRIK は 2 フェーズでチェーン上のジョイントを再配置します。後方フェーズではエンドエフェクタをターゲットに固定しチェーンを根へ伝播し、前方フェーズでは根を元の位置に再固定してエンドエフェクタ方向へ戻します。この 2 フェーズを繰り返すと、急速に解へ収束します。
+
+FABRIK が CCD のエンドエフェクタバイアスを避けられる理由は、両フェーズがチェーン内のすべてのジョイントを対称に扱うからです。デフォルトではどのジョイントも他より影響力が大きくはなく、それぞれが隣から課される制約を満たすよう調整するだけです。結果のポーズは、腕や脚全体が動きに参加すべきリーチ動作で、より自然に見える傾向があります。
+
+== FABRIK アルゴリズム
+
+具体化しましょう。ジョイント位置 `p[0], p[1], ..., p[n]` のチェーンがあり、`p[0]` が根、`p[n]` がエンドエフェクタです。ボーン長は `d[i] = |p[i+1] - p[i]|` で固定—ボーンは伸びません。ターゲットは `t` です。
+
+**後方フェーズ:**
+
+1. `p[n] = t` とする。エンドエフェクタがターゲットにいる。
+2. `n-1` から `0` まで各ジョイントについて: `p[i]` から `p[i+1]` への方向を計算し、`p[i+1]` から距離 `d[i]` の位置に `p[i]` を置く。言い換えると `p[i] = p[i+1] + normalize(p[i] - p[i+1]) * d[i]`。
+
+後方フェーズの後、エンドエフェクタはターゲットにいますが、根 `p[0]` は元の位置から動いています。
+
+**前方フェーズ:**
+
+1. `p[0]` を元の位置 `b` に戻す（根は固定で動けない）。
+2. `1` から `n` まで各ジョイントについて: `p[i-1]` から `p[i]` への方向を計算し、`p[i-1]` から距離 `d[i-1]` の位置に `p[i]` を置く。言い換えると `p[i] = p[i-1] + normalize(p[i] - p[i-1]) * d[i-1]`。
+
+前方フェーズの後、根は正しい位置に戻りますが、エンドエフェクタは再びターゲットからわずかに離れているかもしれません。
+
+**反復:** `|p[n] - t| < threshold` になるか最大反復回数に達するまで、後方・前方フェーズを繰り返します。
+
+収束は驚くほど速く—ヒューマノイドチェーンでは通常、完全反復 2〜4 回（後方＋前方を 1 セット）で十分です。FABRIK は本質的に位置空間での勾配降下を行っており、目的関数が滑らかで条件が良いためです。
+
+== FABRIK の実装
+
+FABRIK は回転ではなく位置で働くため、まずシーングラフから位置を取り出し、ソルバーを実行し、結果をジョイント回転へ戻します。この位置から回転への変換ステップが、一見より FABRIK をやや複雑にします。
+
+[source,cpp]
+----
+void solve_fabrik(std::vector<Node>& nodes, const IKChain& chain, const glm::vec3& target_world)
+{
+    const int n = static_cast<int>(chain.joints.size());
+    if (n == 0) return;
+
+    // Step 1: Extract current world positions and compute bone lengths.
+    std::vector<glm::vec3> positions(n + 1);
+    std::vector<float>     lengths(n);
+
+    for (int i = 0; i < n; ++i) {
+        positions[i] = glm::vec3(nodes[chain.joints[i]].world_matrix[3]);
+    }
+    positions[n] = glm::vec3(nodes[chain.effector_node].world_matrix[3]);
+
+    for (int i = 0; i < n; ++i) {
+        lengths[i] = glm::distance(positions[i], positions[i + 1]);
+        if (lengths[i] < 1e-6f) lengths[i] = 1e-6f; // Prevent division by zero
+    }
+
+    // Step 2: Check if the target is reachable.
+    float total_length = 0.0f;
+    for (float l : lengths) total_length += l;
+
+    glm::vec3 root_pos = positions[0]; // Remember the root position
+
+    // Step 3: Iterate backward-forward passes.
+    for (int iter = 0; iter < chain.max_iterations; ++iter) {
+        // Check convergence
+        if (glm::distance(positions[n], target_world) < chain.threshold) break;
+
+        // --- Backward pass: anchor the end effector at target ---
+        positions[n] = target_world;
+        for (int i = n - 1; i >= 0; --i) {
+            glm::vec3 dir = glm::normalize(positions[i] - positions[i + 1]);
+            positions[i] = positions[i + 1] + dir * lengths[i];
+        }
+
+        // --- Forward pass: re-anchor the root at its original position ---
+        positions[0] = root_pos;
+        for (int i = 1; i <= n; ++i) {
+            glm::vec3 dir = glm::normalize(positions[i] - positions[i - 1]);
+            positions[i] = positions[i - 1] + dir * lengths[i - 1];
+        }
+    }
+
+    // Step 4: Convert solved positions back to joint rotations.
+    // For each joint, we know where it is (positions[i]) and where its
+    // child is (positions[i+1]). We want to rotate the joint so that
+    // its local "bone direction" vector points toward the child's new position.
+
+    for (int i = 0; i < n; ++i) {
+        Node& joint = nodes[chain.joints[i]];
+
+        // The direction the bone should point after solving
+        glm::vec3 solved_dir = glm::normalize(positions[i + 1] - positions[i]);
+
+        // The direction the bone currently points in world space
+        // (the unit vector from this joint's world position to the next joint's
+        // current world position, before we apply our correction)
+        glm::vec3 current_dir = glm::normalize(
+            glm::vec3(nodes[i + 1 < n ? chain.joints[i + 1] : chain.effector_node].world_matrix[3])
+            - glm::vec3(joint.world_matrix[3])
+        );
+
+        float dot = glm::clamp(glm::dot(current_dir, solved_dir), -1.0f, 1.0f);
+        if (dot > 0.9999f) continue; // Already pointing the right way
+
+        float     angle = std::acos(dot);
+        glm::vec3 axis  = glm::cross(current_dir, solved_dir);
+        if (glm::length(axis) < 1e-6f) continue;
+        axis = glm::normalize(axis);
+
+        glm::quat world_correction = glm::angleAxis(angle, axis);
+        glm::quat new_world_rot    = world_correction * joint.get_world_rotation();
+
+        glm::quat parent_world_rot = (joint.parent_index != INVALID_NODE_INDEX)
+            ? nodes[joint.parent_index].get_world_rotation()
+            : glm::quat(1, 0, 0, 0);
+
+        joint.local_rotation = glm::inverse(parent_world_rot) * new_world_rot;
+        joint.mark_dirty();
+        update_world_matrices_subtree(nodes, chain.joints[i]);
+    }
+}
+----
+
+位置から回転への変換（ステップ 4）は見覚えがよいかもしれません—CCD と同じ「1 ベクトルを別のベクトルへ回す」操作ですが、IK ターゲット位置ではなく解いたボーン方向をターゲットに使います。決定的な違いは、このループに入る時点ですべてのジョイントが*あるべき*位置が分かっているため、反復近似ではなく正確な補正を行うことです。
+
+== 制約付き FABRIK
+
+FABRIK にジョイント制限を加えるのは、ジョイントを直接回転するのではなく点として再配置するため、CCD よりやや複雑です。標準的な方法は、新しいジョイント位置を計算する前に方向ベクトルをクランプし、後方・前方パス*中に*制約を強制することです。
+
+ヒンジ制約では、ジョイント `i` から `i+1` への方向を計算するとき、その方向をヒンジ軸に垂直な平面へ射影し、角度をクランプします。ボールアンドソケット制約では、方向をスイング制限で定義される円錐内にクランプします。実装は無制約ケースより複雑で、正しく行うには参照フレームの慎重な扱いが必要です。
+
+[source,cpp]
+----
+// Clamp direction 'd' to be within a cone of half-angle 'limit_deg'
+// around the reference direction 'ref', all in world space.
+glm::vec3 clamp_to_cone(const glm::vec3& d, const glm::vec3& ref, float limit_deg)
+{
+    float limit_rad = glm::radians(limit_deg);
+    float current_angle = std::acos(glm::clamp(glm::dot(d, ref), -1.0f, 1.0f));
+
+    if (current_angle <= limit_rad) return d; // Already within cone
+
+    // Rotate d toward ref by the excess angle
+    glm::vec3 axis = glm::cross(d, ref);
+    if (glm::length(axis) < 1e-6f) return ref; // Anti-parallel; snap to ref
+    axis = glm::normalize(axis);
+
+    float excess = current_angle - limit_rad;
+    return glm::mat3(glm::angleAxis(excess, axis)) * d;
+}
+----
+
+FABRIK パス中にこれを適用すると、ボールアンドソケットジョイントの位置計算は、無制約の式から、ステップ計算前に方向をクランプする式に変わります。これによりボーン長を保ちつつ円錐制約を強制します。
+
+== CCD と FABRIK の選択
+
+両アルゴリズムとも実用的で速く、一般的なケースでは良好な結果を出します。選択は具体的な動作次第です。
+
+**凹凸地形上の足置き**では、CCD が通常十分で、正しく実装するのもより簡単です。補正は小さく、チェーンは短い（2〜3 ボーン）ため、CCD のエンドエフェクタバイアスは小さな調整では知覚されません。
+
+**腕全体のリーチ**では、FABRIK の方が一般に見た目が良いです。腕の長さのオブジェクトに手を伸ばすとき、肩・肘・手首全体が自然にリーチに参加してほしいからです。FABRIK は CCD より補正をチェーン全体により均等に分配します。
+
+**脊椎や長いチェーン**では、FABRIK が強く推奨されます。5 ボーンの脊椎に CCD を適用すると、骨盤近くのボーンが過回転し上脊椎はほとんど動かず、硬く不自然に見えます。FABRIK は滑らかで流れるような曲がりを生み、正しく読み取れます。
+
+多くの本番エンジンは両方を使います。肢 IK に CCD、脊椎と特殊ケースに FABRIK です。シーングラフの観点では同じインターフェースなので、同じことができます。
+
+xref:Advanced_glTF/Procedural_Animation_IK/02_ccd_ik.adoc[前へ: Cyclic Coordinate Descent IK] | xref:Advanced_glTF/Procedural_Animation_IK/04_foot_placement.adoc[次へ: 凹凸地形上の足置き]

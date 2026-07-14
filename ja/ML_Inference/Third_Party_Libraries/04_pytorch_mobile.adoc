@@ -1,0 +1,427 @@
+:pp: {plus}{plus}
+
+= PyTorch Mobile
+
+== 導入
+
+PyTorch は多くの研究者と実務者にとって第一選択のフレームワークになりました。動的な計算グラフ、直感的な Python API、強力なエコシステムが実験と開発に理想的な環境を提供します。しかし PyTorch はもともと研究と学習向けに設計されており、リソースが限られたデバイスへのデプロイを念頭に置いたものではありません。
+
+PyTorch Mobile はこのギャップを埋めます。Meta（旧 Facebook）が提供するモバイル・組み込み向けの PyTorch モデルデプロイソリューションです。TensorFlow Lite が別のフレームワーク形式への変換を要求するのに対し、PyTorch Mobile は PyTorch モデルを直接デプロイでき、学習からデプロイまで同じモデル表現を維持できます。
+
+本章では PyTorch Mobile を掘り下げます。デスクトップ版 PyTorch との違い、TensorFlow Lite や ONNX Runtime との比較、Vulkan アプリとの統合方法、そしてプロジェクトに適した選択かどうかの判断基準です。
+
+== PyTorch の利点: 一つのフレームワークをどこでも
+
+PyTorch Mobile の核となる価値は連続性です。PyTorch で学習し、そのまま PyTorch でデプロイする。別の形式へ変換する必要はなく、操作が正しく変換されるか心配する必要もなく、学習時と推論時の挙動に生じる微妙な差異をデバッグする必要もありません。
+
+=== 変換問題
+
+TensorFlow Lite や ONNX を使ったことがあれば、変換にまつわる問題を経験しているはずです。あるフレームワークで学習し、デプロイ用の形式へ変換する。この変換はバグやいら立ちの源になりがちです。
+
+操作が正しく変換されない。動的な形状が固定になってしまう。カスタム操作がサポートされない。学習フレームワークとデプロイ先ランタイムの間で数値の差異が生じる。PyTorch では完璧に動くのに TensorFlow Lite では結果が違う——何時間もデバッグに費やすことになります。
+
+PyTorch Mobile はこの問題をそもそも取り除きます。学習したモデルがそのままデプロイするモデルです。学習中にモデルを実行するのと同じ PyTorch ランタイムが推論も実行します。変換ステップも形式変換も不要で、微妙なバグが入り込む余地もありません。
+
+=== 開発者の体験
+
+この連続性は開発者の体験にも及びます。PyTorch を知っていれば PyTorch Mobile も知っているのと同じです。API は似ていて、概念も同じで、デバッグツールも共通です。
+
+デスクトップでプロトタイプを作り、スマートフォンでテストしても、挙動が同一であるという安心感があります。デスクトップでの推論、サーバーへのデプロイ、モバイルへのデプロイに同じモデルファイルを使えます。プラットフォーム固有の問題を気にせず素早く反復できる、これは大きな強みです。
+
+=== トレードオフ: サイズと最適化
+
+この連続性にはトレードオフが伴います。PyTorch Mobile は TensorFlow Lite より大きくなります。ランタイムは数百 KB ではなく数 MB になります。モデルも、FlatBuffers のような形式ほど徹底的には最適化されない PyTorch 形式で保存されます。
+
+多くのアプリでは、このトレードオフには十分な価値があります。開発速度の向上とデバッグ時間の削減が、サイズのコストを上回るからです。サイズが重要な要素になる場合（ダウンロードサイズの予算が厳しいアプリや、ストレージの限られた組み込み機器など)には、TFLite の徹底した最適化が必要になるかもしれません。
+
+== アーキテクチャ: モバイル向けに最適化されたデスクトップ版 PyTorch
+
+PyTorch Mobile は完全な書き換えではありません——モバイルの制約に合わせて慎重に刈り込み、最適化されたデスクトップ版 PyTorch です。
+
+=== 選択的ビルド: 必要なものだけを含める
+
+PyTorch Mobile がサイズを管理する鍵は選択的ビルドです。デスクトップ版 PyTorch は数百の操作、学習用のサポート、自動微分、幅広いデバッグツールを含みます。PyTorch Mobile では、モデルが実際に使う操作のみを含むカスタムランタイムをビルドできます。
+
+モバイルデプロイ用にモデルを準備するとき、使用する操作を解析します。50 個の操作しか使わないモデルなら、500 個ではなく 50 個の操作だけを含むランタイムになります。
+
+この選択的ビルドにより、ランタイムは 50MB を超える規模から 2〜5MB 程度まで縮小します（モデルの複雑さによって変わります）。TFLite ほど小さくはなりませんが、多くのモバイルアプリには十分です。
+
+=== TorchScript: デプロイ形式
+
+PyTorch モデルは通常、`forward` メソッドを持つ Python のクラスとして定義されます。学習には非常に適していますが、モバイルデプロイには不向きです——iOS では Python を実行できませんし、Android でも問題が起きやすいです。
+
+これを解決するのが TorchScript です。Python のサブセットとして、移植性のある中間表現にコンパイルできます。PyTorch モデルを TorchScript に変換すると `.pt` または `.ptl` ファイルが生成され、Python なしで PyTorch Mobile ランタイムがそれを読み込んで実行できます。
+
+TorchScript の作成には 2 つの方式があります。
+
+*トレース方式*: サンプル入力を使ってモデルを実行し、PyTorch がその際に実行された操作を記録します。トレースされた実行経路をそのまま複製する TorchScript モデルが生成されます。
+
+[source,python]
+----
+import torch
+
+model = MyModel()
+example_input = torch.rand(1, 3, 224, 224)
+traced_model = torch.jit.trace(model, example_input)
+traced_model.save("model.pt")
+----
+
+トレース方式はシンプルで多くのモデルで機能しますが、制限もあります。入力データに依存する制御フロー（if 文やループ)があるモデルでは、1 つの経路しか捕捉されません。トレースされたモデルは異なる入力を正しく扱えない可能性があります。
+
+*スクリプティング方式*: 型ヒントでモデルに注釈を付け、Python のソースコードから直接 TorchScript へコンパイルします。制御フローが保持され、動的な挙動も正しく処理されます。
+
+[source,python]
+----
+import torch
+
+class MyModel(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.sum() > 0:
+            return x * 2
+        else:
+            return x * 3
+
+model = MyModel()
+scripted_model = torch.jit.script(model)
+scripted_model.save("model.pt")
+----
+
+スクリプティング方式はより強力ですが、型注釈が必要で、使える Python の機能にも制限があります。
+
+多くのモデルではトレース方式で十分です。複雑な制御フローがある場合はスクリプティング方式が必要になります。
+
+=== 量子化: TensorFlow Lite への追いつき
+
+歴史的には、PyTorch の量子化サポートは TFLite に後れを取っていました。しかし近年これは大きく変わりました。今では PyTorch も TFLite に匹敵する包括的な量子化サポートを備えています。
+
+PyTorch がサポートするもの:
+
+*動的量子化*: 重みを int8 に、活性化を float32 のままにします。適用が簡単で、サイズ削減とある程度の高速化が得られます。
+
+*静的量子化*: 重みと活性化の両方を int8 にします。代表データによるキャリブレーションが必要ですが、最大の性能が得られます。
+
+*量子化認識学習（QAT）*: 学習中に量子化をシミュレートします。モデルが量子化に対して頑健になるよう学習されるため、量子化モデルの中で最も高い精度が得られます。
+
+ワークフローは TFLite と似ています。
+
+[source,python]
+----
+import torch
+from torch.quantization import quantize_dynamic, get_default_qconfig, prepare, convert
+
+# 動的量子化（最もシンプル）
+model_dynamic = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+
+# 静的量子化（キャリブレーションが必要）
+model.qconfig = get_default_qconfig('fbgemm')  # モバイルでは 'qnnpack'
+model_prepared = prepare(model)
+# キャリブレーションデータを model_prepared に通す
+model_quantized = convert(model_prepared)
+
+# モバイル向けに TorchScript へ変換
+traced = torch.jit.trace(model_quantized, example_input)
+traced.save("model_quantized.pt")
+----
+
+PyTorch の量子化は強力ですが、ツールとドキュメントは TFLite よりまだ未成熟です。良い結果を得るには試行が必要になることもあります。
+
+=== モバイル最適化: オペレータ融合とグラフ最適化
+
+量子化に加えて、PyTorch Mobile は推論性能を向上させるさまざまな最適化を適用します。
+
+*オペレータ融合*: 複数の操作を単一の最適化されたカーネルに結合します。例えば畳み込み・バッチ正規化・ReLU を 1 つの操作にまとめることで、メモリトラフィックとオーバーヘッドを削減できます。
+
+*定数畳み込み*: 定数入力を使う操作をコンパイル時に評価しておき、実行時の計算を排除します。
+
+*デッドコード除去*: 最終的な出力に寄与しない操作を削除します。
+
+*メモリ計画*: グラフを解析し、中間テンソル用のメモリを再利用してピーク使用量を削減します。
+
+これらはモバイルデプロイ用の準備時に自動的に適用されます。特別なことをする必要はなく、モバイル最適化用の API を呼ぶだけです。
+
+== Vulkan アプリケーションとの統合
+
+PyTorch Mobile と Vulkan アプリの統合は TFLite と似たパターンをとりますが、PyTorch 固有の考慮点もあります。
+
+=== 基本的なアプローチ: 別コンテキスト
+
+TFLite と同様に、最もシンプルな統合方法は PyTorch Mobile と Vulkan を別々のシステムとして扱うことです。
+
+1. Vulkan アプリがフレームのレンダリングと GPU リソース管理を担当する
+2. 推論が必要になったら、GPU から CPU メモリへデータをコピーする
+3. PyTorch Mobile で推論を行う（内部で GPU を使う可能性もある）
+4. CPU で結果を処理する
+5. 必要なら結果を GPU へコピーし戻す
+
+これは単純明快で、多くのアプリでうまく機能します。推論が毎フレーム発生しないのであれば、このオーバーヘッドは許容できる範囲です。
+
+=== GPU 加速: Vulkan バックエンド
+
+PyTorch Mobile は複数のバックエンドで GPU 加速をサポートします。
+
+*Metal*（iOS）: Apple の Metal API です。iOS では推奨される方式で、Apple の GPU で優秀な性能を発揮します。
+
+*Vulkan*（Android）: Android 向けの実験的な Vulkan バックエンドです。レンダリングと ML 推論の両方が Vulkan を使えるため、Vulkan ベースのアプリにとっては興味深い選択肢です。
+
+*OpenGL ES*（Android）: Vulkan に対応していないデバイス向けのフォールバックです。
+
+Vulkan バックエンドはまだ実験的であり、制限もあります。すべての操作がサポートされているわけではなく、iOS の Metal や Android の TFLite GPU デリゲートに匹敵しない場合もあります。急速に改善が進んでおり、Vulkan アプリにとってはより密な統合の可能性を秘めています。
+
+Vulkan バックエンドの使用例です。
+
+[source,cpp]
+----
+#include <torch/script.h>
+
+// モデルを読み込み
+torch::jit::script::Module module = torch::jit::load("model.pt");
+
+// Vulkan バックエンドを有効化（Android）
+module.to(torch::kVulkan);
+
+// 推論を実行
+std::vector<torch::jit::IValue> inputs;
+inputs.push_back(torch::rand({1, 3, 224, 224}).to(torch::kVulkan));
+auto output = module.forward(inputs).toTensor();
+----
+
+鍵となるのは `.to(torch::kVulkan)` で、これによりモデルとテンソルの両方が Vulkan 側のメモリへ移動します。
+
+=== メモリ共有: 可能だが複雑
+
+TFLite と異なり、PyTorch Mobile の Vulkan バックエンドはメモリ共有の可能性を念頭に置いて設計されています。理論上は、レンダリングコンテキストと PyTorch Mobile の推論コンテキストの間で Vulkan メモリを共有できます。
+
+実務上はこれは複雑で、ドキュメントも十分ではありません。Vulkan バックエンドは実験的であり、メモリ共有の API も不安定です。本番環境では別コンテキストを使う方が信頼性が高いでしょう。
+
+より密な結合が必要な場合は次のような方法があります。
+
+*カスタムオペレータ*: 重要な操作を独自の PyTorch オペレータとして実装し、Vulkan コンテキストを直接使います。完全な制御が得られますが、相当な実装の手間がかかります。
+
+*ハイブリッド構成*: 大半の処理は PyTorch Mobile に任せ、性能が重要な部分や密な結合が必要な部分だけをカスタムの Vulkan コンピュートシェーダで実装します。手間と性能のバランスをとる方法です。
+
+=== クロスプラットフォームでの考慮点
+
+PyTorch Mobile のクロスプラットフォーム対応は強力です。
+
+*iOS*: 優秀なサポートがあります。GPU 加速には Metal バックエンドを使います。iOS アプリとの統合も良好で、ツールも成熟しています。
+
+*Android*: 良好です。Vulkan または OpenGL ES で GPU 加速を行います。Vulkan バックエンドはまだ実験的ですが、ランタイム自体はよく機能します。
+
+*デスクトップ*: フル機能の PyTorch が動作します。デスクトップとモバイルで同じモデルを使えるため、テストと開発に有用です。
+
+すべてのプラットフォームで同じモデルを使えるため、開発・テスト・各環境へのデプロイを通じて挙動が一貫しているという安心感が得られます。これは大きな利点です。
+
+== 実践例: リアルタイムスタイル転送
+
+完全な例として、Vulkan ベースのモバイルアプリに PyTorch Mobile によるスタイル転送を統合してみましょう。
+
+=== シナリオ
+
+カメラフレームにリアルタイムで芸術的なスタイル転送を適用するモバイルアプリを考えます。有名な絵画のスタイルに変換されたカメラフィードを表示します。ミッドレンジのデバイスで 15 FPS 以上のフレーム処理が求められます。
+
+=== モデルの選択と学習
+
+Johnson らのアーキテクチャに基づく高速スタイル転送モデルから始めます。デスクトップの GPU で PyTorch を使って学習します。
+
+[source,python]
+----
+import torch
+import torch.nn as nn
+
+class StyleTransferNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # エンコーダ
+        self.conv1 = nn.Conv2d(3, 32, 9, stride=1, padding=4)
+        self.conv2 = nn.Conv2d(32, 64, 3, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
+
+        # 残差ブロック
+        self.res1 = ResidualBlock(128)
+        self.res2 = ResidualBlock(128)
+        self.res3 = ResidualBlock(128)
+
+        # デコーダ
+        self.deconv1 = nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1)
+        self.deconv2 = nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1)
+        self.conv4 = nn.Conv2d(32, 3, 9, stride=1, padding=4)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.res3(x)
+        x = F.relu(self.deconv1(x))
+        x = F.relu(self.deconv2(x))
+        x = torch.tanh(self.conv4(x))
+        return x
+
+# モデルを学習
+model = StyleTransferNet()
+# ... 学習コード ...
+----
+
+学習後、モバイルデプロイ用に TorchScript へ変換します。
+
+[source,python]
+----
+# TorchScript に変換
+model.eval()
+example_input = torch.rand(1, 3, 360, 640)
+traced_model = torch.jit.trace(model, example_input)
+
+# モバイル向けに最適化
+from torch.utils.mobile_optimizer import optimize_for_mobile
+optimized_model = optimize_for_mobile(traced_model)
+optimized_model._save_for_lite_interpreter("style_transfer.ptl")
+----
+
+`.ptl` 形式はモバイル向けに最適化されており、ファイルサイズの削減と読み込みの高速化が図られています。
+
+=== Android への統合
+
+Android アプリで PyTorch Mobile を統合します。
+
+[source,java]
+----
+import org.pytorch.IValue;
+import org.pytorch.Module;
+import org.pytorch.Tensor;
+
+// モデルを読み込み
+Module module = Module.load(assetFilePath(this, "style_transfer.ptl"));
+
+// 入力テンソルを準備（360x640x3 画像、[-1, 1] に正規化）
+float[] inputData = preprocessImage(cameraFrame);
+Tensor inputTensor = Tensor.fromBlob(inputData, new long[]{1, 3, 360, 640});
+
+// 推論を実行
+Tensor outputTensor = module.forward(IValue.from(inputTensor)).toTensor();
+
+// 出力を処理
+float[] outputData = outputTensor.getDataAsFloatArray();
+Bitmap styledImage = postprocessImage(outputData, 360, 640);
+----
+
+=== Vulkan との統合
+
+Vulkan パイプラインがカメラフレームをキャプチャします。スタイル転送の統合手順は次のとおりです。
+
+1. *フレームキャプチャ*: Vulkan がカメラフィードをテクスチャへレンダリングします
+2. *読み戻し*: `vkCmdCopyImageToBuffer` でステージングバッファへコピーします
+3. *メモリマップ*: ステージングバッファを CPU にマップします
+4. *前処理*: 360×640 にリサイズし、[-1, 1] に正規化します
+5. *推論*: バックグラウンドスレッドで PyTorch Mobile の推論を実行します
+6. *表示*: 完了したらスタイル画像を Vulkan テクスチャにアップロードしてレンダリングします
+
+鍵となるのは非同期実行です。GPU が現在のフレームをレンダリングしている間に、CPU が前のフレームのスタイル転送を処理します。これにより滑らかなフレームレートを維持できます。
+
+=== 性能の最適化
+
+最初の実装では推論に 80ms かかり、12.5 FPS と 15 FPS の目標に届きませんでした。以下の最適化を行いました。
+
+*解像度の削減*: 360×640 の代わりに 270×480 を使うと 45ms（22 FPS）になり、品質の低下は許容範囲でした。
+
+*量子化*: 動的量子化で 35ms（28 FPS）になり、モデルサイズも 6.5MB から 1.7MB へ縮小しました。
+
+*オペレータ融合*: モバイルオプティマイザが既に融合を行っていましたが、学習時にバッチ正規化を畳み込みへ手動で融合することでさらに 10% の改善が得られました（32ms、31 FPS）。
+
+*GPU 加速*: 実験的な Vulkan バックエンドを使うと、Vulkan のサポートが良好なデバイスでは 25ms（40 FPS）まで改善しました。
+
+最終的な実装では、ミッドレンジのデバイスで 30 FPS 以上のリアルタイムスタイル転送を、最小限のレイテンシで実現できました。
+
+== PyTorch Mobile と代替ライブラリの比較
+
+PyTorch Mobile は TensorFlow Lite や ONNX Runtime とどのように比較されるでしょうか。
+
+=== PyTorch Mobile vs TensorFlow Lite
+
+*PyTorch Mobile の利点*:
+
+- 変換ステップが不要——同一のフレームワークで学習とデプロイを行える
+- 動的なモデルや制御フローへのサポートがより優れている
+- デバッグが容易——学習と推論で同じツールを使える
+- Metal バックエンドによる強力な iOS サポート
+
+*TensorFlow Lite の利点*:
+
+- ランタイムが小さい（300KB 程度 vs 2〜5MB）
+- 量子化ツールがより成熟している
+- Android の GPU サポートがより優れている（GPU デリゲートは PyTorch の Vulkan より安定している）
+- 事前学習済みモデルのエコシステムが大きい
+
+*PyTorch Mobile を選ぶべき場面*: PyTorch で学習し、サイズの最適化より開発速度を重視する場合、あるいは動的なモデルの挙動が必要な場合です。
+
+*TFLite を選ぶべき場面*: サイズが重要で、最も成熟したモバイル ML が必要な場合、あるいは TensorFlow のエコシステム内で作業している場合です。
+
+=== PyTorch Mobile vs ONNX Runtime
+
+*PyTorch Mobile の利点*:
+
+- PyTorch から直接デプロイできる——変換が不要
+- PyTorch 固有の機能へのサポートがより優れている
+- PyTorch ユーザーにとってよりシンプルなワークフロー
+
+*ONNX Runtime の利点*:
+
+- フレームワークに依存しない——どのフレームワークのモデルも扱える
+- デスクトップ・サーバーでの性能がより優れている
+- 実行プロバイダの選択肢が多い（WebGPU、DirectML、CUDA など）
+- モバイルデプロイでのサイズがより小さい
+
+*PyTorch Mobile を選ぶべき場面*: PyTorch に強くこだわりがあり、最もシンプルなデプロイ経路を望む場合です。
+
+*ONNX Runtime を選ぶべき場面*: クロスフレームワークの互換性、デスクトップ・サーバーへのデプロイ、最大限の柔軟性が必要な場合です。
+
+=== ハイブリッドなアプローチ
+
+多くのアプリが複数のランタイムを併用しています。
+
+- PyTorch で学習し動的な挙動が必要なモデルには PyTorch Mobile
+- サイズが重要なモデルには TensorFlow Lite
+- デスクトップには ONNX Runtime
+- 性能が重要な操作にはカスタムの Vulkan シェーダ
+
+ハイブリッド構成はそれぞれの良さを取り入れられますが、複雑さのコストも伴います。
+
+== PyTorch Mobile が適している場面
+
+PyTorch Mobile が常に正しい選択というわけではありません。輝く場面と代替案を検討すべき場面を見ていきましょう。
+
+=== 理想的なユースケース
+
+*PyTorch を第一に使う開発*: チームが PyTorch で学習を行い、デプロイまでの摩擦を最小化したいなら自然な選択です。
+
+*動的なモデル*: 制御フロー、動的な形状、他の形式への変換が難しい複雑なロジックを持つモデルは、直接デプロイの恩恵を受けられます。
+
+*迅速な反復*: モデルのアーキテクチャを素早く反復し、変換の問題で足を止められたくない場合、シームレスなワークフローが価値を発揮します。
+
+*クロスプラットフォームデプロイ*: 同じモデルを iOS、Android、デスクトップで動かせるため、マルチプラットフォーム開発を簡素化できます。
+
+*研究から本番へ*: 別のフレームワークで再実装せずに、研究のプロトタイプを本番へ迅速に移行できます。
+
+=== 代替案を検討すべき場面
+
+*サイズが重要な場合*: アプリサイズの各 MB が重要であれば、TFLite の小さなランタイムの方が適しています。
+
+*Android での最大性能*: TFLite の GPU デリゲートはより成熟しており、Android では PyTorch の Vulkan より速いことが多いです。
+
+*TensorFlow のエコシステム*: 既に TensorFlow を使っているなら TFLite の方が自然です。
+
+*フレームワークに依存しないデプロイ*: 複数のフレームワークのモデルをデプロイする必要があるなら、ONNX Runtime の方がクロスフレームワークサポートに優れています。
+
+*組み込み向け*: 非常にリソースが限られた組み込み環境では、TFLite の徹底した最適化が必要になるかもしれません。
+
+== まとめ
+
+PyTorch Mobile は PyTorch をモバイル・組み込み環境に持ち込み、学習からデプロイまで同一のフレームワークを維持します。この連続性が変換の問題を取り除き、シームレスな開発者体験を提供します。トレードオフとして、TFLite に比べてランタイムのサイズが大きくなります。
+
+アーキテクチャは、選択的ビルド、TorchScript コンパイル、量子化、オペレータ融合によって最適化されたデスクトップ版 PyTorch です。結果として得られるのは 2〜5MB のランタイム（TFLite より大きいですが多くのアプリで許容できる範囲です）で、多くのユースケースで十分競争力のある性能を発揮します。
+
+Vulkan アプリへの統合は TFLite と似たパターンをとります。将来的にはより密な統合が可能な実験的な Vulkan バックエンドという、さらなる利点もあります。クロスプラットフォーム対応は、Metal による優秀な iOS サポートと、Vulkan/OpenGL ES による良好な Android サポートで成り立っています。
+
+PyTorch Mobile は、すでに PyTorch を使っている、動的なモデルの挙動が必要である、あるいはサイズの最適化より開発速度を重視するという場面で最も輝きます。サイズが重要な場合や Android での最大性能が求められる場合は、TFLite の方が適しているかもしれません。
+
+xref:ML_Inference/Third_Party_Libraries/03_tensorflow_lite.adoc[前へ: TensorFlow Lite] | xref:ML_Inference/Third_Party_Libraries/05_directml.adoc[次へ: DirectML]

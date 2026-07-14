@@ -1,0 +1,70 @@
+:pp: {plus}{plus}
+= 4D ライトフィールド表現
+
+ライトフィールドを表現するには、4D 光線を GPU が効率よく処理できる線形メモリアドレスへ写す必要があります。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+標準の OpenXR ランタイムは 2D 投影レイヤに焦点を当てています。Vulkan の生バッファ管理とカスタムシェーダーインデックスを使い、高次元の 4D ライトフィールドを実装し、標準の空間レンダリングモデルを超える真のホログラフィック表現を可能にします。
+
+== 7D プレノプティック関数: 出発点
+
+ライトフィールドを理解するには、まず **プレノプティック関数**（ラテン語 *plenus*＝満ちた、から）を見る必要があります。これは宇宙のあらゆる光子を記述する 7D 関数 latexmath:[P(x, y, z, \theta, \phi, \lambda, t)] です。
+
+7 次元の格納は不可能です。GPU 向けには三つの仮定を置きます。
+
+1.  **静的シーン**: 時間を無視する。
+2.  **RGB 色**: 波長を三チャネルに還元する。
+3.  **空虚な空間**: 空気中で光の色は変わらず、「ライトボックス」に入る／出る位置だけを知る必要があると仮定する。
+
+これで **4 次元** が残ります。入口点の二つ（**ST 平面**）と入口方向の二つ（**UV 平面**）です。
+
+== Vulkan メモリへの写像
+
+Vulkan では、この 4D 構造を巨大な `vk::raii::Buffer` として表します。指定初期化子でこの高帯域ストレージを構成します。
+
+[source,cpp]
+----
+// Initializing a 4D LightField buffer using designated initializers
+vk::BufferCreateInfo bufferInfo{
+    .size = spatialRes * directionalRes * sizeof(glm::vec4),
+    .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+    .sharingMode = vk::SharingMode::eExclusive
+};
+vk::raii::Buffer lightFieldBuffer(device, bufferInfo);
+----
+
+ランタイムは「ライトボックス」が物理空間（Stage Space）で完全に静止したままであることを保証し、ユーザーの頭が動いてもライトフィールドの方向的整合性を保ちます。
+
+== 第 4 次元のインデックス
+
+Slang シェーダーでは、4D 座標をこのバッファ内の線形インデックスへ写します。
+
+[source,slang]
+----
+struct LightFieldRay {
+    float4 color;
+};
+
+RWStructuredBuffer<LightFieldRay> lightFieldData;
+
+// Mapping 4D coordinates to a linear index
+uint getLinearIndex(uint2 st, uint2 uv, uint2 stRes, uint2 uvRes) {
+    return st.x + st.y * stRes.x +
+           uv.x * (stRes.x * stRes.y) +
+           uv.y * (stRes.x * stRes.y * uvRes.x);
+}
+----
+
+== 発展: スパースライトフィールド常駐
+
+Vulkan は、標準バッファ限界を超えるギガバイト級ライトフィールドを管理できます。
+
+*   **ホログラフィック仮想テクスチャリング**: Vulkan の **Sparse Resident Resources** を使い、現在可視の光線だけを VRAM に常駐させられる。ユーザーの予測移動に基づき GPU 内外でデータをスワップできる。
+*   **リアルタイム生成**: Vulkan の **Mesh Shaders** を使い、動的物体向けにライトフィールド更新をリアルタイムで「ベイク」し、動くアクターや変化するライティングをプレノプティック表現に取り込める。
+
+TIP: ライトフィールド理論とバッファ管理の詳細については、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#resources-buffers[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/14_LightField_Theory/01_introduction.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/14_LightField_Theory/03_high_density_view_arrays.adoc[Next]

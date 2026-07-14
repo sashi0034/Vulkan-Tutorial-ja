@@ -1,0 +1,330 @@
+:pp: {plus}{plus}
+
+= 複数オブジェクトの描画
+
+== はじめに
+
+この章では、Vulkan アプリケーションを拡張して、シーン内の複数オブジェクトを描画します。これまでは単一モデルを描画してきましたが、実際のアプリケーションでは通常、多数のオブジェクトを表示する必要があります。このチュートリアルでは、できるだけ多くのリソースを再利用しながら、複数オブジェクトを効率的に管理・描画する方法を示します。
+
+== 概要
+
+複数オブジェクトを描画するとき、どのリソースを次のように扱うかを検討する必要があります。
+
+1. *すべてのオブジェクトで共有する* — メモリ使用量と状態変更を最小限にするため
+2. *各オブジェクト用に複製する* — 独立した位置と見た目を可能にするため
+
+各カテゴリに典型的に入るものの簡単な一覧です。
+
+*共有リソース:*
+
+* 頂点バッファとインデックスバッファ（オブジェクトが同じメッシュを使う場合）
+* テクスチャとサンプラー（オブジェクトが同じテクスチャを使う場合）
+* パイプラインオブジェクトとパイプラインレイアウト
+* レンダーパス
+* コマンドプール
+
+*オブジェクトごとのリソース:*
+
+* 変換行列（位置、回転、スケール）
+* それらの行列を含むユニフォームバッファ
+* それらのユニフォームバッファを参照するディスクリプタセット
+* プッシュ定数（小さく頻繁に変わるデータ用）
+
+== 実装
+
+複数オブジェクトを描画するために必要な主な変更を見ていきましょう。
+
+=== GameObject 構造体の定義
+
+まず、オブジェクトごとのデータを保持する構造体を作成します。
+
+[,c{pp}]
+----
+// Define a structure to hold per-object data
+struct GameObject {
+    // Transform properties
+    glm::vec3 position = {0.0f, 0.0f, 0.0f};
+    glm::vec3 rotation = {0.0f, 0.0f, 0.0f};
+    glm::vec3 scale = {1.0f, 1.0f, 1.0f};
+
+    // Uniform buffer for this object (one per frame in flight)
+    std::vector<vk::raii::Buffer> uniformBuffers;
+    std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
+    std::vector<void*> uniformBuffersMapped;
+
+    // Descriptor sets for this object (one per frame in flight)
+    std::vector<vk::raii::DescriptorSet> descriptorSets;
+
+    // Calculate model matrix based on position, rotation, and scale
+    glm::mat4 getModelMatrix() const {
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::translate(model, position);
+        model = glm::rotate(model, rotation.x, glm::vec3(1.0f, 0.0f, 0.0f));
+        model = glm::rotate(model, rotation.y, glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, rotation.z, glm::vec3(0.0f, 0.0f, 1.0f));
+        model = glm::scale(model, scale);
+        return model;
+    }
+};
+----
+
+この構造体は次をカプセル化します。
+
+* オブジェクトの変換（位置、回転、スケール）
+* オブジェクトごとのユニフォームバッファ（インフライトフレームごとに 1 つ）
+* オブジェクトごとのディスクリプタセット（インフライトフレームごとに 1 つ）
+* モデル行列を計算するヘルパーメソッド
+
+=== GameObject の配列の作成
+
+アプリケーションクラスでは、単一のユニフォームバッファとディスクリプタセットのセットを、GameObject の配列に置き換えます。
+
+[,c{pp}]
+----
+// Define the number of objects to render
+constexpr int MAX_OBJECTS = 3;
+
+// In the VulkanApplication class:
+// Array of game objects to render
+std::array<GameObject, MAX_OBJECTS> gameObjects;
+----
+
+=== GameObject の初期化
+
+異なる位置、回転、スケールでゲームオブジェクトをセットアップする新しいメソッドを追加します。
+
+[,c{pp}]
+----
+// Initialize the game objects with different positions, rotations, and scales
+void setupGameObjects() {
+    // Object 1 - Center
+    gameObjects[0].position = {0.0f, 0.0f, 0.0f};
+    gameObjects[0].rotation = {0.0f, 0.0f, 0.0f};
+    gameObjects[0].scale = {1.0f, 1.0f, 1.0f};
+
+    // Object 2 - Left
+    gameObjects[1].position = {-2.0f, 0.0f, -1.0f};
+    gameObjects[1].rotation = {0.0f, glm::radians(45.0f), 0.0f};
+    gameObjects[1].scale = {0.75f, 0.75f, 0.75f};
+
+    // Object 3 - Right
+    gameObjects[2].position = {2.0f, 0.0f, -1.0f};
+    gameObjects[2].rotation = {0.0f, glm::radians(-45.0f), 0.0f};
+    gameObjects[2].scale = {0.75f, 0.75f, 0.75f};
+}
+----
+
+このメソッドは、`initVulkan()` からモデル読み込みの後、ユニフォームバッファ作成の前に呼び出します。
+
+=== 各オブジェクト用のユニフォームバッファの作成
+
+単一セットのユニフォームバッファを作成する代わりに、各オブジェクト用に作成します。
+
+[,c{pp}]
+----
+// Create uniform buffers for each object
+void createUniformBuffers() {
+    // For each game object
+    for (auto& gameObject : gameObjects) {
+        gameObject.uniformBuffers.clear();
+        gameObject.uniformBuffersMemory.clear();
+        gameObject.uniformBuffersMapped.clear();
+
+        // Create uniform buffers for each frame in flight
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
+            vk::raii::Buffer buffer({});
+            vk::raii::DeviceMemory bufferMem({});
+            createBuffer(bufferSize, vk::BufferUsageFlagBits::eUniformBuffer,
+                         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                         buffer, bufferMem);
+            gameObject.uniformBuffers.emplace_back(std::move(buffer));
+            gameObject.uniformBuffersMemory.emplace_back(std::move(bufferMem));
+            gameObject.uniformBuffersMapped.emplace_back(gameObject.uniformBuffersMemory[i].mapMemory(0, bufferSize));
+        }
+    }
+}
+----
+
+=== ディスクリプタプールサイズの更新
+
+すべてのオブジェクトに対応できるよう、ディスクリプタプールサイズを増やす必要があります。
+
+[,c{pp}]
+----
+void createDescriptorPool() {
+    // We need MAX_OBJECTS * MAX_FRAMES_IN_FLIGHT descriptor sets
+    std::array poolSize {
+        vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, MAX_OBJECTS * MAX_FRAMES_IN_FLIGHT),
+        vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler, MAX_OBJECTS * MAX_FRAMES_IN_FLIGHT)
+    };
+    vk::DescriptorPoolCreateInfo poolInfo{
+        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+        .maxSets = MAX_OBJECTS * MAX_FRAMES_IN_FLIGHT,
+        .poolSizeCount = static_cast<uint32_t>(poolSize.size()),
+        .pPoolSizes = poolSize.data()
+    };
+    descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
+}
+----
+
+=== 各オブジェクト用のディスクリプタセットの作成
+
+同様に、各オブジェクト用にディスクリプタセットを作成します。
+
+[,c{pp}]
+----
+void createDescriptorSets() {
+    // For each game object
+    for (auto& gameObject : gameObjects) {
+        // Create descriptor sets for each frame in flight
+        std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, *descriptorSetLayout);
+        vk::DescriptorSetAllocateInfo allocInfo{
+            .descriptorPool = *descriptorPool,
+            .descriptorSetCount = static_cast<uint32_t>(layouts.size()),
+            .pSetLayouts = layouts.data()
+        };
+
+        gameObject.descriptorSets.clear();
+        gameObject.descriptorSets = device.allocateDescriptorSets(allocInfo);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vk::DescriptorBufferInfo bufferInfo{
+                .buffer = *gameObject.uniformBuffers[i],
+                .offset = 0,
+                .range = sizeof(UniformBufferObject)
+            };
+            vk::DescriptorImageInfo imageInfo{
+                .sampler = *textureSampler,
+                .imageView = *textureImageView,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+            };
+            std::array descriptorWrites{
+                vk::WriteDescriptorSet{
+                    .dstSet = *gameObject.descriptorSets[i],
+                    .dstBinding = 0,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eUniformBuffer,
+                    .pBufferInfo = &bufferInfo
+                },
+                vk::WriteDescriptorSet{
+                    .dstSet = *gameObject.descriptorSets[i],
+                    .dstBinding = 1,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &imageInfo
+                }
+            };
+            device.updateDescriptorSets(descriptorWrites, {});
+        }
+    }
+}
+----
+
+=== すべてのオブジェクトのユニフォームバッファの更新
+
+すべてのオブジェクトを扱えるよう、ユニフォームバッファの更新を変更します。
+
+[,c{pp}]
+----
+void updateUniformBuffers() {
+    static auto startTime = std::chrono::high_resolution_clock::now();
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    float time = std::chrono::duration<float>(currentTime - startTime).count();
+
+    // Camera and projection matrices (shared by all objects)
+    glm::mat4 view = glm::lookAt(glm::vec3(2.0f, 2.0f, 6.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat4 proj = glm::perspective(glm::radians(45.0f),
+                                     static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height),
+                                     0.1f, 20.0f);
+    proj[1][1] *= -1; // Flip Y for Vulkan
+
+    // Update uniform buffers for each object
+    for (auto& gameObject : gameObjects) {
+        // Apply continuous rotation to the object
+        gameObject.rotation.y += 0.001f; // Slow rotation around Y axis
+
+        // Get the model matrix for this object
+        glm::mat4 initialRotation = glm::rotate(glm::mat4(1.0f), glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+        glm::mat4 model = gameObject.getModelMatrix() * initialRotation;
+
+        // Create and update the UBO
+        UniformBufferObject ubo{
+            .model = model,
+            .view = view,
+            .proj = proj
+        };
+
+        // Copy the UBO data to the mapped memory
+        memcpy(gameObject.uniformBuffersMapped[frameIndex], &ubo, sizeof(ubo));
+    }
+}
+----
+
+ビュー行列とプロジェクション行列はすべてのオブジェクトで共有し、各オブジェクトは独自のモデル行列を持つことに注意してください。
+
+=== コマンドバッファ記録の変更
+
+最後に、各オブジェクトを描画するようコマンドバッファの記録を更新します。
+
+[,c{pp}]
+----
+void recordCommandBuffer(uint32_t imageIndex) {
+    // ... (beginning of the method remains the same)
+
+    // Bind vertex and index buffers (shared by all objects)
+    commandBuffers[frameIndex].bindVertexBuffers(0, *vertexBuffer, {0});
+    commandBuffers[frameIndex].bindIndexBuffer(*indexBuffer, 0, vk::IndexType::eUint32);
+
+    // Draw each object with its own descriptor set
+    for (const auto& gameObject : gameObjects) {
+        // Bind the descriptor set for this object
+        commandBuffers[frameIndex].bindDescriptorSets(
+            vk::PipelineBindPoint::eGraphics,
+            *pipelineLayout,
+            0,
+            *gameObject.descriptorSets[frameIndex],
+            nullptr
+        );
+
+        // Draw the object
+        commandBuffers[frameIndex].drawIndexed(indices.size(), 1, 0, 0, 0);
+    }
+
+    // ... (end of the method remains the same)
+}
+----
+
+== 性能上の考慮事項
+
+複数オブジェクトを描画するとき、次の性能上の考慮事項を心に留めておいてください。
+
+1. *状態変更を最小化する*: バインド変更を減らすため、マテリアル/テクスチャごとにオブジェクトをグループ化します。
+2. *インスタンシングを使う*: 多数の同一オブジェクト向け（このチュートリアルでは扱いません）。
+3. *プッシュ定数を検討する*: 小さく頻繁に変わるデータには、ユニフォームバッファの代わりに使います。
+4. *ドローコールをバッチする*: 可能なところで CPU オーバーヘッドを減らします。
+5. *間接描画を使う*: 大量のオブジェクト向け（ここでは扱いません）。
+
+== まとめ
+
+Vulkan で複数オブジェクトを描画する方法を学びました。内容は次のとおりです。
+
+1. オブジェクトごとのデータを保持する構造体を作成する
+2. 各オブジェクトに必要なリソース（ユニフォームバッファ、ディスクリプタセット）を複製する
+3. 再利用できるリソース（頂点/インデックスバッファ、パイプライン、テクスチャ）を共有する
+4. 各オブジェクトを独自の変換で描画するようレンダリングループを更新する
+
+このアプローチにより、適切なところでリソースを共有して良い性能を保ちつつ、オブジェクトを独立して位置づけ、回転し、スケールする柔軟性が得られます。
+
+実際のアプリケーションでは、このシステムを次のように拡張できます。
+
+* オブジェクト階層（親子関係）
+* オブジェクトごとに異なるメッシュとマテリアル
+* カメラ視野外のオブジェクトの描画を避けるフラスタムカリング
+* 距離に応じたオブジェクトの LOD システム
+
+ここで築いた基盤は、これらのより高度な手法の堅実な出発点になります。
+
+link:/attachments/36_multiple_objects.cpp[C{pp} code]

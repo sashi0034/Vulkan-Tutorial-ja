@@ -1,0 +1,75 @@
+:pp: {plus}{plus}
+= 空間データの洗練
+
+センサから取り込んだ環境メッシュにはしばしばノイズと穴があります。ML 駆動の洗練を使い、これらの生スキャンをクリーンで対話可能な幾何へ変えます。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準の先へ**。
+
+OpenXR は環境メッシュを提供しますが、標準はスキャンの幾何品質や位相的整合性を管理しません。Vulkan のコンピュートシェーダーとレイトレーシング加速構造を使い、リアルタイムメッシュ修復と鏡面を意識した洗練を実装し、標準 OpenXR 取り込みがネイティブに協調しない水準の物理相互作用を提供します。
+
+== 概念: トポロジ推論
+
+標準のメッシュ平滑化はノイズを除去しますが、穴を埋めたり欠けた幾何を「推測」したりはできません。**トポロジ推論（Topology Inference）** はニューラルネットを使い、シーンの欠けた部分を予測します。
+
+1.  **デノイズ**: 「幾何のゴミ」を特定して除去する。
+2.  **穴埋め**: 曲率を予測し（例: 植物の後ろの壁）、ギャップを橋渡しする。
+3.  **プリミティブ近似**: 低ポリプリミティブ（テーブルの箱など）を提案し、複雑でノイズの多いメッシュを置き換える。
+
+ランタイムは LiDAR からメッシュへの変換と時間的平滑化（SLAM）を扱い、洗練された幾何が物理空間にアンカーされたままであることを保証します。
+
+== 実装: ML 支援サーフェス再構成
+
+エンジンでは、コンピュートシェーダーを使い生の空間頂点を ML モデルへ送ります。モデルは **サリエンシーマップ**——再構成を導く確率グリッド——を出力します。
+
+[source,cpp]
+----
+// Binding the spatial mesh and saliency map using designated initializers
+vk::DescriptorBufferInfo meshInfo{
+    .buffer = *rawMeshBuffer,
+    .offset = 0,
+    .range = VK_WHOLE_SIZE
+};
+
+vk::WriteDescriptorSet meshWrite{
+    .dstSet = *reconstructionSet,
+    .dstBinding = 0,
+    .descriptorCount = 1,
+    .descriptorType = vk::DescriptorType::eStorageBuffer,
+    .pBufferInfo = &meshInfo
+};
+----
+
+Slang では、確率データを使い頂点をクリーンな平面へ「スナップ」したりアーティファクトを間引いたりします。
+
+[source,slang]
+----
+// Using ML results to guide mesh reconstruction in Slang
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void reconstructSurfaces(uint3 dtid : SV_DispatchThreadID) {
+    // Query the ML saliency map for this vertex's region
+    float surfaceProbability = mlSaliencyMap.Load(dtid.xy);
+
+    if (surfaceProbability > 0.95) {
+        // High confidence: Snap to the predicted "clean" plane
+        float3 refinedPos = predictCleanSurface(dtid.xyz);
+        updateMeshVertex(dtid.x, refinedPos);
+    } else if (surfaceProbability < 0.1) {
+        // Low confidence: This is likely a sensor artifact (e.g., a mirror reflection)
+        degenerateMeshVertex(dtid.x);
+    }
+}
+----
+
+== 発展: リアルタイムメッシュ修復と鏡面推定
+
+Vulkan は、標準フィードを超える幾何クリーンアップを可能にします。
+
+*   **リアルタイムメッシュ修復**: Vulkan の **Ray Tracing Acceleration Structures** を使い、その場でリアルタイムメッシュ間引きと修復を実装し、標準 OpenXR フィードが管理しない穴を埋められる。
+*   **反射面推定**: センサベースメッシュは鏡やガラスでしばしば失敗する。Vulkan **Ray Tracing** を使い、スキャンした部屋に対して光線をトレースし、窓を考慮して OpenXR 幾何を調整することで、潜在的な反射面を特定できる。
+
+TIP: シーン理解とメッシュ洗練の詳細については、公式の link:https://registry.khronos.org/OpenXR/specs/1.1/html/xpspec.html#XR_EXT_scene_understanding[XR_EXT_scene_understanding Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[本チュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/17_ML_Inference_Spatial/02_on_gpu_inference.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/17_ML_Inference_Spatial/04_incorporating_into_the_engine.adoc[Next]

@@ -1,0 +1,345 @@
+:pp: {plus}{plus}
+
+= イメージビューとサンプラー
+
+この章では、グラフィックスパイプラインがイメージをサンプリングするために必要なリソースをさらに 2 つ作成します。
+最初のリソースはスワップチェーンイメージを扱っていたときにすでに見たものですが、2 つ目は新しいものです。シェーダがイメージからテクセルをどう読むかに関係します。
+
+== テクスチャイメージビュー
+
+スワップチェーンイメージとフレームバッファで以前見たように、イメージは直接ではなくイメージビュー経由でアクセスされます。
+テクスチャイメージ用にも、そのようなイメージビューを作成する必要があります。
+
+テクスチャイメージ用の `VkImageView` を保持するクラスメンバを追加し、それを作成する新しい関数 `createTextureImageView` を作成します。
+
+[,c++]
+----
+vk::raii::ImageView textureImageView = nullptr;
+
+...
+
+void initVulkan()
+{
+    ...
+    createTextureImage();
+    createTextureImageView();
+    createVertexBuffer();
+    ...
+}
+
+...
+
+void createTextureImageView()
+{
+}
+----
+
+この関数のコードは `createImageViews` を直接基にできます。
+変更が必要なのは `format` と `image` の 2 つだけです。
+
+[,c++]
+----
+vk::ImageViewCreateInfo viewInfo{
+    .image            = image,
+    .viewType         = vk::ImageViewType::e2D,
+    .format           = format,
+    .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1}};
+----
+
+明示的な `viewInfo.components` の初期化は省略しました。どうせデフォルトで `vk::ComponentSwizzle::eIdentity` に初期化されるからです。
+`vk::raii::ImageView` コンストラクタを呼び出してイメージビューの作成を完了します。
+
+[,c++]
+----
+textureImageView = vk::raii::ImageView(device, viewInfo);
+----
+
+ロジックの多くが `createImageViews` と重複しているので、新しい `createImageView` 関数へ抽象化したくなるかもしれません。
+
+[,c++]
+----
+vk::raii::ImageView createImageView(vk::Image const &image, vk::Format format)
+{
+  vk::ImageViewCreateInfo viewInfo{
+      .image            = image,
+      .viewType         = vk::ImageViewType::e2D,
+      .format           = format,
+      .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1}};
+  return vk::raii::ImageView(device, viewInfo);
+}
+----
+
+`createTextureImageView` 関数は次のように簡略化できます。
+
+[,c++]
+----
+void createTextureImageView()
+{
+  textureImageView = createImageView(*textureImage, vk::Format::eR8G8B8A8Srgb);
+}
+----
+
+そして `createImageViews` は次のように簡略化できます。
+
+[,c++]
+----
+void createImageViews()
+{
+  assert(swapChainImageViews.empty());
+
+  swapChainImageViews.reserve(swapChainImages.size());
+  for ( auto &image: swapChainImages )
+  {
+    swapChainImageViews.emplace_back(createImageView(image, swapChainSurfaceFormat.format));
+  }
+}
+----
+
+== サンプラー
+
+シェーダがイメージからテクセルを直接読むことも可能ですが、テクスチャとして使う場合それはあまり一般的ではありません。
+テクスチャは通常、最終的に取得する色を計算するためにフィルタリングと変換を適用するサンプラー経由でアクセスされます。
+
+これらのフィルタは、オーバーサンプリングのような問題に対処するのに役立ちます。
+テクセルよりフラグメントが多いジオメトリにマッピングされたテクスチャを考えてください。
+各フラグメントのテクスチャ座標に対して最も近いテクセルを取るだけなら、最初の画像のような結果になります。
+
+image::/images/texture_filtering.png[]
+
+最も近い 4 つのテクセルを線形補間で組み合わせると、右側のようなより滑らかな結果になります。
+もちろんアプリケーションによっては左のスタイルの方が合うアート要件があるかもしれません（Minecraft を思い浮かべてください）が、従来のグラフィックスアプリケーションでは右が好まれます。
+サンプラーオブジェクトは、テクスチャから色を読むときにこのフィルタリングを自動的に適用します。
+
+アンダーサンプリングは逆の問題で、フラグメントよりテクセルが多い場合です。
+これにより、市松模様のテクスチャを急角度でサンプリングするような高周波パターンでアーティファクトが生じます。
+
+image::/images/anisotropic_filtering.png[]
+
+左の画像に示すように、遠くではテクスチャがぼやけた塊になります。
+その解決策が https://en.wikipedia.org/wiki/Anisotropic_filtering[異方性フィルタリング] で、これもサンプラーが自動的に適用できます。
+
+これらのフィルタ以外に、サンプラーは変換も担当できます。
+_アドレッシングモード_ によって、イメージ外のテクセルを読もうとしたときに何が起きるかを決めます。
+下の画像にいくつかの可能性を示します。
+
+image::/images/texture_addressing.png[]
+
+そのようなサンプラーオブジェクトをセットアップする関数 `createTextureSampler` をこれから作成します。
+後でシェーダでテクスチャから色を読むために、そのサンプラーを使います。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createTextureImage();
+    createTextureImageView();
+    createTextureSampler();
+    ...
+}
+
+...
+
+void createTextureSampler()
+{
+}
+----
+
+サンプラーは、適用すべきすべてのフィルタと変換を指定する `vk::SamplerCreateInfo` 構造体で設定します。
+
+[,c++]
+----
+vk::SamplerCreateInfo samplerInfo{.magFilter = vk::Filter::eLinear, .minFilter = vk::Filter::eLinear};
+----
+
+`magFilter` と `minFilter` フィールドは、拡大または縮小されたテクセルをどう補間するかを指定します。
+拡大は上記のオーバーサンプリング問題に、縮小はアンダーサンプリングに関係します。
+選択肢は `vk::Filter::eNearest` と `vk::Filter::eLinear` で、上の画像で示したモードに対応します。
+
+[,c++]
+----
+vk::SamplerCreateInfo samplerInfo{.magFilter    = vk::Filter::eLinear,
+                                  .minFilter    = vk::Filter::eLinear,
+                                  .mipmapMode   = vk::SamplerMipmapMode::eLinear,
+                                  .addressModeU = vk::SamplerAddressMode::eRepeat,
+                                  .addressModeV = vk::SamplerAddressMode::eRepeat,
+                                  .addressModeW = vk::SamplerAddressMode::eRepeat};
+----
+
+アドレッシングモードは、`addressMode` フィールドを使って軸ごとに指定できます。
+利用可能な値を以下に示します。
+そのほとんどは上の画像で示されています。
+軸は X、Y、Z ではなく U、V、W と呼ばれることに注意してください。
+これはテクスチャ空間座標の慣習です。
+
+* `vk::SamplerAddressMode::eRepeat`: イメージ寸法を超えたときにテクスチャを繰り返す
+* `vk::SamplerAddressMode::eMirroredRepeat`: 繰り返しに似ているが、寸法を超えたときに座標を反転してイメージをミラーする
+* `vk::SamplerAddressMode::eClampToEdge`: イメージ寸法を超えた座標に最も近いエッジの色を取る
+* `vk::SamplerAddressMode::eMirrorClampToEdge`: エッジへのクランプに似ているが、最も近いエッジではなく反対側のエッジを使う
+* `vk::SamplerAddressMode::eClampToBorder`: イメージの寸法を超えてサンプリングしたときに単色を返す
+
+このチュートリアルではイメージ外をサンプリングしないので、どのアドレッシングモードを使うかはあまり重要ではありません。
+ただし、床や壁のようなテクスチャのタイリングに使えるため、リピートモードがおそらく最も一般的なモードです。
+
+[,c++]
+----
+vk::PhysicalDeviceProperties properties = physicalDevice.getProperties();
+vk::SamplerCreateInfo        samplerInfo{.magFilter        = vk::Filter::eLinear,
+                                         .minFilter        = vk::Filter::eLinear,
+                                         .mipmapMode       = vk::SamplerMipmapMode::eLinear,
+                                         .addressModeU     = vk::SamplerAddressMode::eRepeat,
+                                         .addressModeV     = vk::SamplerAddressMode::eRepeat,
+                                         .addressModeW     = vk::SamplerAddressMode::eRepeat,
+                                         .anisotropyEnable = vk::True,
+                                         .maxAnisotropy    = properties.limits.maxSamplerAnisotropy};
+----
+
+`anisotropyEnable` フィールドは、異方性フィルタリングを使うかどうかを指定します。
+性能が懸念でない限り、使わない理由はありません。
+`maxAnisotropy` フィールドは、最終色の計算に使えるテクセルサンプル数を制限します。
+値が低いほど性能は良くなりますが、品質は下がります。
+どの値を使えるかを知るには、次のように物理デバイスのプロパティを取得する必要があります。
+
+[,c++]
+----
+vk::PhysicalDeviceProperties properties = physicalDevice.getProperties();
+----
+
+`vk::PhysicalDeviceProperties` 構造体のドキュメントを見ると、`limits` という名前の `vk::PhysicalDeviceLimits` メンバが含まれているのが分かります。
+この構造体にはさらに `maxSamplerAnisotropy` というメンバがあり、これが `maxAnisotropy` に指定できる最大値です。
+最大品質を目指すなら、その値をそのまま使えばよいです。
+プログラムの先頭でプロパティを問い合わせて必要な関数へ渡すか、`createTextureSampler` 関数自体で問い合わせるかのどちらかです。
+
+[,c++]
+----
+vk::PhysicalDeviceProperties properties = physicalDevice.getProperties();
+vk::SamplerCreateInfo        samplerInfo{.magFilter        = vk::Filter::eLinear,
+                                         .minFilter        = vk::Filter::eLinear,
+                                         .mipmapMode       = vk::SamplerMipmapMode::eLinear,
+                                         .addressModeU     = vk::SamplerAddressMode::eRepeat,
+                                         .addressModeV     = vk::SamplerAddressMode::eRepeat,
+                                         .addressModeW     = vk::SamplerAddressMode::eRepeat,
+                                         .anisotropyEnable = vk::True,
+                                         .maxAnisotropy    = properties.limits.maxSamplerAnisotropy,
+                                         .compareEnable    = vk::False,
+                                         .compareOp        = vk::CompareOp::eAlways};
+----
+
+[,c++]
+----
+samplerInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
+----
+
+`borderColor` フィールドは、クランプ・トゥ・ボーダーアドレッシングモードでイメージ外をサンプリングしたときに返す色を指定します。
+float または int 形式で、黒、白、または透明を返せます。
+任意の色は指定できません。
+
+[,c++]
+----
+samplerInfo.unnormalizedCoordinates = vk::False;
+----
+
+`unnormalizedCoordinates` フィールドは、イメージ内のテクセルをアドレスするのに使う座標系を指定します。
+このフィールドが `vk::True` なら、単に `[0, texWidth)` と `[0, texHeight)` の範囲内の座標を使えます。
+`vk::False` なら、テクセルはすべての軸で `[0, 1)` の範囲を使ってアドレスされます。
+実世界のアプリケーションはほぼ常に正規化座標を使います。同じ座標で異なる解像度のテクスチャを使えるからです。
+
+[,c++]
+----
+samplerInfo.compareEnable = vk::False;
+samplerInfo.compareOp = vk::CompareOp::eAlways;
+----
+
+比較関数が有効な場合、テクセルはまずある値と比較され、その比較結果がフィルタリング操作に使われます。
+これは主にシャドウマップでの https://developer.nvidia.com/gpugems/GPUGems/gpugems_ch11.html[percentage-closer filtering] に使われます。
+今後の章で見ていきます。
+
+[,c++]
+----
+samplerInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
+samplerInfo.mipLodBias = 0.0f;
+samplerInfo.minLod = 0.0f;
+samplerInfo.maxLod = 0.0f;
+----
+
+これらのフィールドはすべてミップマッピングに適用されます。
+ミップマッピングは link:/Generating_Mipmaps[後の章] で見ていきますが、基本的には適用できる別の種類のフィルタです。
+
+サンプラーの動作はこれで完全に定義されました。
+サンプラーオブジェクトのハンドルを保持するクラスメンバを追加し、`vkCreateSampler` でサンプラーを作成します。
+
+[,c++]
+----
+vk::raii::ImageView    textureImageView   = nullptr;
+vk::raii::Sampler      textureSampler     = nullptr;
+
+...
+
+void createTextureSampler()
+{
+    ...
+
+    textureSampler = vk::raii::Sampler(device, samplerInfo);
+}
+----
+
+サンプラーがどこにも `vk::Image` を参照していないことに注意してください。
+サンプラーは、テクスチャから色を取り出すインタフェースを提供する独立したオブジェクトです。
+1D、2D、3D を問わず、任意のイメージに適用できます。
+これは、テクスチャイメージとフィルタリングを単一の状態にまとめていた多くの古い API とは異なります。
+
+== 異方性デバイス機能
+
+今プログラムを実行すると、次のようなバリデーションレイヤメッセージが表示されます。
+
+image::/images/validation_layer_anisotropy.png[]
+
+これは、異方性フィルタリングが実際にはオプションのデバイス機能だからです。
+要求するよう `createLogicalDevice` 関数を更新する必要があります。
+
+[,c++]
+----
+vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = {
+    {.features = {.samplerAnisotropy = true } },            // vk::PhysicalDeviceFeatures2
+    {.synchronization2 = true, .dynamicRendering = true },  // vk::PhysicalDeviceVulkan13Features
+    {.extendedDynamicState = true }                         // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
+};
+----
+
+そして、現代のグラフィックスカードがサポートしない可能性は非常に低いものの、利用可能かを確認するよう `isDeviceSuitable` も更新すべきです。
+
+[,c++]
+----
+bool isDeviceSuitable(VkPhysicalDevice device)
+{
+    ...
+
+		auto features                 = physicalDevice.template getFeatures2<vk::PhysicalDeviceFeatures2,
+		                                                                     vk::PhysicalDeviceVulkan13Features,
+		                                                                     vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+		bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy &&
+		                                features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
+		                                features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2 &&
+		                                features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+
+		// Return true if the physicalDevice meets all the criteria
+		return supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures;
+}
+----
+
+`vk::raii::PhysicalDevice::getFeatures2` は、ブール値を設定することで、要求される機能ではなくサポートされる機能を示すために `vk::PhysicalDeviceFeatures` 構造体を再利用します。
+
+異方性フィルタリングの利用可能性を強制する代わりに、条件付きで単に使わないことも可能です。
+
+[,c++]
+----
+samplerInfo.anisotropyEnable = vk::False;
+samplerInfo.maxAnisotropy = 1.0f;
+----
+
+xref:./02_Combined_image_sampler.adoc[次の章]では、正方形にテクスチャを描くために、イメージとサンプラーオブジェクトをシェーダへ公開します。
+
+link:/attachments/25_sampler.cpp[C{pp} code] /
+link:/attachments/22_shader_ubo.slang[slang shader] /
+link:/attachments/22_shader_ubo.vert[GLSL Vertex shader] /
+link:/attachments/22_shader_ubo.frag[GLSL Fragment shader]

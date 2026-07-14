@@ -1,0 +1,381 @@
+:pp: {plus}{plus}
+
+= モバイル開発: レンダリングのアプローチ
+
+== モバイル GPU のレンダリング アプローチ
+
+モバイル GPU は通常、デスクトップ GPU とは異なるレンダリング アーキテクチャを使用します。これらの違いを理解することは、モバイル プラットフォーム向けに Vulkan アプリケーションを最適化するために重要です。このセクションでは、タイルベース レンダリング (TBR) と即時モード レンダリング (IMR) という 2 つの主要なレンダリング アプローチについて説明します。
+
+=== タイルベース レンダリング (TBR)
+
+最新のモバイル GPU のほとんどは、実装によってはタイルベース遅延レンダリング (TBDR) とも呼ばれる、タイルベースのレンダリング アーキテクチャを使用します。
+
+==== TBR の仕組み
+
+1. *タイリング フェーズ*: 画面は小さなタイル (通常は 16x16 または 32x32 ピクセル) に分割されます。
+
+2. *ビニング フェーズ*: GPU は、どのプリミティブ (三角形) が各タイルに影響を与えるかを決定します。
+
+3. *レンダリング フェーズ*: 各タイルについて:
+   ａ．そのタイルに影響を与えるプリミティブをオンチップ メモリにロードします。
+   b.プリミティブをタイルにレンダリングします。
+   c.完成したタイルをメイン メモリに書き込みます。
+
+==== TBRのメリット
+
+1. *メモリ帯域幅の削減*: レンダリングはオンチップ メモリで行われるため、メイン メモリへのトラフィックが減少します。
+
+2. *電力効率*: メモリ帯域幅が低いということは、消費電力が低いことを意味します。これはバッテリー駆動のデバイスにとって重要です。
+
+3. *隠れたサーフェスの削除*: 多くの TBR GPU はビニング フェーズ中に初期の深度テストを実行し、オーバードローを削減します。
+
+==== TBR の最適化
+
+TBR GPU から最高のパフォーマンスを得るには、次の最適化を検討してください。
+
+* *一時的なアタッチメント*: レンダー パス内でのみ使用されるレンダー ターゲットに一時的なアタッチメントを使用します。
+
+[source,cpp]
+----
+vk::AttachmentDescription depth_attachment{};
+depth_attachment.setFormat(depth_format);
+depth_attachment.setSamples(vk::SampleCountFlagBits::e1);
+depth_attachment.setLoadOp(vk::AttachmentLoadOp::eClear);
+depth_attachment.setStoreOp(vk::AttachmentStoreOp::eDontCare);  // Don't store the result
+depth_attachment.setStencilLoadOp(vk::AttachmentLoadOp::eDontCare);
+depth_attachment.setStencilStoreOp(vk::AttachmentStoreOp::eDontCare);
+depth_attachment.setInitialLayout(vk::ImageLayout::eUndefined);
+depth_attachment.setFinalLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal);
+
+// When creating the image, mark the attachment as transient
+vk::ImageCreateInfo image_info{};
+image_info.setImageType(vk::ImageType::e2D);
+image_info.setExtent(vk::Extent3D(width, height, 1));
+image_info.setMipLevels(1);
+image_info.setArrayLayers(1);
+image_info.setFormat(depth_format);
+image_info.setTiling(vk::ImageTiling::eOptimal);
+image_info.setInitialLayout(vk::ImageLayout::eUndefined);
+image_info.setUsage(vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eTransientAttachment);
+image_info.setSamples(vk::SampleCountFlagBits::e1);
+// Prefer lazily allocated memory for transient attachments when supported
+// Choose memory with vk::MemoryPropertyFlagBits::eLazilyAllocated
+----
+
+* *レンダー パスの構造*: を活用するようにレンダー パスを設計します。
+タイルベースのレンダリング:
+   - サブパスを使用して、タイル メモリ内でレンダリング操作を維持します。
+   - 適切なロード/ストア操作を使用して、メモリ トラフィックを最小限に抑えます。
+
+[source,cpp]
+----
+// Create a render pass with multiple subpasses
+vk::SubpassDescription subpass1{};
+subpass1.setPipelineBindPoint(vk::PipelineBindPoint::eGraphics);
+subpass1.setColorAttachments(color_attachment_refs);
+subpass1.setDepthStencilAttachment(&depth_attachment_ref);
+
+vk::SubpassDescription subpass2{};
+subpass2.setPipelineBindPoint(vk::PipelineBindPoint::eGraphics);
+subpass2.setInputAttachments(input_attachment_refs);  // Use output from subpass1 as input
+subpass2.setColorAttachments(final_color_attachment_refs);
+
+// Create a dependency to ensure proper ordering
+vk::SubpassDependency dependency{};
+dependency.setSrcSubpass(0);
+dependency.setDstSubpass(1);
+dependency.setSrcStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
+dependency.setDstStageMask(vk::PipelineStageFlagBits::eFragmentShader);
+dependency.setSrcAccessMask(vk::AccessFlagBits::eColorAttachmentWrite);
+dependency.setDstAccessMask(vk::AccessFlagBits::eInputAttachmentRead);
+
+// Create the render pass
+vk::RenderPassCreateInfo render_pass_info{};
+render_pass_info.setAttachments(attachments);
+render_pass_info.setSubpasses({subpass1, subpass2});
+render_pass_info.setDependencies(dependency);
+
+vk::RenderPass render_pass = device.createRenderPass(render_pass_info);
+----
+
+==== TBR のベスト プラクティス
+
+* *外部フレームバッファ読み取りを避ける*: タイルを外部メモリにフラッシュして再ロードする必要がある画像からの読み取りを避けます。これはTBRでは高価です。
+  - オンチップ/タイル メモリからのローカルの同じピクセルの読み取りは問題なく、タイルベースの GPU では推奨されます。
+  - Vulkan では、サブパス内の入力アタッチメントまたは `VK_KHR_dynamic_rendering_local_read` 機能を使用して、タイル メモリを離れることなくタイル ローカル読み取りを実行します。これは、タイルベースのアーキテクチャではピクセル ローカル ストレージ (PLS) と呼ばれることがよくあります。
+
+* *タイル サイズの最適化*: レンダリング アルゴリズムを設計するときは、タイル サイズを考慮してください。たとえば、タイル サイズが 16x16 であることがわかっている場合は、そのサイズで効率的に動作するようにデータまたはアルゴリズムを編成できます。
+
+===== タイラーでのアタッチメントのロード/ストア操作
+
+タイルベースの GPU では、loadOp と storeOp を正しく使用することが、最も大きな影響を与える最適化の 1 つです。
+
+- 以前のコンテンツが必要ない場合は、loadOp = CLEAR およびInitialLayout = UNDEFINED を使用して添付ファイルをクリアします。これにより、タイルに対する外部メモリの読み取りが回避されます。
+- レンダリング パス後に結果が必要ないアタッチメント (一時的な深度または中間カラー ターゲットなど) には、storeOp = DONT_CARE を使用します。これにより、タイルがメイン メモリにフラッシュバックされるのを防ぐことができます。
+- スワップチェーン イメージ (または後でサンプリング/転送する任意のイメージ) の場合は、storeOp = STORE を使用し、finalLayout を適切に設定します (たとえば、スワップチェーンの場合は PRESENT_SRC_KHR)。
+- MSAA の場合、ハードウェアがタイル メモリから解決し、解決されたイメージのみを外部メモリに保存できるように、同じレンダー パス内で解決します。
+
+[source,cpp]
+----
+// Color attachment that we clear and present
+vk::AttachmentDescription color_attachment{};
+color_attachment.setFormat(swapchain_format);
+color_attachment.setSamples(vk::SampleCountFlagBits::e1);
+color_attachment.setLoadOp(vk::AttachmentLoadOp::eClear);
+color_attachment.setStoreOp(vk::AttachmentStoreOp::eStore); // we need to present
+color_attachment.setStencilLoadOp(vk::AttachmentLoadOp::eDontCare);
+color_attachment.setStencilStoreOp(vk::AttachmentStoreOp::eDontCare);
+color_attachment.setInitialLayout(vk::ImageLayout::eUndefined); // no need to load previous contents
+color_attachment.setFinalLayout(vk::ImageLayout::ePresentSrcKHR);
+
+// Depth attachment used only within the pass
+vk::AttachmentDescription depth_attachment{};
+depth_attachment.setFormat(depth_format);
+depth_attachment.setSamples(vk::SampleCountFlagBits::e1);
+depth_attachment.setLoadOp(vk::AttachmentLoadOp::eClear);
+depth_attachment.setStoreOp(vk::AttachmentStoreOp::eDontCare); // don't flush depth to memory
+depth_attachment.setStencilLoadOp(vk::AttachmentLoadOp::eDontCare);
+depth_attachment.setStencilStoreOp(vk::AttachmentStoreOp::eDontCare);
+depth_attachment.setInitialLayout(vk::ImageLayout::eUndefined);
+depth_attachment.setFinalLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal);
+----
+
+[NOTE]
+====
+動的レンダリングを使用する場合、同じルールが vk::RenderingAttachmentInfoloadOp/storeOp フィールドを介して適用されます。
+背景については、「Vulkan ガイド」を参照してください: レンダー パスとサブパス、タイルベースの GPU。
+====
+
+===== タイラーでのパイプライン: サブパスの依存関係と BY_REGION
+
+タイルベースの GPU は、作業とデータをオンチップに維持するきめ細かい同期の恩恵を受けます。
+
+- 入力アタッチメントを含むサブパスを優先して、プロデューサー/コンシューマーを同じレンダー パス内に維持し、タイル ローカルの読み取りを可能にします。
+- vk::DependencyFlagBits::eByRegion を使用して、実際に書き込まれた/読み取られたピクセル領域に危険を限定し、不必要なタイルのフラッシュを回避します。
+- パイプラインをシリアル化し、外部メモリ トラフィックを強制する可能性がある広すぎる障壁 (ALL_COMMANDS、MEMORY_READ/WRITE など) を避けてください。正確なステージ/アクセス マスクを使用します。
+
+例: 色を書き込むサブパスから、その色を入力アタッチメントとして読み取るサブパスへの依存関係。
+
+[source,cpp]
+----
+vk::SubpassDependency dep{};
+dep.setSrcSubpass(0);
+dep.setDstSubpass(1);
+dep.setSrcStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
+dep.setDstStageMask(vk::PipelineStageFlagBits::eFragmentShader);
+dep.setSrcAccessMask(vk::AccessFlagBits::eColorAttachmentWrite);
+dep.setDstAccessMask(vk::AccessFlagBits::eInputAttachmentRead);
+dep.setDependencyFlags(vk::DependencyFlagBits::eByRegion);
+----
+
+例: レンダー パスの最初のサブパスへの外部依存関係。リージョンごとに範囲を制限しながら、前のパスとのパイプライン処理を許可します。
+
+[source,cpp]
+----
+vk::SubpassDependency externalDep{};
+externalDep.setSrcSubpass(VK_SUBPASS_EXTERNAL);
+externalDep.setDstSubpass(0);
+externalDep.setSrcStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
+externalDep.setDstStageMask(vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eColorAttachmentOutput);
+externalDep.setSrcAccessMask(vk::AccessFlagBits::eColorAttachmentWrite);
+externalDep.setDstAccessMask(vk::AccessFlagBits::eDepthStencilAttachmentWrite | vk::AccessFlagBits::eColorAttachmentWrite);
+externalDep.setDependencyFlags(vk::DependencyFlagBits::eByRegion);
+----
+
+[NOTE]
+====
+Synchronization2 (vkCmdPipelineBarrier2 とその仲間) では、ALL_COMMANDS を回避し、危険を捉える最小限のステージ/アクセスのセットを優先します。可能な場合はレンダー パス/サブパス構造を使用します。これは、パイプラインを表現する最もタイラーに適した方法です。
+====
+
+詳細なガイダンスについては、タイルベースの GPU、レンダー パス、および同期に関するxref:https://docs.vulkan.org/guide/latest/[バルカンガイド] トピックを参照してください。
+
+===== メモリ管理
+
+TBR アーキテクチャでのメモリ割り当ての効率を向上するには、次の手順を実行します。
+
+* *最適なメモリ タイプの選択*: vkAllocateMemory を使用する場合、(適切な VkMemoryPropertyFlags を使用して) 最適なメモリ タイプを選択します。
+
+* *バッチ割り当て*: リソースの各タイプ (インデックス バッファ、頂点バッファ、ユニフォーム バッファなど) に対して、可能な場合は、特定のサイズの大きなメモリ チャンクを一度に割り当てます。
+
+* *メモリ リソースの再利用*: タイム スライスを通じて、割り当てられたメモリを複数のパスで順番に使用します。
+
+* *適切な場合はキャッシュされたメモリを使用*: CPU がアクセスする可能性がある場合は、VK_MEMORY_PROPERTY_HOST_CACHED_BIT を使用し、メモリを手動でフラッシュすることを検討してください。ドライバーは一度に大きなメモリ ブロックをリフレッシュできるため、これは多くの場合、VK_MEMORY_PROPERTY_HOST_COHERENT_BIT よりも効率的です。
+
+* *割り当て呼び出しを最小限に抑える*: vkAllocateMemory への頻繁な呼び出しを避けます。メモリ割り当ての数は、maxMemoryAllocationCount によって制限されます。
+
+===== シェーダーの最適化
+
+TBR アーキテクチャ用にシェーダを最適化すると、パフォーマンスが大幅に向上します。
+
+* *ベクトル化されたメモリ アクセス*: ベクトル化された方法でメモリにアクセスし、アクセス サイクルと帯域幅を削減します。例えば：
+
+[source,glsl]
+----
+// Recommended: Vectorized access
+struct TileStructSample {
+    vec4 data;
+};
+
+void main() {
+    uint idx = 0u;
+    TileStructSample ts[3];
+    while (idx < 3u) {
+        ts[int(idx)].data = a;
+        idx++;
+    }
+}
+
+// Not recommended: Non-vectorized access
+struct TileStructSample {
+    float data1;
+    float data2;
+    float data3;
+    float data4;
+};
+
+void main() {
+    uint idx = 0u;
+    TileStructSample ts[3];
+    while (idx < 3u) {
+        ts[int(idx)].data1 = a;
+        ts[int(idx)].data2 = b;
+        ts[int(idx)].data3 = c;
+        ts[int(idx)].data4 = d;
+        idx++;
+    }
+}
+----
+
+* *均一バッファの最適化*: 小さなデータの場合は、均一バッファの代わりにプッシュ定数またはマクロ定数の使用を検討してください。可能な場合は、動的インデックス作成を避けてください。
+
+* *分岐を最小限に抑える*: 並列処理に悪影響を与える可能性があるため、複雑な分岐構造、分岐の入れ子、およびループ構造を減らします。
+
+* *半精度を使用*: 必要に応じて、帯域幅と消費電力を削減するために半精度浮動小数点数を使用します。 SPIR-V では、変数または結果に緩和精度の装飾を使用します。
+
+===== 深度テストの最適化
+
+TBR のパフォーマンスには、適切な深度テストが不可欠です。
+
+* *深度テストと書き込みを有効にする*: これにより、GPU が隠れたプリミティブを選択し、オーバードローを減らすことができます。
+
+* *Early-Z を無効にする操作を避ける*: 次の操作により、効果的な初期の深度テストが妨げられる可能性があります。
+  - フラグメント シェーダでの破棄命令の使用
+  - gl_FragDepth (GLSL) SV_Depth (スラング) への明示的な書き込み
+  - ストレージイメージまたはストレージバッファの使用
+  - gl_SampleMask の使用 (特定のピクセルをオン/オフにする GLSL の明示的な方法)
+  - 深さ境界と深さ書き込みの両方を有効にする
+  - ブレンディングと深度書き込みの両方を有効にする
+
+* *一貫した比較操作*: CompareOp を使用する場合は、レンダー パス内の各描画の値の一貫性を保つようにしてください。
+
+* *アタッチメントを適切にクリア*: アタッチメントは、レンダー パスの開始時、または以前の描画呼び出しに有効な CompareOp 値が割り当てられていないときにクリアする必要があります。
+
+=== 即時モード レンダリング (IMR)
+
+従来のデスクトップ GPU と一部の古いモバイル GPU は、イミディエイト モード レンダリング アーキテクチャを使用します。
+
+==== IMRの仕組み
+
+1. *頂点処理*: 頂点を処理し、プリミティブを組み立てます。
+
+2. *ラスタライズ*: プリミティブをフラグメントに変換します。
+
+3. *フラグメント処理*: 各フラグメントを処理し、結果をメイン メモリのフレームバッファに直接書き込みます。
+
+==== IMRの利点
+
+1. *シンプルさ*: レンダリング モデルはより単純で、従来のグラフィックス パイプラインと一致します。
+
+2. *柔軟性*: フレームバッファからの読み取りを必要とする一部のアルゴリズムは実装が簡単です。
+
+==== IMR 向けの最適化
+
+ターゲット デバイスが IMR を使用している場合は、次の最適化を検討してください。
+
+1. *前から後ろへのレンダリング*: オーバードローを最小限に抑えるために、不透明なオブジェクトを前から後ろにレンダリングします。
+
+2. *Early-Z*: 深さテストを使用して、パイプラインの早い段階でフラグメントを拒否します。
+
+3. *オクルージョン カリング*: 表示されないオブジェクトのレンダリングを避けるためにオクルージョン カリングを実装します。
+
+=== レンダリング アーキテクチャの検出
+
+Vulkan は、GPU が TBR を使用しているか IMR を使用しているかを判断する直接的な方法を提供しません。ただし、デバイスのベンダーとモデルに基づいて、経験に基づいた推測を行うことができます。
+
+[source,cpp]
+----
+bool is_likely_tbr_gpu(vk::PhysicalDevice physical_device) {
+    vk::PhysicalDeviceProperties props = physical_device.getProperties();
+
+    // Most mobile GPUs from these vendors use TBR
+    if (props.vendorID == 0x5143) {  // Qualcomm
+        return true;
+    }
+    if (props.vendorID == 0x1010) {  // PowerVR (Imagination Technologies)
+        return true;
+    }
+    if (props.vendorID == 0x13B5) {  // ARM Mali
+        return true;
+    }
+    if (props.vendorID == 0x19E5) {  // Huawei
+        return true;
+    }
+
+    // Apple GPUs are also TBR
+    if (props.vendorID == 0x106B) {  // Apple
+        return true;
+    }
+
+    // For other vendors, you might need to maintain a list of known TBR GPUs
+    // or just assume desktop GPUs are IMR and mobile GPUs are TBR
+
+    return false;
+}
+----
+
+=== 両方のアーキテクチャに適応する
+
+最善のアプローチは、TBR アーキテクチャと IMR アーキテクチャの両方で適切に動作するようにエンジンを設計することです。
+
+* *アーキテクチャの検出*: ヒューリスティックを使用して、可能性の高いアーキテクチャを検出します。
+
+* *条件付き最適化*: に基づいてさまざまな最適化を適用します。
+検出されたアーキテクチャ:
+
+[source,cpp]
+----
+void configure_rendering_pipeline(vk::PhysicalDevice physical_device) {
+    bool is_tbr = is_likely_tbr_gpu(physical_device);
+
+    if (is_tbr) {
+        // TBR optimizations
+        use_transient_attachments = true;
+        prioritize_subpass_dependencies = true;
+        avoid_framebuffer_reads = true;
+    } else {
+        // IMR optimizations
+        use_front_to_back_sorting = true;
+        prioritize_early_z = true;
+        implement_occlusion_culling = true;
+    }
+}
+----
+
+* *フォールバック戦略*: アーキテクチャを決定できない場合は、アーキテクチャを最適化します。
+TBR。これらの最適化は通常、IMR のパフォーマンスに大きな悪影響を与えません。
+
+=== 両方のアーキテクチャのベスト プラクティス
+
+レンダリング アーキテクチャに関係なく、次の実践はパフォーマンスの最適化に役立ちます。
+
+1. *状態の変化を最小限に抑える*: 描画呼び出しをマテリアルごとにグループ化して、状態の変化を減らします。
+
+2. *類似オブジェクトのバッチ処理*: インスタンス化またはバッチ処理を使用して、描画呼び出しのオーバーヘッドを削減します。
+
+3. *適切な同期を使用*: 正しいレンダリングを保証するために必要な最小限の同期を使用します。
+
+4. *ターゲット デバイス上のプロファイル*: 常に実際のターゲット デバイス上で最適化をテストしてください。
+
+次のセクションでは、モバイル デバイス、特にタイルベースのアーキテクチャを利用するデバイスでのパフォーマンスの最適化に役立つ Vulkan 拡張機能について説明します。
+
+xref:Building_a_Simple_Engine/Mobile_Development/03_performance_optimizations.adoc[前: パフォーマンスの最適化] | xref:Building_a_Simple_Engine/Mobile_Development/05_vulkan_extensions.adoc[次へ: モバイル用の Vulkan 拡張機能]

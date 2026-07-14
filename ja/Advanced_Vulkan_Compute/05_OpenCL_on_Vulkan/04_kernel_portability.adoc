@@ -1,0 +1,46 @@
+:pp: {plus}{plus}
+
+= カーネル移植性: Vulkan 向け OpenCL C
+
+== Vulkan 向けに OpenCL C を適応させる
+
+`clspv` はほとんどの OpenCL C カーネルを変換できますが、すべての機能がそのままサポートされるわけではありません。カーネルが Vulkan 上で正しく動くことを保証するには、「Vulkan 風」の OpenCL C スタイルを採用する必要があるかもしれません。
+
+ロジックを書き直す話ではなく、OpenCL と Vulkan のメモリ・実行モデルの違いを意識する話です。
+
+== 物理ポインタを避ける
+
+OpenCL C はメモリを単一のフラットアドレス空間のように扱えます。一方 Vulkan はメモリを異なる型（Storage Buffer、Uniform Buffer、LDS など）に分けます。
+
+`clspv` パイプライン向けにカーネルを書くとき:
+
+*   **バッファを優先**: 大きなデータ配列には `__global` ポインタを使い、Vulkan Storage Buffer へマッピングする。
+*   **明示的に**: ポインタ型（例: `__global`、`__local`、`__constant`）を明確にマークし、`clspv` が正しい Vulkan メモリ領域へマッピングできるようにする。
+*   **ポインタ演算を避ける**: `VK_KHR_variable_pointers` により演算は可能ですが、古いハードウェアでは遅くなることがあります。可能な限りポインタインクリメント（`*(p + i)`）より配列スタイルのインデックス付け（`p[i]`）を使う。
+
+== 同期の理解
+
+OpenCL の `barrier()` は Vulkan の `control_barrier` と非常に似ています。ただし Vulkan は（第 3 章で議論したように）**メモリ一貫性** についてはるかに明示的です。
+
+カーネルを移植するとき:
+
+1.  **スコープを確認**: OpenCL の `CLK_LOCAL_MEM_FENCE` と `CLK_GLOBAL_MEM_FENCE` は、Vulkan の `Workgroup` と `Device` メモリスコープに対応します。
+2.  **ドメイン操作**: ワークグループ間で共有されるデータは、正しいメモリ可視性フラグを含むアトミック演算または明示的なメモリバリア経由で扱うことを保証する。
+
+== 組み込み変数
+
+OpenCL C では `get_global_id()` や `get_local_id()` のような関数を使います。`clspv` はこれらを同等の Vulkan 組み込みへ自動マッピングします。
+
+*   `get_global_id(0)` は `gl_GlobalInvocationID.x`（または Slang では `SV_DispatchThreadID.x`）へマップ
+*   `get_local_id(0)` は `gl_LocalInvocationID.x`（または Slang では `SV_GroupThreadID.x`）へマップ
+*   `get_group_id(0)` は `gl_WorkGroupID.x`（または Slang では `SV_GroupID.x`）へマップ
+
+この直接マッピングのため、カーネルのインデックス付けロジックはそのまま保てます。
+
+== 何百万行ものコードの移植
+
+このパイプラインの本当の力は、レガシーコードを扱えることです。多くの本番グレードのライブラリ（OpenCV やカスタム物理エンジンなど）は何千もの OpenCL カーネルを含みます。これらの単純な移植性ガイドラインに従えば、最小限の労力でこれらのライブラリを Vulkan へ持ち込めます。
+
+次のセクションでは、Vulkan 上に完全な OpenCL 3.0 API 実装を提供することでこれをさらに進める **clvk** を探ります。
+
+xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/03_clspv_pipeline.adoc[前へ: clspv パイプライン] | xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/05_clvk_and_layering.adoc[次へ: clvk とレイヤリング]

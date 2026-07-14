@@ -1,0 +1,289 @@
+:pp: {plus}{plus}
+
+= スワップチェーンの再作成
+
+== はじめに
+
+今のアプリケーションは三角形の描画に成功していますが、まだ適切に処理できていない状況がいくつかあります。
+ウィンドウサーフェスが変化し、スワップチェーンと互換でなくなることがあり得ます。
+それが起きる理由の 1 つは、ウィンドウサイズの変化です。
+これらのイベントを捕捉し、スワップチェーンを再作成しなければなりません。
+
+== スワップチェーンの再作成
+
+`createSwapChain` と、スワップチェーンまたはウィンドウサイズに依存するオブジェクトの作成関数をすべて呼ぶ新しい `recreateSwapChain` 関数を作成します。
+
+[,c++]
+----
+void recreateSwapChain()
+{
+    device.waitIdle();
+
+    createSwapChain();
+    createImageViews();
+}
+----
+
+まず `vk::raii::Device::waitIdle` を呼びます。前の章と同様、まだ使われている可能性のあるリソースに触れるべきではないからです。
+明らかに、スワップチェーン自体を再作成する必要があります。
+イメージビューはスワップチェーンイメージに直接もとづいているため、再作成が必要です。
+
+再作成前にこれらのオブジェクトの古い版がクリーンアップされるよう、クリーンアップコードの一部を、`recreateSwapChain` から呼べる別関数に移すべきです。
+それを `cleanupSwapChain` と呼びましょう。
+
+[,c++]
+----
+void cleanupSwapChain()
+{
+}
+
+void recreateSwapChain()
+{
+    device.waitIdle();
+
+    cleanupSwapChain();
+
+    createSwapChain();
+    createImageViews();
+}
+----
+
+簡略化のため、ここではレンダーパスを再作成しないことに注意してください。
+理論上は、アプリケーションの寿命中にスワップチェーンイメージフォーマットが変わることもあり得ます。たとえば、標準レンジのモニタからハイダイナミックレンジモニタへウィンドウを移したときです。
+ダイナミックレンジの変化が正しく反映されるよう、アプリケーションがレンダーパスを再作成する必要があるかもしれません。
+
+スワップチェーンの更新の一部として再作成されるすべてのオブジェクトのクリーンアップコードを、`cleanup` から `cleanupSwapChain` へ移します。
+
+[,c++]
+----
+void cleanupSwapChain()
+{
+    swapChainImageViews.clear();
+    swapChain = nullptr;
+}
+
+void cleanup()
+{
+    cleanupSwapChain();
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+}
+----
+
+`chooseSwapExtent` ではすでに新しいウィンドウ解像度を問い合わせて、スワップチェーンイメージが（新しい）正しいサイズになるようしているので、`chooseSwapExtent` を修正する必要はないことに注意してください（スワップチェーン作成時にサーフェスのピクセル単位の解像度を得るためにすでに `glfwGetFramebufferSize` を使う必要があったことを思い出してください）。
+
+スワップチェーンの再作成に必要なのはこれだけです。
+ただしこのアプローチの欠点は、新しいスワップチェーンを作成する前にすべてのレンダリングを止める必要があることです。
+古いスワップチェーンのイメージ上で描画コマンドがまだ実行中でも、新しいスワップチェーンを作成することは可能です。
+`vk::SwapchainCreateInfoKHR` 構造体の `oldSwapchain` フィールドに前のスワップチェーンを渡し、使い終わったらすぐに古いスワップチェーンを破棄する必要があります。
+
+== 非最適または古くなったスワップチェーン
+
+あとは、いつスワップチェーンの再作成が必要かを把握し、新しい `recreateSwapChain` 関数を呼ぶだけです。
+幸い Vulkan は通常、プレゼンテーション中にスワップチェーンがもはや適切でないことを教えてくれます。
+`vk::raii::SwapchainKHR::acquireNextImage` と `vk::raii::Queue::presentKHR` 関数は、これを示す次の特別な値を返すことがあります。
+
+* `vk::Result::eErrorOutOfDateKHR`: スワップチェーンがサーフェスと互換でなくなり、レンダリングに使えなくなりました。
+通常はウィンドウリサイズの後に起きます。
+注意: 「vk::Result::eErrorOutOfDateKHR」は実際にはエラーコードで、デフォルトでは例外を引き起こします。「VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS」を定義すると、これは成功コードとして扱われ、「vk::raii::SwapchainKHR::acquireNextImage」と「vk::raii::Queue::presentKHR」から返せるようになります。
+* `vk::Result::eSuboptimalKHR`: スワップチェーンはサーフェスへの提示に成功して使えますが、サーフェスプロパティはもはや正確には一致していません。
+
+[,c++]
+----
+auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+
+if (result == vk::Result::eErrorOutOfDateKHR)
+{
+  recreateSwapChain();
+  return;
+}
+if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR)
+{
+  assert(result == vk::Result::eTimeout || result == vk::Result::eNotReady);
+  throw std::runtime_error("failed to acquire swap chain image!");
+}
+----
+
+イメージ取得を試みてスワップチェーンが古くなっている場合、それへの提示はもはや不可能です。
+そのため、すぐにスワップチェーンを再作成し、次の `drawFrame` 呼び出しで再試行すべきです。
+
+スワップチェーンが非最適の場合にもそうすることもできますが、その場合はすでにイメージを取得しているので、私は続行することにしました。
+`vk::Result::eSuccess` と `vk::Result::eSuboptimalKHR` の両方は「成功」の戻りコードとみなされます。
+
+[,c++]
+----
+result = queue.presentKHR(presentInfoKHR);
+if ((result == vk::Result::eSuboptimalKHR) || (result == vk::Result::eErrorOutOfDateKHR))
+{
+  recreateSwapChain();
+}
+else
+{
+  // There are no other success codes than eSuccess; on any error code, presentKHR already threw an exception.
+  assert(result == vk::Result::eSuccess);
+}
+----
+
+`vk::raii::Queue::presentKHR` 関数は同じ意味の同じ値を返します。
+この場合、可能な最良の結果が欲しいので、非最適でもスワップチェーンを再作成します。
+
+[,c++]
+----
+const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1,
+                                        .pWaitSemaphores    = &*renderFinishedSemaphores[imageIndex],
+                                        .swapchainCount     = 1,
+                                        .pSwapchains        = &*swapChain,
+                                        .pImageIndices      = &imageIndex};
+result = queue.presentKHR(presentInfoKHR);
+if ((result == vk::Result::eSuboptimalKHR) || (result == vk::Result::eErrorOutOfDateKHR))
+{
+  recreateSwapChain();
+}
+else
+{
+  // There are no other success codes than eSuccess; on any error code, presentKHR already threw an exception.
+  assert(result == vk::Result::eSuccess);
+}
+----
+
+== デッドロックの修正
+
+今のコードを実行すると、デッドロックに遭遇する可能性があります。
+コードをデバッグすると、アプリケーションが `vk::raii::Device::waitForFences` に到達してから先に進まないことがわかります。
+これは、`vk::raii::SwapchainKHR::acquireNextImage` が `vk::Result::eErrorOutOfDateKHR` を返したとき、スワップチェーンを再作成してから `drawFrame` から戻るためです。
+しかしその前に、現在のフレームのフェンスは待機されリセットされています。
+すぐに戻るため、実行用の作業は投入されず、フェンスは決してシグナルされず、`vk::raii::Device::waitForFences` が永遠に止まります。
+
+幸い簡単な修正があります。
+そのフェンスで作業を投入することが確実にわかってから、フェンスのリセットを遅らせます。
+こうして早期リターンする場合、フェンスはまだシグナルされたままで、次に同じフェンスオブジェクトを使うとき `vk::raii::Device::waitForFences` がデッドロックしません。
+
+`drawFrame` の冒頭は次のようになるはずです。
+
+[,c++]
+----
+auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
+if (fenceResult != vk::Result::eSuccess)
+{
+  throw std::runtime_error("failed to wait for fence!");
+}
+
+auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+
+if (result == vk::Result::eErrorOutOfDateKHR)
+{
+    recreateSwapChain();
+    return;
+}
+if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR)
+{
+    assert(result == vk::Result::eTimeout || result == vk::Result::eNotReady);
+    throw std::runtime_error("failed to acquire swap chain image!");
+}
+
+// Only reset the fence if we are submitting work
+device.resetFences(*inFlightFences[frameIndex]);
+----
+
+== リサイズの明示的な処理
+
+多くのドライバとプラットフォームはウィンドウリサイズ後に自動で `vk::Result::eErrorOutOfDateKHR` を発火しますが、それが保証されているわけではありません。
+そのため、リサイズを明示的に処理する追加コードも入れます。
+まず、リサイズが起きたことを示す新しいメンバ変数を追加します。
+
+[,c++]
+----
+bool framebufferResized = false;
+----
+
+`drawFrame` 関数は、このフラグも確認するよう修正すべきです。
+
+[,c++]
+----
+if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR || framebufferResized)
+{
+    framebufferResized = false;
+    recreateSwapChain();
+}
+else
+{
+    ...
+}
+----
+
+セマフォが一貫した状態にあることを保証するため、これを `vk::raii::Queue::presentKHR` の*後*に行うことが重要です。そうしないと、シグナルされたセマフォが適切に待機されないことがあります。
+実際にリサイズを検出するには、GLFW フレームワークの `glfwSetFramebufferSizeCallback` 関数でコールバックを設定できます。
+
+[,c++]
+----
+void initWindow()
+{
+    glfwInit();
+
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+
+    window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+    glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+}
+
+static void framebufferResizeCallback(GLFWwindow* window, int width, int height)
+{
+}
+----
+
+コールバックとして `static` 関数を作っている理由は、GLFW が正しい `this` ポインタで `HelloTriangleApplication` インスタンスのメンバ関数を適切に呼び出す方法を知らないからです。
+
+ただしコールバックでは `GLFWwindow` への参照が得られ、任意のポインタをその中に格納できる別の GLFW 関数があります。`glfwSetWindowUserPointer` です。
+
+[,c++]
+----
+window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+glfwSetWindowUserPointer(window, this);
+glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+----
+
+この値はコールバック内から `glfwGetWindowUserPointer` で取得し、フラグを適切に設定できます。
+
+[,c++]
+----
+static void framebufferResizeCallback(GLFWwindow* window, int width, int height)
+{
+    auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+    app->framebufferResized = true;
+}
+----
+
+プログラムを実行し、ウィンドウをリサイズして、フレームバッファがウィンドウとともに正しくリサイズされるかを確認してみてください。
+
+== 最小化の処理
+
+スワップチェーンが古くなる別のケースがあり、それは特別な種類のウィンドウリサイズ、ウィンドウの最小化です。
+このケースが特別なのは、フレームバッファサイズが `0` になるからです。
+本チュートリアルでは、`recreateSwapChain` 関数を拡張し、ウィンドウが再び前面に来るまで一時停止することで対処します。
+
+[,c++]
+----
+void recreateSwapChain() {
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(window, &width, &height);
+    while (width == 0 || height == 0) {
+        glfwGetFramebufferSize(window, &width, &height);
+        glfwWaitEvents();
+    }
+
+    device.waitIdle();
+
+    ...
+}
+----
+
+最初の `glfwGetFramebufferSize` 呼び出しは、サイズがすでに正しく、`glfwWaitEvents` が待つものが何もない場合を処理します。
+
+おめでとうございます。これで初めてのよく振る舞う Vulkan プログラムが完成しました。
+xref:04_Vertex_buffers/00_Vertex_input_description.adoc[次の章] では、頂点シェーダ内のハードコードされた頂点をやめ、実際に頂点バッファを使います。
+
+link:/attachments/17_swap_chain_recreation.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

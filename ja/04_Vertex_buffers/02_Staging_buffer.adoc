@@ -1,0 +1,196 @@
+:pp: {plus}{plus}
+
+= ステージングバッファ
+
+== はじめに
+
+現在の頂点バッファは正しく動作しますが、CPU からアクセスできるメモリタイプは、グラフィックスカード自身が読み取るのに最も最適なメモリタイプではない場合があります。
+最も最適なメモリは `vk::MemoryPropertyFlagBits::eDeviceLocal` フラグを持ち、専用グラフィックスカードでは通常 CPU からアクセスできません。
+この章では、2 つの頂点バッファを作成します。
+1 つは頂点配列からデータをアップロードするための CPU アクセス可能なメモリ上の _ステージングバッファ_、もう 1 つはデバイスローカルメモリ上の最終的な頂点バッファです。
+その後、バッファコピーコマンドを使ってステージングバッファから実際の頂点バッファへデータを移します。
+
+== 転送キュー
+
+バッファコピーコマンドには、`vk::QueueFlagBits::eTransfer` で示される転送操作をサポートするキューファミリーが必要です。
+良い知らせは、`vk::QueueFlagBits::eGraphics` または `vk::QueueFlagBits::eCompute` 能力を持つキューファミリーは、すでに暗黙的に `vk::QueueFlagBits::eTransfer` 操作をサポートしていることです。
+その場合、実装は `queueFlags` に明示的に列挙する必要はありません。
+
+挑戦したいなら、転送操作用に別のキューファミリーを使うこともできます。
+プログラムに次の変更が必要になります。
+
+* `uint32_t queueIndex`（今は `graphicsQueueIndex` に改名した方がよいかもしれない）に加えて `uint32_t transferQueueIndex` を導入し、`vk::QueueFlagBits::eTransfer` ビットを持ち、`vk::QueueFlagBits::eGraphics` は持たないキューファミリーを明示的に探す
+* `createLogicalDevice` を変更して `vk::raii::Queue transferQueue` へのハンドルを要求する（そしておそらく `queue` を `graphicsQueue` に改名する）
+* 転送キューファミリー上でサブミットされるコマンドバッファ用に、2 つ目のコマンドプールを作成する
+* リソースの `sharingMode` を `vk::SharingMode::eConcurrent` に変更し、グラフィックスと転送の両方のキューファミリーを指定する
+* `vk::raii::CommandBuffer::copyBuffer`（この章で使う）のような転送コマンドを、グラフィックスキューではなく転送キューへサブミットする
+
+少し手間はかかりますが、リソースがキューファミリー間でどう共有されるかについて多くを学べます。
+
+== バッファ作成の抽象化
+
+この章では複数のバッファを作成するので、バッファ作成をヘルパー関数に移すのが良い考えです。
+新しい関数 `createBuffer` を作成し、`createVertexBuffer` 内のコード（マップ以外）をそこに移します。
+
+[,c++]
+----
+std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties)
+{
+  vk::BufferCreateInfo   bufferInfo{.size = size, .usage = usage, .sharingMode = vk::SharingMode::eExclusive};
+  vk::raii::Buffer       buffer          = vk::raii::Buffer(device, bufferInfo);
+  vk::MemoryRequirements memRequirements = buffer.getMemoryRequirements();
+  vk::MemoryAllocateInfo allocInfo{.allocationSize = memRequirements.size, .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties)};
+  vk::raii::DeviceMemory bufferMemory = vk::raii::DeviceMemory(device, allocInfo);
+  buffer.bindMemory(*bufferMemory, 0);
+  return {std::move(buffer), std::move(bufferMemory)};
+}
+----
+
+バッファサイズ、メモリプロパティ、usage のパラメータを追加し、さまざまな種類のバッファを作成できるようにしてください。
+この関数は、生成されたバッファとそれにバインドされたデバイスメモリの両方を `std::pair` として返します。`vk::raii` ハンドルはコピーできないので、この関数からムーブで取り出す必要があります。
+
+これで `createVertexBuffer` からバッファ作成とメモリ割り当てのコードを削除し、代わりに `createBuffer` を呼ぶだけにできます。
+
+[,c++]
+----
+void createVertexBuffer()
+{
+  vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+  auto [stagingBuffer, stagingBufferMemory] =
+      createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+  void *dataStaging = stagingBufferMemory.mapMemory(0, bufferSize);
+  memcpy(dataStaging, vertices.data(), bufferSize);
+  stagingBufferMemory.unmapMemory();
+}
+----
+
+プログラムを実行して、頂点バッファがまだ正しく動作することを確認してください。
+
+== ステージングバッファの使用
+
+今度は `createVertexBuffer` を変更し、ホスト可視バッファを一時バッファとしてのみ使い、実際の頂点バッファにはデバイスローカルなものを使います。
+
+[,c++]
+----
+void createVertexBuffer()
+{
+  vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+  auto [stagingBuffer, stagingBufferMemory] =
+      createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+  void *dataStaging = stagingBufferMemory.mapMemory(0, bufferSize);
+  memcpy(dataStaging, vertices.data(), bufferSize);
+  stagingBufferMemory.unmapMemory();
+
+  std::tie(vertexBuffer, vertexBufferMemory) =
+      createBuffer(bufferSize, vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+  copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+}
+----
+
+頂点データのマップとコピーには、新しい `stagingBuffer` と `stagingBufferMemory` を使います。
+この章では、2 つの新しいバッファ usage フラグを使います。
+
+* `vk::BufferUsageFlagBits::eTransferSrc`: メモリ転送操作のソースとして使えるバッファ
+* `vk::BufferUsageFlagBits::eTransferDst`: メモリ転送操作のデスティネーションとして使えるバッファ
+
+`vertexBuffer` はデバイスローカルなメモリタイプから割り当てられるようになったため、一般に `vk::raii::DeviceMemory::mapMemory` は使えません。
+ただし、`stagingBuffer` から `vertexBuffer` へデータをコピーできます。
+そのためには、`stagingBuffer` に転送ソースフラグ、`vertexBuffer` に転送デスティネーションフラグと頂点バッファ usage フラグを指定して、その意図を示す必要があります。
+
+あるバッファから別のバッファへ内容をコピーする関数 `copyBuffer` をこれから書きます。
+
+[,c++]
+----
+void copyBuffer(vk::raii::Buffer & srcBuffer, vk::raii::Buffer & dstBuffer, vk::DeviceSize size)
+{
+}
+----
+
+メモリ転送操作は、描画コマンドと同じくコマンドバッファで実行されます。
+したがって、まず一時的なコマンドバッファを割り当てる必要があります。
+こうした短命なバッファ用に別のコマンドプールを作成するとよいかもしれません。実装がメモリ割り当ての最適化を適用できる場合があるからです。
+その場合は、コマンドプール生成時に `vk::CommandPoolCreateFlagBits::eTransient` フラグを使うべきです。
+
+[,c++]
+----
+void copyBuffer(vk::raii::Buffer & srcBuffer, vk::raii::Buffer & dstBuffer, vk::DeviceSize size)
+{
+  vk::CommandBufferAllocateInfo allocInfo{ .commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1 };
+  vk::raii::CommandBuffer commandCopyBuffer = std::move(device.allocateCommandBuffers(allocInfo).front());
+}
+----
+
+そしてすぐにコマンドバッファの記録を開始します。
+
+[,c++]
+----
+commandCopyBuffer.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+----
+
+コマンドバッファは一度だけ使い、コピー操作の実行が終わるまで関数から戻りません。
+`vk::CommandBufferUsageFlagBits::eOneTimeSubmit` で意図をドライバに伝えるのは良い習慣です。
+
+[,c++]
+----
+commandCopyBuffer.copyBuffer(*srcBuffer, *dstBuffer, vk::BufferCopy(0, 0, size));
+----
+
+バッファの内容は `vk:raii::CommandBuffer::copyBuffer` コマンドで転送されます。
+ソースとデスティネーションのバッファを引数に取り、コピーする領域の配列も取ります。
+領域は `vk::BufferCopy` 構造体で定義され、ソースバッファオフセット、デスティネーションバッファオフセット、サイズからなります。
+`vk::raii::DeviceMemory::mapMemory` コマンドとは異なり、ここでは `vk::WholeSize` を指定できません。
+
+[,c++]
+----
+commandCopyBuffer.end();
+----
+
+このコマンドバッファにはコピーコマンドだけが入っているので、その直後に記録を止められます。
+転送を完了するためにコマンドバッファを実行します。
+
+[,c++]
+----
+queue.submit(vk::SubmitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandCopyBuffer}, nullptr);
+queue.waitIdle();
+----
+
+描画コマンドとは異なり、今回待つべきイベントはありません。
+バッファ上で転送をすぐに実行したいだけです。
+この転送の完了を待つ方法は、やはり 2 つあります。
+フェンスを使って `vk::raii::Device::waitForFences` で待つ方法と、単に `vk::raii::Queue::waitIdle` で転送キューがアイドルになるのを待つ方法です。
+フェンスなら、一度に 1 つずつ実行する代わりに、複数の転送を同時にスケジュールしてすべて完了するのを待てます。
+それによりドライバに最適化の余地が増える場合があります。
+
+これで `createVertexBuffer` 関数から `copyBuffer` を呼び出し、頂点データをデバイスローカルバッファへ移せます。
+
+[,c++]
+----
+copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+----
+
+ステージングバッファからデバイスバッファへデータをコピーしたあと、RAII バッファオブジェクトが自分自身をクリーンアップしてメモリを解放します。
+
+プログラムを実行して、おなじみの三角形が再び表示されることを確認してください。
+今のところ改善は目に見えないかもしれませんが、頂点データは高性能なメモリから読み込まれるようになっています。
+これは、より複雑なジオメトリを描画し始めるときに重要になります。
+
+== まとめ
+
+実世界のアプリケーションでは、個々のバッファごとに実際に `vk::raii::Device::allocateMemory` を呼ぶべきではないことに注意してください。
+同時に行えるメモリ割り当ての最大数は物理デバイスの制限 `maxMemoryAllocationCount` で制限され、NVIDIA GTX 1080 のようなハイエンドハードウェアでも `4096` 程度まで低い場合があります。
+多数のオブジェクト用メモリを同時に割り当てる正しい方法は、多くの関数で見てきた `offset` パラメータを使い、単一の割り当てを多くの異なるオブジェクトに分割するカスタムアロケータを作成することです。
+
+そのようなアロケータを自分で実装するか、GPUOpen イニシアチブが提供する https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator[VulkanMemoryAllocator] ライブラリを使うこともできます。
+ただしこのチュートリアルでは、今のところこれらの制限に近づくことはないので、リソースごとに別々の割り当てを使って問題ありません。
+
+xref:./03_Index_buffer.adoc[次の章]では、頂点の再利用のためのインデックスバッファについて学びます。
+
+link:/attachments/20_staging_buffer.cpp[C{pp} code] /
+link:/attachments/19_shader_vertexbuffer.slang[slang shader] /
+link:/attachments/19_shader_vertexbuffer.vert[GLSL Vertex shader] /
+link:/attachments/19_shader_vertexbuffer.frag[GLSL Fragment shader]

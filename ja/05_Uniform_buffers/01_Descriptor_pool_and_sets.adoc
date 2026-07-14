@@ -1,0 +1,386 @@
+:pp: {plus}{plus}
+
+= ディスクリプタプールとセット
+
+== はじめに
+
+前章のディスクリプタセットレイアウトは、バインドできるディスクリプタの種類を記述します。
+この章では、各 `vk::raii::Buffer` リソース用のディスクリプタセットを作成し、ユニフォームバッファディスクリプタにバインドします。
+
+== ディスクリプタプール
+
+ディスクリプタセットは直接作成できず、コマンドバッファと同様にプールから割り当てる必要があります。
+ディスクリプタセットに相当するものは、当然ながら _ディスクリプタプール_ と呼ばれます。
+新しい関数 `createDescriptorPool` を書いてセットアップします。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createUniformBuffers();
+    createDescriptorPool();
+    ...
+}
+
+...
+
+void createDescriptorPool()
+{
+}
+----
+
+まず、ディスクリプタセットが含むディスクリプタの種類と数を、`vk::DescriptorPoolSize` 構造体で記述する必要があります。
+
+[,c++]
+----
+vk::DescriptorPoolSize poolSize{ .type = vk::DescriptorType::eUniformBuffer, .descriptorCount = MAX_FRAMES_IN_FLIGHT };
+----
+
+フレームごとにこれらのディスクリプタを 1 つ割り当てます。
+このプールサイズ構造体は、メインの `vk::DescriptorPoolCreateInfo` から参照されます。
+
+[,c++]
+----
+vk::DescriptorPoolCreateInfo poolInfo{ .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, .maxSets = MAX_FRAMES_IN_FLIGHT, .poolSizeCount = 1, .pPoolSizes = &poolSize };
+----
+
+利用可能な個々のディスクリプタの最大数のほかに、割り当て可能なディスクリプタセットの最大数も指定する必要があります。
+
+この構造体には、コマンドプールと同様に、個々のディスクリプタセットを解放できるかどうかを決めるオプションのフラグがあります。
+`vk::raii::DescriptorSets` は破棄時に基底の `VkDescriptorSet` を破棄するので、それを許可するために `vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet` を設定する必要があります。
+
+[,c++]
+----
+vk::raii::DescriptorPool descriptorPool = nullptr;
+
+...
+
+descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
+----
+
+ディスクリプタプールのハンドルを格納する新しいクラスメンバを追加し、`vk::raii::DescriptorPool` コンストラクタを呼び出して作成します。
+
+== ディスクリプタセット
+
+これでディスクリプタセット自体を割り当てられます。
+そのための `createDescriptorSets` 関数を追加します。
+
+[,c++]
+----
+void initVulkan()
+{
+    ...
+    createDescriptorPool();
+    createDescriptorSets();
+    ...
+}
+
+...
+
+void createDescriptorSets()
+{
+}
+----
+
+ディスクリプタセットの割り当ては `vk::DescriptorSetAllocateInfo` 構造体で記述します。
+割り当て元のディスクリプタプール、割り当てるディスクリプタセットの数、それらに基づくディスクリプタセットレイアウトを指定する必要があります。
+
+[,c++]
+----
+std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, *descriptorSetLayout);
+vk::DescriptorSetAllocateInfo        allocInfo{.descriptorPool     = descriptorPool,
+                                               .descriptorSetCount = static_cast<uint32_t>(layouts.size()),
+                                               .pSetLayouts        = layouts.data()};
+----
+
+今回は、すべて同じレイアウトで、フレームインフライトごとに 1 つのディスクリプタセットを作成します。
+残念ながら、次の関数がセット数と一致する配列を期待するため、レイアウトのコピーがすべて必要です。
+
+ディスクリプタセットハンドルを保持するクラスメンバを追加し、`vk::raii::Device::allocateDescriptorSets` で割り当てます。
+
+[,c++]
+----
+vk::raii::DescriptorPool             descriptorPool = nullptr;
+std::vector<vk::raii::DescriptorSet> descriptorSets;
+
+...
+
+descriptorSets = device.allocateDescriptorSets(allocInfo);
+----
+
+ディスクリプタセットは割り当てられましたが、内部のディスクリプタはまだ設定が必要です。
+各ディスクリプタを埋めるループを追加します。
+
+[,c++]
+----
+for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+{
+}
+----
+
+ユニフォームバッファディスクリプタのようにバッファを参照するディスクリプタは、`vk::DescriptorBufferInfo` 構造体で設定します。
+この構造体は、バッファと、ディスクリプタ用のデータが含まれるその中の領域を指定します。
+
+[,c++]
+----
+for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+{
+    vk::DescriptorBufferInfo bufferInfo{ .buffer = uniformBuffers[i], .offset = 0, .range = sizeof(UniformBufferObject) };
+}
+----
+
+今回のようにバッファ全体を上書きする場合は、範囲に `vk::WholeSize` 値を使うこともできます。
+ディスクリプタの設定は、パラメータとして `vk::WriteDescriptorSet` 構造体の配列を取る `vk::raii::Device::updateDescriptorSets` 関数で更新します。
+
+[,c++]
+----
+vk::DescriptorBufferInfo bufferInfo{.buffer = uniformBuffers[i], .offset = 0, .range = sizeof(UniformBufferObject)};
+vk::WriteDescriptorSet   descriptorWrite{.dstSet          = descriptorSets[i],
+                                         .dstBinding      = 0,
+                                         .dstArrayElement = 0,
+                                         .descriptorCount = 1,
+                                         .descriptorType  = vk::DescriptorType::eUniformBuffer,
+                                         .pBufferInfo     = &bufferInfo};
+----
+
+最初の 2 つのフィールドは、更新するディスクリプタセットとバインディングを指定します。
+ユニフォームバッファのバインディングインデックスは `0` にしました。
+ディスクリプタは配列にもできるので、更新したい配列の最初のインデックスも指定する必要があります。
+配列は使わないので、インデックスは単に `0` です。
+
+ディスクリプタの種類を再び指定する必要があります。
+`dstArrayElement` から始まる配列内の複数のディスクリプタを一度に更新することも可能です。
+`descriptorCount` フィールドは、更新したい配列要素の数を指定します。
+
+最後のフィールドは、実際にディスクリプタを設定する `descriptorCount` 個の構造体の配列を参照します。
+ディスクリプタの種類に応じて、実際に使うべき 3 つのうちどれかが決まります。
+`pBufferInfo` フィールドはバッファデータを参照するディスクリプタに使います。この構造体には、このサンプルでは使わない追加要素もあります。`pImageInfo` はイメージデータを参照するディスクリプタに、`pTexelBufferView` はバッファビューを参照するディスクリプタに使います。
+私たちのディスクリプタはバッファに基づくので、`pBufferInfo` だけを使います。
+
+[,c++]
+----
+device.updateDescriptorSets(descriptorWrite, {});
+----
+
+更新は `vk::raii::Device::updateDescriptorSets` で適用されます。
+パラメータとして 2 つの配列を受け取ります。`vk::WriteDescriptorSet` の配列と `vk::CopyDescriptorSet` の配列です。
+後者は名前が示すとおり、ディスクリプタ同士をコピーするために使えます。
+
+== ディスクリプタセットの使用
+
+`recordCommandBuffer` 関数を更新し、`vk::raii::CommandBuffer::bindDescriptorSets` で各フレームの正しいディスクリプタセットをシェーダ内のディスクリプタに実際にバインドする必要があります。
+これは `vk::raii::CommandBuffer::drawIndexed` 呼び出しの前に行う必要があります。
+
+[,c++]
+----
+commandBuffers[frameIndex].bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *descriptorSets[frameIndex], nullptr);
+commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+----
+
+頂点バッファやインデックスバッファとは異なり、ディスクリプタセットはグラフィックスパイプライン固有ではありません。
+したがって、ディスクリプタセットをグラフィックスパイプラインとコンピュートパイプラインのどちらにバインドするかを指定する必要があります。
+次のパラメータは、ディスクリプタの基になるレイアウトです。
+その次の 2 つのパラメータは、最初のディスクリプタセットのインデックスと、バインドするセットの配列を指定します。
+これについてはすぐ後で戻ります。
+最後のパラメータは、動的ディスクリプタに使うオフセットの配列を指定します。
+これらは今後の章で見ていきます。
+
+今プログラムを実行すると、残念ながら何も見えないことに気づくでしょう。
+問題は、プロジェクション行列で行った Y 反転のため、頂点が時計回りではなく反時計回りに描画されるようになったことです。
+これにより裏面カリングが働き、ジオメトリが一切描画されなくなります。
+`createGraphicsPipeline` 関数へ行き、`vk::PipelineRasterizationStateCreateInfo` の `frontFace` を修正するよう変更します。
+
+[,c++]
+----
+vk::PipelineRasterizationStateCreateInfo rasterizer{.depthClampEnable        = vk::False,
+                                                    .rasterizerDiscardEnable = vk::False,
+                                                    .polygonMode             = vk::PolygonMode::eFill,
+                                                    .cullMode                = vk::CullModeFlagBits::eBack,
+                                                    .frontFace               = vk::FrontFace::eCounterClockwise,
+                                                    .depthBiasEnable         = vk::False,
+                                                    .lineWidth               = 1.0f};
+----
+
+プログラムを再実行すると、次のように見えるはずです。
+
+image::/images/spinning_quad.png[]
+
+プロジェクション行列がアスペクト比を補正するようになったため、長方形は正方形に変わりました。
+`updateUniformBuffer` が画面リサイズを処理するので、`recreateSwapChain` でディスクリプタセットを再作成する必要はありません。
+
+== アライメント要件
+
+これまでに見落としてきたことの 1 つは、C{pp} 構造体内のデータがシェーダ内のユニフォーム定義とどのように正確に一致すべきかです。
+両方で同じ型を使えば十分そうに見えます。
+
+[,c++]
+----
+struct UniformBufferObject
+{
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+
+struct UniformBuffer
+{
+    float4x4 model;
+    float4x4 view;
+    float4x4 proj;
+};
+ConstantBuffer<UniformBuffer> ubo;
+----
+
+しかし、それだけでは不十分です。
+例えば、構造体とシェーダを次のように変更してみてください。
+
+[,c++]
+----
+struct UniformBufferObject
+{
+    glm::vec2 foo;
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+
+struct UniformBuffer {
+    float2 foo;
+    float4x4 model;
+    float4x4 view;
+    float4x4 proj;
+};
+ConstantBuffer<UniformBuffer> ubo;
+----
+
+シェーダとプログラムを再コンパイルして実行すると、ここまで苦労して作った色付きの正方形が消えてしまうでしょう。
+それは _アライメント要件_ を考慮していないからです。
+
+Vulkan は、構造体内のデータがメモリ上で特定の方法で整列されていることを期待します。例えば次のとおりです。
+
+* スカラーは N（= 32 ビット浮動小数点なら 4 バイト）で整列する必要がある
+* `float2` は 2N（= 8 バイト）で整列する必要がある
+* `float3` または `float4` は 4N（= 16 バイト）で整列する必要がある
+* ネストした構造体は、メンバの基本アライメントを 16 の倍数に切り上げた値で整列する必要がある
+* `float4x4` 行列は `float4` と同じアライメントを持つ必要がある
+
+アライメント要件の完全な一覧は https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-resources-layout[仕様] にあります。
+
+`mat4` フィールドが 3 つだけの元のシェーダは、すでにアライメント要件を満たしていました。
+各 `mat4` は 4 x 4 x 4 = 64 バイトなので、`model` のオフセットは `0`、`view` は 64、`proj` は 128 です。
+これらはすべて 16 の倍数なので問題なく動作しました。
+
+新しい構造体はサイズが 8 バイトだけの `vec2` から始まるため、すべてのオフセットがずれます。
+今度は `model` のオフセットが `8`、`view` が `72`、`proj` が `136` となり、いずれも 16 の倍数ではありません。
+この問題を修正するには、C{pp}11 で導入された https://en.cppreference.com/w/cpp/language/alignas[`alignas`] 指定子を使えます。
+
+[,c++]
+----
+struct UniformBufferObject
+{
+    glm::vec2 foo;
+    alignas(16) glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+----
+
+プログラムを再コンパイルして実行すると、シェーダが再び正しく行列値を受け取るのが分かるはずです。
+
+幸い、これらのアライメント要件について _ほとんどの_ 場合考えなくて済む方法があります。
+GLM をインクルードする直前に `GLM_FORCE_DEFAULT_ALIGNED_GENTYPES` を定義できます。
+
+[,c++]
+----
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
+#include <glm/glm.hpp>
+----
+
+これにより、GLM はアライメント要件がすでに指定されたバージョンの `vec2` と `mat4` を使うよう強制されます。
+この定義を追加すれば `alignas` 指定子を削除しても、プログラムは動作するはずです。
+
+残念ながら、ネストした構造体を使い始めるとこの方法は崩れることがあります。
+C{pp} コードでの次の定義を考えてください。
+
+[,c++]
+----
+struct Foo
+{
+    glm::vec2 v;
+};
+
+struct UniformBufferObject
+{
+    Foo f1;
+    Foo f2;
+};
+----
+
+そして次のシェーダ定義です。
+
+[,c++]
+----
+struct Foo
+{
+    vec2 v;
+};
+
+struct UniformBuffer
+{
+    Foo f1;
+    Foo f2;
+};
+ConstantBuffer<UniformBuffer> ubo;
+----
+
+この場合、`f2` のオフセットは `8` になりますが、ネストした構造体なのでオフセットは `16` であるべきです。
+この場合は、自分でアライメントを指定する必要があります。
+
+[,c++]
+----
+struct UniformBufferObject
+{
+    Foo f1;
+    alignas(16) Foo f2;
+};
+----
+
+こうした落とし穴は、常にアライメントを明示する良い理由です。
+そうすれば、アライメントエラーの奇妙な症状に不意を突かれることはありません。
+
+[,c++]
+----
+struct UniformBufferObject
+{
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
+----
+
+`foo` フィールドを削除したあと、シェーダを再コンパイルすることを忘れないでください。
+
+== 複数のディスクリプタセット
+
+一部の構造体や関数呼び出しが示唆していたように、実際には複数のディスクリプタセットを同時にバインドできます。
+パイプラインレイアウト作成時に、ディスクリプタセットごとにディスクリプタセットレイアウトを指定する必要があります。
+シェーダは次のように特定のディスクリプタセットを参照できます。
+
+[,c++]
+----
+struct UniformBuffer
+{
+};
+ConstantBuffer<UniformBuffer> ubo;
+----
+
+この機能を使い、オブジェクトごとに変わるディスクリプタと共有されるディスクリプタを別々のディスクリプタセットに分けられます。
+その場合、描画呼び出しをまたいでほとんどのディスクリプタの再バインドを避けられ、潜在的により効率的です。
+
+xref:06_Texture_mapping/00_Images.adoc[次の章]では、今学んだことを土台に、シーンへテクスチャを追加します。
+
+link:/attachments/23_descriptor_sets.cpp[C{pp} code]  /
+link:/attachments/22_shader_ubo.slang[slang shader] /
+link:/attachments/22_shader_ubo.vert[GLSL Vertex shader] /
+link:/attachments/22_shader_ubo.frag[GLSL Fragment shader]

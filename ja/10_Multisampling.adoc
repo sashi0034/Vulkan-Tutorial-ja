@@ -1,0 +1,367 @@
+:pp: {plus}{plus}
+
+= マルチサンプリング
+
+== はじめに
+
+プログラムは、ビューアから遠いオブジェクトを描画するときのアーティファクトを修正する、
+複数の詳細レベルをテクスチャに読み込めるようになりました。
+画像はかなり滑らかになりましたが、よく見ると、描画された幾何形状のエッジに沿って
+ギザギザののこぎり状のパターンに気づくでしょう。
+これは、クワッドを描画した初期のプログラムの一つで特に目立ちます。
+
+image::/images/texcoord_visualization.png[]
+
+この望ましくない効果は「エイリアシング」と呼ばれ、レンダリングに利用できるピクセル数が
+限られていることの結果です。
+無制限の解像度を持つディスプレイは存在しないため、ある程度は常に見えるでしょう。
+これを修正する方法はいくつかあり、この章ではより人気のあるものの一つ、
+https://en.wikipedia.org/wiki/Multisample_anti-aliasing[マルチサンプルアンチエイリアシング]
+（MSAA）に焦点を当てます。
+
+通常のレンダリングでは、ピクセルの色は単一のサンプル点に基づいて決定され、
+ほとんどの場合は画面上の対象ピクセルの中心です。
+描画された線のある部分が特定のピクセルを通過してもサンプル点を覆わない場合、
+そのピクセルは空白のままになり、ギザギザの「階段」効果につながります。
+
+image::/images/aliasing.png[]
+
+MSAA が行うのは、最終色を決定するためにピクセルあたり複数のサンプル点を使うことです
+（だからその名前です）。
+予想どおり、サンプルが多いほど結果は良くなりますが、計算コストも高くなります。
+
+image::/images/antialiasing.png[]
+
+実装では、利用可能な最大サンプル数の使用に焦点を当てます。
+アプリケーションによっては、これが常に最善のアプローチとは限らず、最終結果が品質要求を
+満たすなら、より高いパフォーマンスのために少ないサンプルを使う方が良い場合もあります。
+
+== 利用可能なサンプル数の取得
+
+まず、ハードウェアが何サンプル使えるかを調べるところから始めましょう。
+現代のほとんどの GPU は少なくとも 8 サンプルをサポートしますが、この数がどこでも同じである
+保証はありません。
+新しいクラスメンバを追加して追跡します。
+
+[,c++]
+----
+...
+vk::SampleCountFlagBits msaaSamples = vk::SampleCountFlagBits::e1;
+...
+----
+
+デフォルトでは、ピクセルあたり 1 サンプルだけを使います。これはマルチサンプリングなしと
+同等で、その場合最終画像は変わりません。
+サンプルの正確な最大数は、選択した物理デバイスに関連付けられた
+`VkPhysicalDeviceProperties` から取り出せます。
+深度バッファを使っているので、色と深度の両方のサンプル数を考慮する必要があります。
+両方がサポートする（かつ）最も高いサンプル数が、サポートできる最大になります。
+この情報を取得する関数を追加します。
+
+[,c++]
+----
+vk::SampleCountFlagBits getMaxUsableSampleCount() {
+    vk::PhysicalDeviceProperties physicalDeviceProperties = physicalDevice->getProperties();
+
+    vk::SampleCountFlags counts = physicalDeviceProperties.limits.framebufferColorSampleCounts & physicalDeviceProperties.limits.framebufferDepthSampleCounts;
+    if (counts & vk::SampleCountFlagBits::e64) { return vk::SampleCountFlagBits::e64; }
+    if (counts & vk::SampleCountFlagBits::e32) { return vk::SampleCountFlagBits::e32; }
+    if (counts & vk::SampleCountFlagBits::e16) { return vk::SampleCountFlagBits::e16; }
+    if (counts & vk::SampleCountFlagBits::e8) { return vk::SampleCountFlagBits::e8; }
+    if (counts & vk::SampleCountFlagBits::e4) { return vk::SampleCountFlagBits::e4; }
+    if (counts & vk::SampleCountFlagBits::e2) { return vk::SampleCountFlagBits::e2; }
+
+    return vk::SampleCountFlagBits::e1;
+}
+----
+
+物理デバイス選択プロセス中にこの関数を使って `msaaSamples` 変数を設定します。
+そのためには、`pickPhysicalDevice` 関数を少し変更する必要があります。
+
+[,c++]
+----
+void pickPhysicalDevice() {
+    ...
+    for (const auto& device : devices) {
+        if (isDeviceSuitable(device)) {
+            physicalDevice = device;
+            msaaSamples = getMaxUsableSampleCount();
+            break;
+        }
+    }
+    ...
+}
+----
+
+== レンダーターゲットのセットアップ
+
+MSAA では、各ピクセルがオフスクリーンバッファでサンプリングされ、それが画面に描画されます。
+この新しいバッファは、これまで描画してきた通常の画像とは少し異なり、ピクセルあたり
+複数のサンプルを格納できなければなりません。
+マルチサンプルバッファが作成されたら、デフォルトのフレームバッファ（ピクセルあたり
+1 サンプルだけを格納）に解決（resolve）する必要があります。
+そのため、追加のレンダーターゲットを作成し、現在の描画プロセスを変更する必要があります。
+深度バッファと同様に、一度にアクティブな描画操作は 1 つだけなので、レンダーターゲットは
+1 つだけで十分です。
+次のクラスメンバを追加します。
+
+[,c++]
+----
+...
+vk::raii::Image colorImage = nullptr;
+vk::raii::DeviceMemory colorImageMemory = nullptr;
+vk::raii::ImageView colorImageView = nullptr;
+...
+----
+
+この新しい画像はピクセルあたり望ましい数のサンプルを格納する必要があるので、画像作成プロセス中に
+`VkImageCreateInfo` にこの数を渡す必要があります。
+`numSamples` パラメータを追加して `createImage` 関数を変更します。
+
+[,c++]
+----
+void createImage(uint32_t width, uint32_t height, uint32_t mipLevels, vk::SampleCountFlagBits numSamples, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties, vk::raii::Image& image, vk::raii::DeviceMemory& imageMemory) const {
+    ...
+    imageInfo.samples = numSamples;
+    ...
+----
+
+当面は、この関数へのすべての呼び出しを `VK_SAMPLE_COUNT_1_BIT` で更新します。実装が進むにつれて
+適切な値に置き換えます。
+
+[,c++]
+----
+createImage(swapChainExtent.width, swapChainExtent.height, 1, vk::SampleCountFlagBits::e1, depthFormat, vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eDepthStencilAttachment, vk::MemoryPropertyFlagBits::eDeviceLocal, depthImage, depthImageMemory);
+...
+createImage(texWidth, texHeight, mipLevels, vk::SampleCountFlagBits::e1, vk::Format::eR8G8B8A8Srgb, vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled, vk::MemoryPropertyFlagBits::eDeviceLocal, textureImage, textureImageMemory);
+----
+
+次に、マルチサンプルのカラーバッファを作成します。
+`createColorResources` 関数を追加し、ここで `createImage` の関数パラメータとして
+`msaaSamples` を使っていることに注意してください。
+また、ピクセルあたり複数サンプルの画像の場合は Vulkan 仕様で強制されるため、ミップレベルは
+1 つだけ使います。
+また、このカラーバッファはテクスチャとして使われないので、ミップマップは不要です。
+
+[,c++]
+----
+void createColorResources() {
+    vk::Format colorFormat = swapChainImageFormat;
+
+    createImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, colorFormat, vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eTransientAttachment | vk::ImageUsageFlagBits::eColorAttachment,  vk::MemoryPropertyFlagBits::eDeviceLocal, colorImage, colorImageMemory);
+    colorImageView = createImageView(colorImage, colorFormat, vk::ImageAspectFlagBits::eColor, 1);
+}
+----
+
+一貫性のため、`createDepthResources` の直前にこの関数を呼び出します。
+
+[,c++]
+----
+void initVulkan() {
+    ...
+    createColorResources();
+    createDepthResources();
+    ...
+}
+----
+
+マルチサンプルのカラーバッファが揃ったので、次は深度です。
+`createDepthResources` を変更し、深度バッファが使うサンプル数を更新します。
+
+[,c++]
+----
+void createDepthResources() {
+    ...
+    createImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, depthFormat, vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eDepthStencilAttachment, vk::MemoryPropertyFlagBits::eDeviceLocal, depthImage_, depthImageMemory_);
+    ...
+}
+----
+
+そして、ウィンドウがリサイズされたときに新しいカラー画像が正しい解像度で再作成できるよう、
+`recreateSwapChain` を更新します。
+
+[,c++]
+----
+void recreateSwapChain() {
+    ...
+    createImageViews();
+    createColorResources();
+    createDepthResources();
+    ...
+}
+----
+
+初期の MSAA セットアップは乗り越えました。次はこの新しいリソースをグラフィックスパイプライン、
+フレームバッファ、レンダーパスで使い始め、結果を見ましょう！
+
+== 新しいアタッチメントの追加
+
+まずレンダーパスを扱いましょう。
+`createRenderPass` を変更し、色と深度のアタッチメント作成情報構造体を更新します。
+
+[,c++]
+----
+void createRenderPass() {
+    ...
+    colorAttachment.samples = msaaSamples;
+    colorAttachment.finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    ...
+    depthAttachment.samples = msaaSamples;
+    ...
+----
+
+`finalLayout` を `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` から
+`VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` に変更したことに気づくでしょう。
+マルチサンプル画像は直接提示できないからです。
+まず通常の画像に解決する必要があります。
+この要件は深度バッファには適用されません。どの時点でも提示されないからです。
+したがって、色用に 1 つだけ新しいアタッチメントを追加します。いわゆる resolve アタッチメントです。
+
+[,c++]
+----
+    ...
+    vk::AttachmentDescription colorAttachmentResolve({}, swapChainImageFormat, vk::SampleCountFlagBits::e1, vk::AttachmentLoadOp::eDontCare,
+        vk::AttachmentStoreOp::eStore, vk::AttachmentLoadOp::eDontCare, vk::AttachmentStoreOp::eDontCare, vk::ImageLayout::eUndefined,
+        vk::ImageLayout::ePresentSrcKHR);
+    ...
+----
+
+レンダーパスは、マルチサンプルのカラー画像を通常のアタッチメントに解決するよう指示される
+必要があります。
+resolve ターゲットとなるカラーバッファを指す新しいアタッチメント参照を作成します。
+
+[,c++]
+----
+    ...
+    vk::AttachmentReference colorAttachmentResolveRef(2, vk::ImageLayout::eColorAttachmentOptimal);
+    ...
+----
+
+サブパス構造体メンバの `pResolveAttachments` を、新しく作成したアタッチメント参照を指すよう
+設定します。
+これで、レンダーパスにマルチサンプル resolve 操作を定義させ、画面に画像を描画するのに
+十分です。
+
+----
+    ...
+    subpass.pResolveAttachments = &colorAttachmentResolveRef;
+    ...
+----
+
+マルチサンプルのカラー画像を再利用しているため、`VkSubpassDependency` の
+`srcAccessMask` を更新する必要があります。
+この更新により、カラーアタッチメントへの書き込み操作が後続のものが始まる前に完了することが
+保証され、不安定なレンダリング結果につながり得る write-after-write ハザードを防ぎます。
+
+[,c++]
+----
+    ...
+    dependency.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eDepthStencilAttachmentWrite;
+    ...
+----
+
+次に、新しいカラーアタッチメントでレンダーパス情報構造体を更新します。
+
+[,c++]
+----
+    ...
+    std::array attachments = {colorAttachment, depthAttachment, colorAttachmentResolve};
+    ...
+----
+
+レンダーパスが揃ったので、`createFramebuffers` を変更し、リストに新しいイメージビューを
+追加します。
+
+[,c++]
+----
+void createFramebuffers() {
+        ...
+        vk::ImageView attachments[] = { *colorImageView,  *depthImageView, view };
+        ...
+}
+----
+
+最後に、`createGraphicsPipeline` を変更して、新しく作成したパイプラインに複数サンプルを
+使うよう伝えます。
+
+[,c++]
+----
+void createGraphicsPipeline() {
+    ...
+    multisampling.rasterizationSamples = msaaSamples;
+    ...
+}
+----
+
+今プログラムを実行すると、次のように見えるはずです。
+
+image::/images/multisampling.png[]
+
+ミップマッピングと同様に、違いはすぐには分からないかもしれません。
+よく見ると、エッジが以前ほどギザギザではなく、全体の画像がオリジナルと比べて少し滑らかに
+見えることに気づくでしょう。
+
+image::/images/multisampling_comparison.png[]
+
+エッジの一つを間近で見ると、違いはより目立ちます。
+
+image::/images/multisampling_comparison2.png[]
+
+== 品質の改善
+
+現在の MSAA 実装には、より詳細なシーンで出力画像の品質に影響し得る一定の制限があります。
+たとえば、シェーダエイリアシングによって生じる潜在的な問題は現在解決していません。つまり、
+MSAA はジオメトリのエッジを滑らかにしますが、内部の塗りつぶしはしません。
+これにより、画面上に滑らかなポリゴンが描画されても、適用されたテクスチャに高コントラストの
+色が含まれていると、まだエイリアスして見える状況になり得ます。
+この問題に対処する一つの方法は、https://docs.vulkan.org/spec/latest/chapters/vertexpostproc.html#primsrast-sampleshading[Sample Shading]
+を有効にすることで、追加のパフォーマンスコストはかかりますが、画像品質をさらに改善します。
+
+[,c++]
+----
+
+void createLogicalDevice() {
+    ...
+    deviceFeatures.sampleRateShading = vk::True; // enable sample shading
+    feature for the device
+    ...
+}
+
+void createGraphicsPipeline() {
+    ...
+    multisampling.sampleShadingEnable = vk::True; // enable sample shading in the pipeline
+    multisampling.minSampleShading = .2f; // min fraction for sample shading; closer to one is smoother
+    ...
+}
+----
+
+この例ではサンプルシェーディングは無効のままにしますが、特定のシナリオでは品質の改善が
+目立つ場合があります。
+
+image::/images/sample_shading.png[]
+
+== まとめ
+
+ここまで来るのに多くの作業がかかりましたが、これでようやく Vulkan プログラムの良い基盤が
+できました。
+今持っている Vulkan の基本原則の知識は、次のような機能をもっと探索し始めるのに十分である
+はずです。
+
+* プッシュ定数
+* インスタンス描画
+* ダイナミックユニフォーム
+* 分離された画像とサンプラーディスクリプタ
+* パイプラインキャッシュ
+* マルチスレッドのコマンドバッファ生成
+* 複数のサブパス
+* xref:11_Compute_Shader.adoc[コンピュートシェーダ]
+
+現在のプログラムは、Blinn-Phong ライティング、ポストプロセス効果、シャドウマッピングの
+追加など、多くの方法で拡張できます。
+Vulkan の明示性にもかかわらず多くの概念は同じように動作するため、他の API 向けの
+チュートリアルからこれらの効果がどう動作するかを学べるはずです。
+
+link:/attachments/30_multisampling.cpp[C{pp} コード] /
+link:/attachments/27_shader_depth.slang[slang シェーダ] /
+link:/attachments/27_shader_depth.vert[GLSL 頂点シェーダ] /
+link:/attachments/27_shader_depth.frag[GLSL フラグメントシェーダ]

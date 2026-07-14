@@ -1,0 +1,130 @@
+= プッシュ定数
+
+この節では、ディスクリプタセットのオーバーヘッドなしに少量のデータをシェーダーへ効率的に渡せる、Vulkan の強力な機能であるプッシュ定数を探ります。
+
+== プッシュ定数とは？
+
+プッシュ定数は、少量のデータをシェーダーへ直接送る方法です。ディスクリプタセットとメモリ割り当てが必要なユニフォームバッファと異なり、プッシュ定数はコマンドバッファ自体の一部です。そのため、小さく頻繁に変わるデータに理想的です。
+
+プッシュ定数の主な特徴: サイズは小さく（通常最大 128 バイト、デバイス依存）、ドローごとの更新が速く、コマンドバッファ上に存在するためディスクリプタセットや割り当てが不要です。パイプラインで有効にした任意のシェーダーステージから読み取れます。
+
+== プッシュ定数を使うべきとき
+
+オブジェクトごとに調整するマテリアルつまみ（base color、metallic、roughness）のように、小さく頻繁に変わるドローごとのパラメータにプッシュ定数を使います。デバイスのプッシュ定数上限より大きいか、あまり変わらないデータなら、代わりにユニフォームバッファを選んでください。
+
+== シェーダーでのプッシュ定数の定義
+
+GLSL（または SPIR-V）では、`push_constant` レイアウト修飾子付きのユニフォームブロックでプッシュ定数を定義します。
+
+[source,glsl]
+----
+layout(push_constant) uniform PushConstants {
+    vec4 baseColorFactor;
+    float metallicFactor;
+    float roughnessFactor;
+    int baseColorTextureSet;
+    int physicalDescriptorTextureSet;
+    int normalTextureSet;
+    int occlusionTextureSet;
+    int emissiveTextureSet;
+    float alphaMask;
+    float alphaMaskCutoff;
+} material;
+----
+
+エンジンで使っている Slang では、構文がやや異なります。
+
+[source,slang]
+----
+struct PushConstants {
+    float4 baseColorFactor;
+    float metallicFactor;
+    float roughnessFactor;
+    int baseColorTextureSet;
+    int physicalDescriptorTextureSet;
+    int normalTextureSet;
+    int occlusionTextureSet;
+    int emissiveTextureSet;
+    float alphaMask;
+    float alphaMaskCutoff;
+};
+
+[[vk::push_constant]] PushConstants material;
+----
+
+== Vulkan でのプッシュ定数の設定
+
+vk::raii で Vulkan のプッシュ定数を使うには、次が必要です。
+
+1. パイプラインレイアウト作成時にプッシュ定数範囲を定義する。
+2. シェーダーへデータを送るために `commandBuffer.pushConstants` を使う。
+
+プッシュ定数範囲の定義例です。
+
+[source,cpp]
+----
+// Set up push constant range for material properties
+vk::PushConstantRange pushConstantRange;
+pushConstantRange.setStageFlags(vk::ShaderStageFlagBits::eFragment) // Which shader stages can access the push constants
+               .setOffset(0)
+               .setSize(sizeof(PushConstantBlock)); // Size of our push constant data
+
+// Create pipeline layout with push constants
+vk::PipelineLayoutCreateInfo pipelineLayoutInfo;
+pipelineLayoutInfo.setSetLayoutCount(1)
+                 .setPSetLayouts(&*descriptorSetLayout)
+                 .setPushConstantRangeCount(1)
+                 .setPPushConstantRanges(&pushConstantRange);
+
+// Create pipeline layout with vk::raii
+vk::raii::PipelineLayout pipelineLayout = device.createPipelineLayout(pipelineLayoutInfo);
+----
+
+シェーダーへデータを送る例です。
+
+[source,cpp]
+----
+// Define material properties
+PushConstantBlock pushConstants{};
+pushConstants.baseColorFactor = {1.0f, 1.0f, 1.0f, 1.0f};
+pushConstants.metallicFactor = 1.0f;
+pushConstants.roughnessFactor = 0.5f;
+pushConstants.baseColorTextureSet = 0;
+pushConstants.physicalDescriptorTextureSet = 1;
+pushConstants.normalTextureSet = 2;
+pushConstants.occlusionTextureSet = 3;
+pushConstants.emissiveTextureSet = 4;
+pushConstants.alphaMask = 0.0f;
+pushConstants.alphaMaskCutoff = 0.5f;
+
+// Push constants to shader using vk::raii
+commandBuffer.pushConstants(
+    *pipelineLayout,
+    vk::ShaderStageFlagBits::eFragment, // Which shader stages will receive the data
+    0, // Offset
+    sizeof(PushConstantBlock), // Size
+    &pushConstants // Data
+);
+----
+
+== プッシュ定数 vs. ユニフォームバッファ
+
+プッシュ定数は小さく頻繁に変わるデータに効率的ですが、制限があります。より大きなデータセットや、あまり変わらないデータには、ユニフォームバッファの方がよいことが多いです。
+
+比較表です。
+
+|===
+| 機能 | プッシュ定数 | ユニフォームバッファ
+| サイズ | 制限あり（通常 128 バイト） | はるかに大きい
+| 更新メカニズム | コマンドバッファ内の直接コマンド | メモリマップまたはステージングバッファ
+| ディスクリプタセット | 不要 | 必要
+| メモリ割り当て | 不要 | 必要
+| 更新頻度 | 頻繁な更新に理想的 | まれな更新に適する
+| アクセス速度 | 速い | やや遅い
+|===
+
+PBR 実装では、マテリアルプロパティにプッシュ定数を、ライト情報と変換行列にユニフォームバッファを使います。
+
+次の節では、マテリアルプロパティにプッシュ定数を使う基本的なライティングシェーダーを実装します。
+
+xref:Building_a_Simple_Engine/Lighting_Materials/02_lighting_models.adoc[前へ: ライティングモデル] | xref:Building_a_Simple_Engine/Lighting_Materials/04_lighting_implementation.adoc[次へ: ライティング実装]

@@ -1,0 +1,89 @@
+:pp: {plus}{plus}
+
+= 組み込み NNEF: 小さな例
+
+== 達成すること
+
+本ページの終わりまでに、小さな NNEF モデルを取り、コンパイラフレンドリー IR に変換し、Vulkan 対応組み込み GPU 向けにコンパイルし、数値がゴールデンリファレンスと一致することを検証します。ツールフラグに埋もれない、教えやすく具体的なフローを保ちます。
+
+具体性のため ONNX→TVM→Vulkan 経路を使い（TVM の ONNX インポート経路は安定）、スタックにより IREE 向け StableHLO 経路が適する場合は IREE 章を参照。
+
+== メンタルモデル、もう一度
+
+NNEF はモデルの記述方法。TVM または IREE がその記述をデバイスが実行できるプログラムに変換。あなたの仕事: 1) コンパイラが好む形式にモデルを正規化、2) Vulkan 向けコンパイル、3) コンパイラランタイム経由で成果物実行、4) 信頼するリファレンスと比較。
+
+== 1) 小さな NNEF モデルから始める
+
+Conv→ReLU→Pool または小さな分類器——形状を推論しエラーを見つけやすいほど単純なもの。テキストグラフ（例: `graph.nnef`）とバイナリ重みファイルがある。NNEF パッケージを読んだことがなければ xref:ML_Inference/Building_the_Inference_Engine/06_nnef_introduction.adoc[NNEF introduction] をざっと読む——ディスク上の内容とレイアウト・量子化の考え方。
+
+== 2) NNEF → ONNX 変換
+
+ツールチェーンのコンバータで NNEF グラフと重みを ONNX に翻訳。コンバータの仕事は機械的: op 種類と属性をマップ、形状と dtype を保持、量子化メタデータを運ぶ。特定バイナリ名を暗記する必要はない——ポイントは TVM インポータが堅牢な ONNX に着地すること。
+
+変換後、ONNX ファイルをビューアで開くかグラフノードを print。3 点を sanity チェック: 最初の入力形状、出力形状、conv/pool 属性（kernel、stride、padding）が正しいか。
+
+== 3) ゴールデンリファレンスの確立
+
+Vulkan を使う前に CPU で期待出力を生成。ONNX Runtime が短く簡潔。コンパイル済みパスの隣に置き、後でデバイス上でも再利用。
+
+[source,python]
+----
+import onnxruntime as ort
+import numpy as np
+
+sess = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+inp  = np.random.randn(1, 3, 64, 64).astype("float32")  # adjust to your model
+ref  = sess.run(None, {sess.get_inputs()[0].name: inp})[0]
+----
+
+== 4) TVM で ONNX → Vulkan コンパイル
+
+TVM では ONNX を Relay にインポート、`target="vulkan"` でビルド、実行方法を知る小さなランタイムラッパー付きモジュールを取得。完全例は xref:ML_Inference/Third_Party_Libraries/13_apache_tvm.adoc[TVM 章]——ここはアイデアを固定する本質的形状:
+
+[source,python]
+----
+from tvm import relay, target, transform
+import tvm, onnx
+from tvm.contrib import graph_executor
+
+onnx_model = onnx.load("model.onnx")
+mod, params = relay.frontend.from_onnx(onnx_model, {"input": inp.shape}, freeze_params=True)
+
+with transform.PassContext(opt_level=3):
+    lib = relay.build(mod, target=tvm.target.Target("vulkan"), params=params)
+
+dev    = tvm.vulkan(0)
+rt_mod = graph_executor.GraphModule(lib["default"](dev))
+rt_mod.set_input("input", tvm.nd.array(inp, device=dev))
+rt_mod.run()
+out = rt_mod.get_output(0).numpy()
+----
+
+この時点で `out` と `ref` を比較し単純な誤差指標を計算。量子化なら小さいが有界な差を期待、そうでなければ密接に一致。
+
+デプロイには共有ライブラリをエクスポートしデバイス上も同様にロード:
+
+[source,python]
+----
+lib.export_library("model_vulkan.so")
+----
+
+デバイス上では ABI 向け TVM ランタイムをリンク、`model_vulkan.so` をロード、入力設定、実行、出力取得——呼び出し cadence は TVM ページの最小 C++ スケッチ。
+
+== 5) デバイス上でチェックを繰り返す
+
+ボードでコンパイル済みモジュールを実行、同じ固定入力を供給、保存した `ref` に対して同じ誤差指標を計算。レイアウト取り違え、dtype プロモーション、ビルド間で異なる精度決定をここで捕捉。これが通るまで性能関連は何も変えない。
+
+== IREE を好む場合
+
+IREE 経路は概念的に類似: NNEF→StableHLO 変換、Vulkan バックエンドでコンパイル、`.vmfb` 成果物をデプロイ、IREE ランタイム経由で関数呼び出し。詳細スイッチと最小埋め込みは xref:ML_Inference/Third_Party_Libraries/12_iree.adoc[IREE]。同じゴールデンリファレンスハーネスがそのまま適用。
+
+== 遭遇しがちなトラブルシューティング
+
+レイアウト不一致が「動くがおかしい」の第一原因。NCHW vs NHWC を早期に決め前処理・モデル・後処理で一貫。TVM インポート失敗時は ONNX グラフ簡素化（学習 op 除去、定数畳み込み）と全入力形状指定を試す。数値ドリフト時は最初に不一致テンソルを見つけるまでレイヤごとに二分探索——最終層出力ではなく。
+
+== 「完了」の意味
+
+組み込みデバイスでコンパイル済み成果物を実行でき、出力が合意許容差内で CPU リファレンスと一致し、サーマル崩壊なしに定常状態レイテンシを測定できる。ここから精度（fp16/INT8）反復、必要なら TVM 自動チューニング、正しさが退屈になってからのみ Vulkan で境界データ移動最適化。
+
+xref:ML_Inference/Embedded_Applications/07_ml_compiler.adoc[前へ: 組み込み ML コンパイラ] | xref:ML_Inference/Embedded_Applications/09_conclusion.adoc[次へ: 結論]

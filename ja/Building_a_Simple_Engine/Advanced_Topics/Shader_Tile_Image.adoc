@@ -1,0 +1,40 @@
+= VK_EXT_shader_tile_image — タイルデータへの高速アクセス
+
+一部の GPU は、メモリ往復なしでオンチップのカラー／デプスをシェーダーから読める「タイル」または「サブパス」のデータパスを公開しています。`VK_EXT_shader_tile_image` は、それに移植可能な形で触るための手段です。
+
+このサンプルではオプションの最適化として扱います。パイプラインはこの機能なしでも正しく動き、デバイスがサポートを広告しているときだけ「高速パス」を取ります。
+
+== 何を解決するか
+
+書き込んだ直後のカラーからのポストライティング用テクスチャ読みは、コストが高くなりがちです。タイルイメージアクセスがあれば、対応ハードウェア上で特定のパターンがより安く、より決定的になります。
+
+== このサンプルでの扱い
+
+* 機能があれば有効化し、コードから確認できる boolean を公開します。
+* レンダラーは引き続ききれいな Synchronization 2 のバリアを使い、正式なレイアウト遷移の前に dynamic rendering を終了します。タイル読みをサポートしないデバイスでもコードが分かりやすく保たれます。
+
+== 指針
+
+最適化として使ってください。どこでも正しいコードを書き、利用可能なときだけタイルイメージの高速パスを足します。
+
+== コードの参照先
+
+* 機能検出と有効化:
+** `renderer_core.cpp`
+* Dynamic rendering のセットアップとアタッチメント遷移（明確さのため明示的に保つ）:
+** `renderer_rendering.cpp`
+** `renderer_pipelines.cpp`
+
+== 今後のアイデア
+
+タイルイメージの利用をより直接的に示したい場合:
+
+* 現在のカラーアタッチメントを読む小さな「local read」ポストエフェクトを追加し、通常のサンプリングパスと比較する。
+* 開発専用のデバイス能力プリントを追加し、高速パスが有効なときを学生が確認できるようにする。
+* マイクロベンチマーク用シーンを追加し、タイルベース GPU での帯域を比較する。
+
+== 次に読むもの
+
+* xref:Building_a_Simple_Engine/Advanced_Topics/Dynamic_Rendering_Local_Read.adoc[Dynamic Rendering Local Read]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Synchronization_2_Frame_Pacing.adoc[フレームペーシング]
+* xref:Building_a_Simple_Engine/Advanced_Topics/Rendering_Pipeline_Overview.adoc[レンダリングパイプライン概要]

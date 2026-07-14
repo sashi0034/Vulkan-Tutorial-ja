@@ -1,0 +1,76 @@
+:pp: {plus}{plus}
+
+= まとめ
+
+これで、前の章までのすべての構造体とオブジェクトを組み合わせてグラフィックスパイプラインを作成できます。簡単な復習として、いま持っているオブジェクトの種類は次のとおりです。
+
+* シェーダステージ: グラフィックスパイプラインのプログラム可能な段階の機能を定義するシェーダモジュール
+* 固定機能の状態: 入力アセンブリ、ラスタライザ、ビューポート、カラーブレンディングなど、パイプラインの固定機能段階を定義するすべての構造体
+* パイプラインレイアウト: 描画時に更新できる、シェーダが参照するuniformとプッシュ値
+* ダイナミックレンダリング: レンダリング中に使うアタッチメントのフォーマット
+
+これらをすべて組み合わせるとグラフィックスパイプラインの機能が完全に定義されるので、`createGraphicsPipeline`関数の末尾で`vk::GraphicsPipelineCreateInfo`構造体を埋め始められます。
+
+[,c++]
+----
+vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+    {.stageCount          = 2,
+     .pStages             = shaderStages,
+----
+
+まず`vk::PipelineShaderStageCreateInfo`構造体の配列を参照します。
+
+[,c++]
+----
+     .pVertexInputState   = &vertexInputInfo,
+     .pInputAssemblyState = &inputAssembly,
+     .pViewportState      = &viewportState,
+     .pRasterizationState = &rasterizer,
+     .pMultisampleState   = &multisampling,
+     .pColorBlendState    = &colorBlending,
+     .pDynamicState       = &dynamicState,
+----
+
+次に、固定機能段階を記述するすべての構造体を参照します。
+
+[,c++]
+----
+     .layout              = pipelineLayout,
+----
+
+その後にパイプラインレイアウトが続きます。これは構造体ポインタではなくVulkanハンドルです。
+
+[,c++]
+----
+     .renderPass          = nullptr},
+    {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format}};
+----
+
+従来のレンダーパスではなくダイナミックレンダリングを使っているため、`renderPass`パラメータを`nullptr`に設定し、`vk::StructureChain`に`vk::PipelineRenderingCreateInfo`構造体を含めていることに注意してください。この構造体は、レンダリング中に使うアタッチメントのフォーマットを指定します。
+
+実際にはvk::GraphicsPipelineCreateInfoにはあと2つのメンバ、`basePipelineHandle`と`basePipelineIndex`があります。Vulkanでは、既存のパイプラインから派生させて新しいグラフィックスパイプラインを作成できます。パイプライン派生の考え方は、既存のパイプラインと多くの機能を共有する場合にパイプラインのセットアップが安価になり、同じ親からのパイプライン間の切り替えも速くできるというものです。既存のパイプラインのハンドルを`basePipelineHandle`で指定するか、これから作成される別のパイプラインを`basePipelineIndex`でインデックス参照できます。これらの値は、`vk::GraphicsPipelineCreateInfo`の`flags`フィールドに`vk::PipelineCreateFlagBits::eDerivative`フラグも指定されている場合にのみ使われます。いまはパイプラインが1つだけなので、これらのメンバは無視します。
+
+最終ステップの準備として、`vk::raii::Pipeline`オブジェクトを保持するクラスメンバを作成します。
+
+[,c++]
+----
+vk::raii::Pipeline graphicsPipeline = nullptr;
+----
+
+そして最後に、グラフィックスパイプラインを作成します。
+
+[,c++]
+----
+graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+----
+
+2つ目のパラメータには`nullptr`引数を渡していますが、これは省略可能な`vk::raii::PipelineCache`オブジェクトを参照します。パイプラインキャッシュは、`vk::raii::Pipeline`コンストラクタへの複数回の呼び出し間、さらにはキャッシュをファイルに保存すればプログラム実行間でも、パイプライン作成に関連するデータを格納して再利用するために使えます。これにより、後でパイプライン作成を大幅に高速化できます。パイプラインキャッシュの章で扱います。
+
+グラフィックスパイプラインは、一般的な描画操作すべてに必要です。
+
+プログラムを実行して、この苦労の成果としてパイプライン作成が成功したことを確認してください。画面に何かが現れるところまでかなり近づいています。xref:/03_Drawing_a_triangle/03_Drawing/00_Dynamic_rendering.adoc[次の数章]では、スワップチェーン画像用のダイナミックレンダリングをセットアップし、描画コマンドを準備します。
+
+link:/attachments/12_graphics_pipeline_complete.cpp[C{pp} code] /
+link:/attachments/09_shader_base.slang[Slang shader] /
+link:/attachments/09_shader_base.vert[GLSL Vertex shader] /
+link:/attachments/09_shader_base.frag[GLSL Fragment shader]

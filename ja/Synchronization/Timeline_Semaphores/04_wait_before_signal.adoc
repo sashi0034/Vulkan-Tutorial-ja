@@ -1,0 +1,69 @@
+:pp: {plus}{plus}
+= Wait-Before-Signal サブミッション: 実行の分離
+
+== パラダイムシフト
+
+レガシー Vulkan では、一般に意図した実行順に作業をサブミットする必要がありました。コマンドバッファ B がコマンドバッファ A に依存する場合、A を先にサブミットするか、バイナリセマフォでつなぎ同じ `vkQueueSubmit` 呼び出しで両方をサブミットする必要がありました。
+
+タイムラインセマフォは **Wait-Before-Signal** サブミッションパターンを導入します。これにより、コマンドバッファ A がまだ記録すらされていない——ましてサブミットされていない——うちに、コマンドバッファ B を GPU にサブミットできます。コマンドバッファ B に、タイムラインセマフォ上の特定の値を待つよう伝えるだけです。コマンドバッファ A（または他のプロセス）がその値を最終的にシグナルする限り、GPU は依存関係を正しく管理します。
+
+== 仕組み
+
+このパターンが機能するのは、Vulkan が作業の **サブミッション** と作業の **実行** を分離しているからです。`queue.submit2` を呼ぶと、ドライバは単にコマンドをキューの内部バッファに追加します。ハードウェアのコマンドプロセッサは指定されたタイムラインセマフォを監視します。すべての「待ち」値に到達するまで、コマンドの実行を開始しません。
+
+[,cpp]
+----
+// Submit the "Waiter" first!
+auto waitInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *timelineSemaphore,
+    .value = 10,
+    .stageMask = vk::PipelineStageFlagBits2::eAllCommands
+};
+
+auto submitWaiter = vk::SubmitInfo2{
+    .waitSemaphoreInfoCount = 1,
+    .pWaitSemaphoreInfos = &waitInfo,
+    .commandBufferInfoCount = 1,
+    .pCommandBufferInfos = &waitCommandBufferInfo
+};
+
+graphicsQueue.submit2(submitWaiter);
+
+// ... Later, perhaps in a different thread or even a different frame ...
+
+// Submit the "Signaler"
+auto signalInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *timelineSemaphore,
+    .value = 10,
+    .stageMask = vk::PipelineStageFlagBits2::eAllCommands
+};
+
+auto submitSignaler = vk::SubmitInfo2{
+    .signalSemaphoreInfoCount = 1,
+    .pSignalSemaphoreInfos = &signalInfo,
+    .commandBufferInfoCount = 1,
+    .pCommandBufferInfos = &signalCommandBufferInfo
+};
+
+transferQueue.submit2(submitSignaler);
+----
+
+== なぜ重要か
+
+この分離は、モダンなマルチスレッドエンジンアーキテクチャにとってゲームチェンジャーです。
+
+1.  **CPU レイテンシの削減**: メインスレッドは、バックグラウンドスレッド（アセットローダや物理エンジンなど）の完了を待たずに、コマンドバッファが記録され次第すべての作業を GPU にサブミットできます。
+2.  **非同期オーバーラップ**: 重なるパスの実装がはるかに容易になります。例えば、ポストプロセスパスがジオメトリのタイムライン値を待つ限り、CPU がポストプロセスパスの記録をまだ終えている最中でも、GPU はジオメトリパスを開始できます。
+3.  **簡素化されたアーキテクチャ**: API 呼び出しの厳密な順序を気にするのではなく、各パスの「必要」に合わせてサブミッション論理を構築できます。
+
+Wait-before-signal は、真にモダンな Vulkan レンダラのための最後のピースです。Synchronization 2 の精密さとタイムラインセマフォの柔軟性を組み合わせることで、理解しやすく、かつハードウェアから最後の一滴まで性能を絞り出せるエンジンを構築できます。
+
+== Simple Engine: ノンブロッキングサブミッション
+
+`Simple Engine` では、このパターンを使って `PhysicsSystem` と `Renderer` を分離します。現在、レンダラはコマンドバッファを *記録* する前に、CPU 上で物理シミュレーションが終わるのを待たなければなりません。これが毎フレーム大きな CPU ストールを生みます。
+
+Wait-before-signal では、`Renderer` は単に `physicsTimeline` が特定の値（例: `currentFrameIndex`）に到達するのを待つコマンドを記録します。その後、それらのコマンドをすぐに `graphicsQueue` へサブミットできます。`PhysicsSystem` がまだ `computeQueue` 上でシミュレーションを終えていなくても、GPU はフレームのレンダリング開始時に正しく待ちます。これにより、GPU が依存関係自体を効率的に管理している間、CPU は他のタスク（オーディオ処理や入力処理など）へ進めます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Timeline_Semaphores/03_monotonic_counter.adoc[単調カウンタ] | 次へ: xref:Synchronization/Frame_in_Flight/01_introduction.adoc[フレームインフライトアーキテクチャ]

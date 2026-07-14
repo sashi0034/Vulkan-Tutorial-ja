@@ -1,0 +1,72 @@
+:pp: {plus}{plus}
+= ステージング同期: グラフィックスと転送の協調
+
+== ハンドシェイク
+
+バックグラウンド転送キューが新しいアセットを GPU 最適メモリへコピーし終えたら、データがサンプリング可能になったことをグラフィックスキューに伝える方法が必要です。ここで **タイムラインセマフォ** と **キューファミリー所有権転送** が結び付きます。
+
+協調は単純な三段階のプロセスに従います。
+
+1.  **転送リリース**: 転送キューはコピーを行い、次にリソースの所有権を「リリース」するパイプラインバリアを記録します（第 3 章で学んだ通り）。
+2.  **セマフォシグナル**: 転送キューは作業完了時に、タイムラインセマフォ上の特定の値をシグナルします。
+3.  **グラフィックスアクワイア**: グラフィックスキューは同じセマフォ値を待ち、次にリソースの所有権を「アクワイア」する自身のパイプラインバリアを記録します。
+
+== ハンドシェイクの協調
+
+第 4 章で学んだ **Wait-Before-Signal** パターンの美しさは、転送がまだ終わっていなくてもグラフィックスキューをサブミットできることです。グラフィックスキューが正しいタイムライン値を待つ限り、ハードウェアは転送が先に完了することを保証します。
+
+[,cpp]
+----
+// Graphics Queue Submission (Wait for Transfer)
+auto waitInfo = vk::SemaphoreSubmitInfo{
+    .semaphore = *transferTimeline,
+    .value = upload_complete_value,
+    .stageMask = vk::PipelineStageFlagBits2::eFragmentShader
+};
+
+auto acquireBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+    .srcAccessMask = vk::AccessFlagBits2::eNone,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .srcQueueFamilyIndex = transferQueueIndex,
+    .dstQueueFamilyIndex = graphicsQueueIndex,
+    .image = newTexture.image(),
+    .subresourceRange = subresourceRange
+};
+
+// Record and submit the acquire barrier on the graphics queue
+graphicsCommandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &acquireBarrier});
+
+auto submit = vk::SubmitInfo2{
+    .waitSemaphoreInfoCount = 1,
+    .pWaitSemaphoreInfos = &waitInfo,
+    // ...
+};
+
+graphicsQueue.submit2(submit);
+----
+
+== リソース寿命の扱い
+
+バックグラウンドでアセットをストリームするときは、**ステージングバッファ** の寿命にも注意が必要です。転送キューがそこからのコピーを終えるまで、ステージングバッファを再利用または破棄してはいけません。これもタイムラインセマフォが貴重な領域です。各ステージング割り当てに完了値をタグ付けすることで、安全なときだけメモリを回収する単純な「ガベージコレクタ」を構築できます。
+
+ステージング同期をタイムラインセマフォと協調させることで、高性能かつ極めて堅牢なエンジンを構築できます。次の章では、従来のサブパス依存がこれらの明示的な同期パターンに置き換えられた、**ダイナミックレンダリング** のモダンな世界に同じ原則がどう適用されるかを見ます。
+
+== Simple Engine での協調
+
+`Simple Engine` では、この協調は `Renderer::ProcessPendingMeshUploads` メソッドで行われます。`LoadingThread` が転送を終えると、新しいメッシュ／テクスチャをスレッドセーフなキューに追加します。メインレンダラは毎フレームこのキューを確認します。
+
+各新しいアセットについて、レンダラは次を行います。
+
+1.  **タイムライン値の取得**: ローディングスレッドがこの特定のアップロード用にシグナルした `uploadTimelineValue` を取得します。
+2.  **アクワイアバリアの記録**: メインのグラフィックスコマンドバッファに `vk::ImageMemoryBarrier2` を記録します。イメージに `eConcurrent` を使っているため、このバリアは主に `eTransferDstOptimal` から `eShaderReadOnlyOptimal` へのレイアウト遷移を扱い、グラフィックスキャッシュでデータが無効化されることを保証します。
+3.  **完了待ち**: メインフレームのサブミッションに `vk::SemaphoreSubmitInfo` を追加します。これにより、新しいテクスチャをサンプリングするフラグメントシェーダの実行を始める前に、`uploadTimeline` が `uploadTimelineValue` に到達するまで `graphicsQueue` が待つよう伝えます。
+
+この堅牢なハンドシェイクにより、バックグラウンドスレッドが別の CPU コアで動き別の GPU キューへサブミットしていても、`Simple Engine` がまだコピー中のテクスチャを描こうとしないことが保証されます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Transfer_Queues_Streaming/02_non_blocking_uploads.adoc[ノンブロッキングデータアップロード] | 次へ: xref:Synchronization/Dynamic_Rendering_Sync/01_introduction.adoc[ダイナミックレンダリングにおける同期]

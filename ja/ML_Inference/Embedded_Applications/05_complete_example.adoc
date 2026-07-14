@@ -1,0 +1,281 @@
+= 完全な組み込みアプリケーション: スマート野生動物カメラ
+:pp: {plus}{plus}
+:stem: latexmath
+
+クロスコンパイルを習得し、ゼロコピーカメラパイプラインを構築し、PID コントローラでエネルギー消費を調整しました。いよいよすべてを統合する時です。
+
+本最終ケーススタディでは **スマート野生動物カメラ** を構築します。バッテリ駆動、ヘッドレス、遠隔の森の木に取り付ける設計。数日間静かに待機し、動きを検知したときだけ起き、量子化ニューラルネットワークで見た種を分類し、結果をハードニングされたテレメトリデータベースに記録します。
+
+
+== ミッション要件
+
+フィールドで成功するには、競合する複数の物理・論理制約を満たす必要があります:
+
+*   **プラットフォーム**: Sony IMX219 link:https://mipi.org/specifications/csi-2[MIPI CSI] カメラ付き Raspberry Pi 5（8GB）。
+*   **動作環境**: ヘッドレス（ディスプレイなし）、受動冷却（密封 IP67 ケース）、ソーラー充電バッテリ。
+*   **推論目標**: 地域 50 種の野生動物を latexmath:[\ge 15] FPS で分類。
+*   **エネルギー目標**: 10,000mAh パワーバンクで 48 時間ミッションを生き延びる latexmath:[< 1.5W] 平均消費。
+*   **信頼性**: 起動時自動開始、カーネルパニック生き延び、電力変動を自律処理。
+
+== システムアーキテクチャ: 「非同期トリプルスレッド」
+
+組み込み製品では「ビッグループ」パターンを避けます。1 スレッドの停止（例: 遅い SD カードへの I/O 書き込み待ち）がカメラの視認を止めるべきではありません。**ロックフリーキュー** で協調する 3 つの独立サービススレッドを使います。
+
+.Wildlife Camera Software Architecture
+----
++-----------------------------------------------------------+
+|                    Hardware Watchdog                      |
++-----------------------------------------------------------+
+          ^                      ^                      ^
+          | (Heartbeat)          | (Heartbeat)          | (Heartbeat)
++---------+----------+  +---------+----------+  +---------+----------+
+|  Capture Thread    |  |  Inference Thread  |  | Persistence Thread |
+|  (V4L2 + dmabuf)   |  |  (Vulkan + ONNX)   |  | (SQLite + LTE)     |
++---------+----------+  +---------+----------+  +---------+----------+
+          |                      ^                      ^
+          | [Filled dmabuf]      | [Inference Result]   |
+          +----------------------+----------------------+
+                      (Shared Memory / Zero-Copy)
+----
+
+1.  **キャプチャスレッド（V4L2）**: YUV フレームを取得し `dmabuf` キューを管理。システムの「脈拍」。
+2.  **推論スレッド（Vulkan）**: GPU で動体検出、フォーマット変換、ML 推論を実行。「脳」。
+3.  **永続化スレッド（SQLite）**: メタデータを SD カードに書き、クラウドテレメトリ（LTE/LoRa 経由）を管理。「記憶」。
+
+== フェーズ 1: ゼロコピー「心臓」
+
+第 3 章のパイプラインを実装。カメラハードウェアが Vulkan コンピュートシェーダがアクセスできるメモリに直接書き込みます。V4L2 と Vulkan ロジックを堅牢な `FrameManager` クラスにラップ。
+
+[source,cpp]
+----
+class FrameManager {
+public:
+    struct Frame {
+        int dmabufFd;
+        vk::raii::Image image;
+        vk::raii::DeviceMemory memory;
+        vk::raii::Fence fence; // Signals when GPU is done with this frame
+    };
+
+    void init(int width, int height) {
+        // 1. Setup V4L2
+        camera.open("/dev/video0");
+        camera.requestBuffers(4);
+
+        // 2. Setup Vulkan Imports
+        for (int i = 0; i < 4; ++i) {
+            int fd = camera.exportBuffer(i);
+            frames[i] = importExternalMemory(fd, width, height);
+        }
+    }
+
+    Frame& acquireNext() {
+        int index = camera.dequeueBuffer();
+        // Ensure the GPU has finished using this buffer from the previous cycle
+        device.waitForFences({*frames[index].fence}, true, UINT64_MAX);
+        device.resetFences({*frames[index].fence});
+        return frames[index];
+    }
+
+private:
+    V4L2Device camera;
+    std::array<Frame, 4> frames;
+};
+----
+
+== フェーズ 2: 電力Aware動体トリガー
+
+数日間生き延びるため、すべてのフレームで重い MobileNetV2 を実行しません。まず **軽量動体検出** コンピュートシェーダを実行。このシェーダは latexmath:[< 0.1ms] の GPU 時間。
+
+[source,glsl]
+----
+// Simple Mean Absolute Difference (MAD) Shader
+// This kernel identifies changes in luminance (Y channel)
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    float current = texelFetch(samplerCurrent, pos, 0).r;
+    float previous = texelFetch(samplerPrevious, pos, 0).r;
+
+    // 1. Calculate pixel-level difference
+    float diff = abs(current - previous);
+
+    // 2. Atomically add to a global counter if movement is significant
+    if (diff > 0.15) {
+        atomicAdd(motionCounter, 1);
+    }
+}
+----
+
+`motionCounter` が閾値以下（例: 0.5% 未満のピクセル変化）なら、**推論スレッド** は即座に `vkWaitForFences` でスリープに戻ります。SoC は時間の latexmath:[95\%] を低電力状態に留め、動物が実際にいるときだけ重いニューラルネットワークを「起こします」。
+
+== フェーズ 3: ハードニングされたメインループ（ウォッチドッグ）
+
+`main()` は「フィールドデバイス」向けに設計。遠隔の森ではドライバ競合でアプリがハングしても、リセットボタンを押す人間はいません。**ハードウェアウォッチドッグ**（link:https://www.kernel.org/doc/Documentation/watchdog/watchdog-api.txt[Linux Watchdog API] 経由で管理）が保険です。
+
+=== ウォッチドッグロジック: 「ハートビート」の数学
+カーネルウォッチドッグは latexmath:[T_{heart}] 秒ごとに「ハートビート」（`/dev/watchdog` への書き込み）を期待。アプリがクラッシュまたはデッドロックすると書き込みが止まり、latexmath:[T_{timeout}] 秒後にハードウェアがハードリセットを強制。
+
+[source,cpp]
+----
+// Heartbeat structure for thread monitoring
+struct ThreadStatus {
+    std::atomic<long long> lastHeartbeat{0};
+    void kick() {
+        lastHeartbeat = std::chrono::steady_clock::now().time_since_epoch().count();
+    }
+};
+
+void watchdogLoop(ThreadStatus& cap, ThreadStatus& inf) {
+    int fd = open("/dev/watchdog", O_WRONLY);
+    if (fd < 0) return;
+
+    while(running) {
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        // 10 second timeout
+        long long timeout = 10000000000LL;
+
+        if ((now - cap.lastHeartbeat) < timeout && (now - inf.lastHeartbeat) < timeout) {
+            ioctl(fd, WDIOC_KEEPALIVE, 0); // System is healthy
+        } else {
+            // BOOM: System will reboot in T-minus 10 seconds
+            syslog(LOG_CRIT, "Watchdog timeout! Cap: %lld, Inf: %lld",
+                   now - cap.lastHeartbeat, now - inf.lastHeartbeat);
+        }
+        std::this_thread::sleep_for(1s);
+    }
+}
+----
+
+== フェーズ 4: 自己修復ステートマシン
+
+現実世界では物事は失敗します。MIPI CSI カメラはフレームを落としたり、電気ノイズで「バッファタイムアウト」を返したりすることがあります。クラッシュする代わりに、**自己修復ステートマシン** を使います。
+
+[source,cpp]
+----
+enum class SystemState { INITIALIZING, STREAMING, RECOVERING, SHUTDOWN };
+
+void captureLoop() {
+    SystemState state = SystemState::INITIALIZING;
+    while(state != SystemState::SHUTDOWN) {
+        try {
+            switch(state) {
+                case SystemState::INITIALIZING:
+                    camera.init();
+                    state = SystemState::STREAMING;
+                    break;
+                case SystemState::STREAMING:
+                    if (!camera.processFrame()) {
+                        state = SystemState::RECOVERING;
+                    }
+                    break;
+                case SystemState::RECOVERING:
+                    syslog(LOG_WARNING, "Camera timeout, resetting hardware...");
+                    camera.reset();
+                    std::this_thread::sleep_for(2s);
+                    state = SystemState::INITIALIZING;
+                    break;
+            }
+        } catch (const std::exception& e) {
+            state = SystemState::RECOVERING;
+        }
+    }
+}
+----
+
+== フェーズ 5: ランタイム性能プロファイリング
+
+フィールドではデバッガをアタッチできません。システムが遅くなる理由を理解する **ライブテレメトリ** が必要。各ステージのタイミングを SQLite データベースに記録する軽量プロファイリングフックを実装。
+
+[source,cpp]
+----
+struct ProfileData {
+    float captureMs;
+    float preprocMs;
+    float inferenceMs;
+    float totalMs;
+};
+
+void logPerformance(const ProfileData& d) {
+    // Log to a specialized 'metrics' table
+    db.execute("INSERT INTO metrics (capture, preproc, inference, total) VALUES (?, ?, ?, ?)",
+               d.captureMs, d.preprocMs, d.inferenceMs, d.totalMs);
+}
+----
+
+=== フィールドでの Roofline 分析
+`preprocMs` と `inferenceMs` の比でボトルネックを特定:
+*   **高 Preproc**: フォーマット変換または正規化が未最適化。`VK_KHR_sampler_ycbcr_conversion` の検討。
+*   **高 Inference**: モデルが SoC に重すぎる。さらなる量子化（INT8 または INT4）や刈り込みを検討。
+
+== フェーズ 6: モデルバージョニングと A/B テスト
+
+エンジンの強力な機能の一つは、アプリ再起動なしでランタイムにモデルを差し替えられること。フィールドでの **A/B テスト** が可能。
+
+1.  **ステージング**: 新しい `.onnx` モデルを一時フォルダにダウンロード。
+2.  **検証**: ハッシュを確認し GPU で単一「ウォームアップ」推論を実行。
+3.  **アトミックスワップ**: 推論スレッドの `ModelPointer` を更新。
+
+[source,cpp]
+----
+void updateModel(const std::string& newPath) {
+    auto nextModel = std::make_unique<VulkanModel>(newPath);
+    nextModel->warmup(); // Ensure shaders are compiled
+
+    // Atomic swap of the shared pointer
+    std::atomic_store(&currentModel, std::move(nextModel));
+    syslog(LOG_INFO, "Model updated to %s", newPath.c_str());
+}
+----
+
+== SQLite テレメトリ: 真実の記録
+
+SD カードは書き込みサイクルが限られ遅い。高信頼度の動きでない限り生画像は記録しません。観測を ACID 準拠 link:https://www.sqlite.org/docs.html[SQLite] データベースに記録。
+
+=== SD カード向け最適化
+小さなランダム書き込みで SD カードを破壊しないよう、いくつかの SQLite「Pragma」を使用:
+1.  **WAL モード**: Write-Ahead Logging で同時読み書き。
+2.  **Synchronous=NORMAL**: 電源断安全性を保ちつつ `fsync` 回数を削減。
+3.  **Page Size = 4096**: フラッシュ NAND ブロックサイズに合わせ「書き込み増幅」を最小化。
+
+[source,sql]
+----
+-- telemetry.db
+-- We log environment data alongside species predictions
+CREATE TABLE observations (
+    id INTEGER PRIMARY KEY,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    species_id INTEGER,
+    confidence FLOAT,
+    soc_temp FLOAT,
+    battery_v FLOAT
+);
+----
+
+== 本番ハードニング: Linux OS
+
+製品はアプリだけではありません。OS 全体です。野生動物カメラには Linux レベルのハードニングを適用:
+
+1.  **読み取り専用 RootFS**: システムパーティションを読み取り専用マウント。突然の電源断（バッテリ切れなど）時の SD カード破損を防止。
+2.  **OOM Killer チューニング**: カメラアプリの `/proc/self/oom_score_adj` を `-1000` に。メモリ不足時、カーネルは AI パイプラインに触れる前に `sshd` などバックグラウンドサービスを kill。
+3.  **スワップなし**: スワップファイルを完全無効化。ML アプリで SD カードへスワップは遅すぎ、最初のページ読み込み前にウォッチドッグが発動。
+4.  **CPU ピン留め**: `pthread_setaffinity_np` でスレッドを SoC の特定「Little」コアにピン留め、ML 作業の重いバースト用に「Big」コアを残す。
+5.  **OverlayFS**: `/var/log` と `/tmp` に RAM バック link:https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt[OverlayFS]。数千ログメッセージを書いても物理 SD カードに触れず、書き込み摩耗を防止。
+
+== フィールド信頼性: 電力変動の処理
+
+フィールドではソーラー電源が不安定。プロの組み込みアプリは「ブラウンアウト」を優雅に処理する必要があります。
+
+1.  **早期警告**: 電源管理 IC（PMIC）の GPIO 割り込みで電圧が 3.3V 以下になったことを通知。
+2.  **安全シャットダウン**: C++ シグナルハンドラで即座に SQLite データベースを閉じ `sync()` で SD カードバッファをフラッシュしてから完全に電源が切れる。
+
+== まとめ
+
+ゼロコピービジョン、マルチスレッドオーケストレーション、ハードウェアレベル信頼性を統合すれば、スクリプト以上のもの——**プロのエッジ AI 製品**——を構築しました。
+
+*   **ハードウェアを理解**: センサーとカーネルウォッチドッグに直接対話。
+*   **物理学を理解**: エネルギーとサーマルを主要制約として管理。
+*   **規律を理解**: フィールドで生き延びる自己修復システムを構築。
+
+最終技術章では、静止世界のカメラから **ステレオ 3D ビジョンと OpenXR** の世界へ移ります。
+
+xref:ML_Inference/Embedded_Applications/04_power_optimization.adoc[前へ: 電力最適化] | xref:ML_Inference/Embedded_Applications/06_scene_understanding_openxr.adoc[次へ: OpenXR でのシーン理解]

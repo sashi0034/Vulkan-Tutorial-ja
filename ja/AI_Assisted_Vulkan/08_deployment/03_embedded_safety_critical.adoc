@@ -1,0 +1,95 @@
+:pp: {plus}{plus}
+
+= 組み込みとセーフティクリティカルシステム
+
+== はじめに: 最小値の管理
+
+組み込みシステム——Raspberry Pi、NVIDIA Jetson、カスタム SoC（System on a Chip）ハードウェアなど——は、Vulkan エコシステムで最も制約の厳しい環境を表します。これらのシステムでは、しばしば共有メモリ 1 ギガバイトに制限され、CPU はデスクトッププロセッサの速度のごく一部です。この環境では「ほぼ十分」は選択肢ではありません。
+
+**協調エンジニアリング** では、アシスタントを **安全性検証ツール** として使います。AI でハードなハードウェアリミットに対するリソース割り当てを継続的にチェックし、現代グラフィックスを「小さな」シリコンフットプリントに収めるのに必要な積極的量子化を提案します。
+
+== チュートリアル: 組み込みメモリマップの管理
+
+デスクトップ開発と異なり、組み込み開発は **ハードリミット** についてです。AI アシスタントを使い、SoC の具体的制約に対してリソース割り当てを監査します。
+
+=== ステップ 1: ハードウェアプロファイルの読み込み
+デバイスのメモリマップとターゲット解像度の要件を AI に与えます。
+
+[source,text]
+----
+I am developing for an NVIDIA Jetson Nano with 4GB of
+unified memory. 512MB is reserved for the display
+controller and OS. Our target is 1080p triple-buffered.
+
+Analyze our 'PoolAllocator.cpp'. We are pre-allocating
+five 64MB heaps. Will this leave enough headroom
+for the swapchain and our G-Buffer?
+----
+
+=== ステップ 2: 割り当ての最適化
+AI が監査結果を報告したら、「パディング無駄」を最小化するリファクタ済み割り当て戦略を求めてください。
+
+[source,cpp]
+----
+// Example of an AI-suggested memory allocation for embedded
+VkMemoryAllocateInfo allocInfo = {};
+allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+allocInfo.allocationSize = reclaimedSize; // Optimized size
+// AI will suggest specific memory types for the Jetson's unified memory
+allocInfo.memoryTypeIndex = unifiedMemoryIndex;
+----
+
+== チュートリアル: Mali/Adreno 向けシェーダ量子化
+
+組み込みシステムでは、シェーダの精度が消費電力に直接影響します。変数を `mediump`（FP16）へダウングレードすると、性能が大幅に上がり得ます。
+
+=== ステップ 1: 精度監査
+フラグメントシェーダを AI に与え、量子化の安全な候補を特定するよう頼みます。
+
+[source,text]
+----
+Goose, audit 'PBR.frag' for a Mali-G710 GPU.
+Which variables can we safely downgrade to 'mediump'
+(FP16) without causing visible artifacts in our
+specular reflections or normal mapping?
+----
+
+=== ステップ 2: 量子化の適用
+AI はリファクタ済みシェーダを提供します。正規化と中間ライティングステップに `mediump` を切り替えることでレジスタ圧を減らし、より多くのスレッドが並列実行できるようにします。
+
+[source,glsl]
+----
+// AI-optimized fragment shader for embedded
+layout(location = 0) out vec4 outColor;
+void main() {
+    mediump vec3 normal = normalize(inNormal);
+    mediump vec3 lightDir = normalize(uBo.lightPos - inPos);
+    // ... lighting calculations at FP16 ...
+}
+----
+
+== チュートリアル: Vulkan SC コンプライアンスチェック
+
+自動車・産業環境では **Vulkan SC** を使います。これはすべてのリソースが事前割り当てされることを要求します。
+
+=== ステップ 1: コンプライアンス監査
+初期化シーケンスを AI に与え、SC 1.0 違反をチェックするよう頼みます。
+
+[source,text]
+----
+Goose, audit 'VulkanContext::initializeSC'.
+Check if our 'PipelineCache' warming logic is compliant
+with the Vulkan SC 1.0 specification for offline compilation.
+Are we using any illegal dynamic state like 'VK_DYNAMIC_STATE_LINE_WIDTH'?
+----
+
+=== ステップ 2: SC リファクタ
+AI が違反（動的ライン幅など）を見つけたら、コンプライアンスを維持するのに必要な「事前ベイク」パイプライン配列を生成するよう頼んでください。
+
+== まとめ: 精密パートナー
+
+組み込みデプロイは **エッジ向けエンジニアリング** です。AI でメモリ予算を監査し量子化戦略を提案することで、他者には「小さすぎる」と見なされるハードウェア上で動くハイパフォーマンスエンジンを構築できます。
+
+セクション 8 の完了により、AI 支援 Vulkan エンジンをコンピューティング世界のあらゆる隅へ持ち込む技術をマスターしました。チュートリアルの最終セクションでは、協調エンジニアとしてのスキルを固める包括的な **FAQ** と **最終プロジェクト** を提供します。
+
+次へ: xref:AI_Assisted_Vulkan/09_faq.adoc[よくある質問とトラブルシューティング（FAQ）]

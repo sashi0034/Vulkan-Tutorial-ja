@@ -1,0 +1,73 @@
+:pp: {plus}{plus}
+
+= シンプルなエンジンの構築: はじめに
+
+== はじめに
+
+「シンプルなエンジンの構築」チュートリアルシリーズへようこそ。本シリーズは、これまでの章で扱ってきた Vulkan の基礎概念から、再利用可能なレンダリングエンジンの構築に焦点を当てた、より構造化されたアプローチへの転換点となります。
+
+=== 新しい学習アプローチ
+
+これまでのチュートリアルシリーズが個々の Vulkan 概念を段階的に紹介してきたのに対し、本シリーズは異なるアプローチを取ります。
+
+対象読者は、xref:00_Introduction.adoc[Vulkan Tutorial] を一通り終え、基礎に慣れている方です。網羅的な API の列挙よりもアーキテクチャの概念とデザインパターンを重視し、断片的なコード集ではなくエンジン志向の考え方を身につけられるようにします。小さな抜けを自分で埋めたり、実験したり、https://docs.vulkan.org/guide/latest/[Vulkan Guide]、https://docs.vulkan.org/samples/latest/[Samples]、https://docs.vulkan.org/spec/latest/[Specification] を一次資料として頼りにしたりする、より自立した作業が求められます。トピックが高度すぎると感じたら、元のチュートリアルに戻り、準備ができてから再挑戦してください。
+
+=== 何を学べるか
+
+「シンプルなエンジンの構築」シリーズは、エンジン開発の旅の出発点として設計されており、ゴール地点ではありません。次の内容を扱います。
+
+1. *エンジンアーキテクチャ* — 柔軟性・保守性・拡張性を備えたコード構造の作り方。
+
+2. *リソース管理* — モデル、テクスチャ、その他アセットを扱う、より洗練された手法。
+
+3. *レンダリング技法* — エンジンフレームワーク内でのモダンなレンダリング手法の実装。
+
+4. *パフォーマンス考慮* — パフォーマンスを意識したエンジン設計。
+
+5. *公開・配布の考慮* — パッケージング、デプロイ、プラットフォーム固有の事項を含む、プロフェッショナルな環境での配布準備。
+
+本シリーズでは、実験し、提供された例を拡張し、設計判断に異議を唱えることさえ推奨します。エンジン開発を学ぶ最善の方法は実践であり、時には失敗（とそこからの学び）を通じてです。
+
+エンジン実装全体を通じて、vk::raii のダイナミックレンダリングと C++20 モジュールを使用します。vk::raii 名前空間は Vulkan オブジェクトに対する Resource Acquisition Is Initialization（RAII）ラッパーを提供し、リソース管理を助け、コードをより簡潔にします。ダイナミックレンダリングは明示的なレンダーパスとフレームバッファを不要にし、レンダリング処理を単純化します。C++20 モジュールは従来のヘッダファイルと比べ、コード構成、コンパイル時間、カプセル化を改善します。
+
+=== 本チュートリアルの使い方
+
+各章は前章の上に積み上げられ、小さくても実用的なエンジンを組み立てます。まず章を最後まで読み、その後実装し、概念を内面化するために立ち止まり、復習が必要なら元の Vulkan チュートリアルに戻ることをためらわないでください。コードは出発点として扱い、実験し、独自の機能で拡張してください。
+
+エンジン開発の旅を、次の章から始めましょう。
+
+1. xref:Building_a_Simple_Engine/Engine_Architecture/01_introduction.adoc[エンジンアーキテクチャ] — 柔軟性・保守性・拡張性を備えたコード構造の作り方。
+2. xref:Building_a_Simple_Engine/Camera_Transformations/01_introduction.adoc[カメラ変換] — カメラシステムと変換の実装。
+3. xref:Building_a_Simple_Engine/Lighting_Materials/01_introduction.adoc[ライティングとマテリアル] — 基本的なライティングモデルとプッシュ定数。
+4. xref:Building_a_Simple_Engine/GUI/01_introduction.adoc[GUI] — Dear ImGui を用いたグラフィカルユーザーインターフェースの実装。
+5. xref:Building_a_Simple_Engine/Loading_Models/01_introduction.adoc[モデルの読み込み] — モデル、テクスチャ、その他アセットを扱う、より洗練された手法。
+6. xref:Building_a_Simple_Engine/Subsystems/01_introduction.adoc[サブシステム] — Vulkan コンピュート機能を伴う Audio および Physics サブシステムの実装。
+7. xref:Building_a_Simple_Engine/Tooling/01_introduction.adoc[ツーリング] — CI/CD、デバッグ、クラッシュミニダンプ、配布、堅牢性のための Vulkan 拡張。
+8. xref:Building_a_Simple_Engine/Mobile_Development/01_introduction.adoc[モバイル開発] — Android/iOS 向けエンジン適応、パフォーマンス考慮とモバイル固有の Vulkan 拡張。
+
+9. xref:Building_a_Simple_Engine/Advanced_Topics/01_introduction.adoc[発展トピック] — Simple Engine を特定の機能と最適化で拡張する、短く焦点を絞ったチュートリアル。
+
+xref:conclusion.adoc[前へ: メインチュートリアルのまとめ] | xref:Building_a_Simple_Engine/Engine_Architecture/01_introduction.adoc[次へ: エンジンアーキテクチャ]
+
+
+=== サンプルアセットの準備
+
+アタッチメントベースの Simple Engine の例とシーンに沿って進めるには、Bistro アセットをローカルに取得します。
+
+image::images/MainEntry.png[The Bistro scene - a detailed outdoor café environment demonstrating the engine's rendering capabilities]
+
+- Linux/macOS（デフォルトの配置先: リポジトリルートの attachments/simple_engine/Assets/bistro）:
++
+  $ cd attachments/simple_engine
+  $ ./fetch_bistro_assets.sh
+
+- Windows（デフォルトの配置先: リポジトリルートの attachments\simple_engine\Assets\bistro）:
++
+  > cd attachments\simple_engine
+  > fetch_bistro_assets.bat
+
+スクリプトは SSH（git@github.com:gpx1000/bistro.git）を使い、SSH が使えない場合は HTTPS にフォールバックします。Git LFS がインストールされていれば、大きなファイルは自動的に取得されます。
+
+次に、必要な依存関係をそろえるために install_dependencies_* スクリプトを活用してください。
+
+アセットが揃い依存関係の準備ができたら、attachments/simple_engine 配下の Simple Engine の例をビルドして実行します。シーン読み込みや例のコードが参照するサブシステムの詳細は、以降の章を参照してください。

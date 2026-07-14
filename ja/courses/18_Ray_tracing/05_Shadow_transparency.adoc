@@ -1,0 +1,283 @@
+= シャドウにおける透明度の実装
+
+*目的*: シーン内の透明オブジェクトのサポートを追加する。アルファ値が低いフラグメントを破棄する単純なアルファテストを実装し、対応するレイトレースシャドウでも同じ処理を再現する。
+
+これまですべてのジオメトリを不透明として扱ってきました。しかし葉はアルファチャンネルで透明度を定義するテクスチャで描画されており、現在それは考慮されていないため、葉の縁に暗いピクセルがあります。
+
+image::../../../images/38_TASK08_alphacut_before.png[]
+
+== タスク 7: アルファカット透明度
+
+アルファカット透明度を実装するため、フラグメントシェーダーでアルファ値が低いフラグメントを破棄します。これは複雑なブレンディングやソートなしで透明テクスチャを扱う一般的な技法です。
+
+[,slang]
+----
+   float4 baseColor = textures[pc.materialIndex].Sample(textureSampler, vertIn.fragTexCoord);
+
+   // Alpha test
+   if (baseColor.a < 0.5) discard;
+----
+
+image::../../../images/38_TASK08_alphacut_after.png[]
+
+シャドウは当面変わらないことに注意してください。まず `createAccelerationStructures()` で、BLAS にアルファ透明度がない場合にのみ `eOpaque` フラグを使う必要があります。
+
+[,c{pp}]
+----
+vk::AccelerationStructureGeometryKHR blasGeometry{
+    .geometryType = vk::GeometryTypeKHR::eTriangles,
+    .geometry = geometryData
+};
+
+blasGeometry.flags = (submesh.alphaCut) ? vk::GeometryFlagsKHR(0) : vk::GeometryFlagBitsKHR::eOpaque;
+----
+
+次を使って再ビルドして実行します。
+
+[,c{pp}]
+----
+#define LAB_TASK_LEVEL 7
+----
+
+葉のシャドウが完全に消えていることに気づくでしょう！交差候補のうち、不透明ジオメトリの三角形だけが自動的にコミットされるためです。レイクエリシャドウで透明度を扱い、候補交差を条件付きでコミットする方法を実装する必要があります。
+
+その前に、これまでにビルドしたアクセラレーション構造を検査し、どのように構造化され、各三角形にどんな情報が利用可能かを理解しましょう。
+
+== タスク 8: NVIDIA Nsight Graphics でアクセラレーション構造を検査する
+
+RenderDoc はまだ Vulkan アクセラレーション構造の検査をサポートしていませんが、*Nsight Graphics* を使って BLAS/TLAS が正しくビルドされているかを検証できます。シェーダーで依存する前に、間違い（例: ジオメトリ数やオフセットの誤り）を見つけるのに役立ちます。
+
+Nsight の使い方:
+
+. 実行ファイルパスを指定: `C:\Users\nvidia\S2025_LABS\gensubcur_105\Vulkan-Tutorial\attachments\build\38_ray_tracing\Debug\38_ray_tracing.exe`。
+. 作業ディレクトリを指定: `C:\Users\nvidia\S2025_LABS\gensubcur_105\Vulkan-Tutorial\attachments\build\38_ray_tracing`。
+. アプリケーションを起動する。
+
+image::../../../images/38_TASK04_nsight_launch.png[]
+
+フレームをキャプチャし、「Start Graphics Debugger」をクリックします。
+
+image::../images/38_TASK04_nsight_capture.png[]
+
+RenderDoc と同様にイベントを検査し、アクセラレーション構造のビルドコマンドを見つけると、アクセラレーション構造の可視化ツールに進みます。
+
+. Event browser の検索機能でフィルタし、`draw` 呼び出しを見つける。
+. いずれかの draw 呼び出しを選択し、API Inspector を開く。
+. `FS` を選択し、フラグメントシェーダーにバインドされているリソースを見つける。
+. アクセラレーション構造バインディング（これが TLAS）をクリックし、「Ray Tracing Inspector」を開く。
+
+image::../../../images/38_TASK04_nsight_main.png[]
+
+新しいウィンドウで、TLAS とそのインスタンスを確認できます。
+
+. 各インスタンスを展開して参照している BLAS を見たり、ジオメトリデータを検査したりできる。
+. シーンのナビゲートには 'Orbit Camera' の方が使いやすい場合がある。
+. モデルで使われている座標系に合わせるため、「Up Direction」を「Z Axis」に設定する必要がある場合がある。
+. 'Opaque' ジオメトリのフィルタを使う（予想どおり、葉のモデルはグレーアウトされる）。
+. 「Color by」など、さまざまな可視化オプションを試す。
+. 「Show Mesh Wireframes」と「Show AABB Wireframes」を試す。
+
+image::../../../images/38_TASK04_nsight_inspector.png[]
+
+== タスク 9: バインドレスリソースとインスタンスルックアップテーブル
+
+これまで、レイが交差した三角形が何かを知る必要はなく、何か当たったかどうかだけを気にしていました。しかし透明度を実装するには、当たった三角形上の点をシェーディングするのに使われたテクスチャのアルファ値を知る必要があります。これにより透明ピクセルに当たったか判定し、ライトへ向かう途上の背後にある不透明三角形を探すためトラバーサルを続ける必要があるかを決められます。
+
+そのためのレイクエリロジックを導入する前に、まずレンダラーがシェーダーに必要なものをどうバインドしているかを観察し、アクセラレーション構造インスタンスをジオメトリとテクスチャリングデータに対応づける単純なルックアップテーブルを実装しましょう。
+
+レンダラーはサブメッシュごとに別々のマテリアルテクスチャをバインドしていないことに注意してください。代わりに単一のテクスチャ配列をバインドし、マテリアルインデックスで各サブメッシュのテクスチャを参照します。マテリアルインデックスの受け渡しにはプッシュ定数を使います。
+
+[,c{pp}]
+----
+        for (auto& sub : submeshes) {
+            // TASK09: Bindless resources
+            PushConstant pushConstant = {
+                .materialIndex = sub.materialID < 0 ? 0u : static_cast<uint32_t>(sub.materialID),
+            };
+            commandBuffers[frameIndex].pushConstants<PushConstant>(pipelineLayout, vk::ShaderStageFlagBits::eFragment, 0, pushConstant);
+
+            commandBuffers[frameIndex].drawIndexed(sub.indexCount, 1, sub.indexOffset, 0, 0);
+        }
+----
+
+次にシェーダーでは、マテリアルインデックスを使ってテクスチャ配列をサンプリングします。すべて同じサンプラーを共有します。
+
+[,slang]
+----
+[[vk::binding(0,1)]]
+SamplerState textureSampler;
+
+[[vk::binding(1,1)]]
+Texture2D<float4> textures[];
+
+struct PushConstant {
+    uint materialIndex;
+};
+[push_constant]
+PushConstant pc;
+
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+   float4 baseColor = textures[pc.materialIndex].Sample(textureSampler, vertIn.fragTexCoord);
+----
+
+これは「バインドレスリソース」と呼ばれる一般的な技法で、必要なディスクリプタセットとバインディングの数を減らし、多くのオブジェクトがあるシーンでのマテリアル管理を容易にします。ディスクリプタインデクシング拡張が必要で、Vulkan 1.2 以降ではコアです。
+
+レイトラバーサルではプッシュ定数を使えません。レイは今シェーディングしているものではなく、シーン内の任意のジオメトリに当たる可能性があるためです。ただし各アクセラレーション構造インスタンスにカスタムインデックスを付け、後でこのインデックスとルックアップテーブル（LUT）を使ってヒットしたインスタンスのジオメトリとテクスチャを見つけられます。
+
+image::../../../images/38_TASK09_instance_lut.png[]
+
+`createAccelerationStructures()` でモデルのサブメッシュを反復するとき、`AccelerationStructureInstanceKHR` 構造体に新しいフィールドを追加し、各サブメッシュ用の一意なインデックスを保持する必要があります。
+
+[,c{pp}]
+----
+vk::AccelerationStructureInstanceKHR instance{
+    .transform = identity,
+    .mask = 0xFF,
+    .accelerationStructureReference = blasDeviceAddr
+};
+
+instances.push_back(instance);
+
+instances[i].instanceCustomIndex = static_cast<uint32_t>(i);
+----
+
+今アプリケーションを実行して Nsight Graphics でキャプチャすると、「Instance Custom Index」で色分けし、各インスタンスに割り当てられたインデックスを確認できます。以前はすべて同じでした。
+
+image::../../../images/38_TASK09_instance_custom_index.png[]
+
+次に、LUT エントリのベクトルを埋めます。同じサブメッシュインデックスを使い、各サブメッシュのマテリアル ID とインデックスバッファオフセットを格納します。
+
+[,c{pp}]
+----
+// TASK09: store the instance look-up table entry
+instanceLUTs.push_back({ static_cast<uint32_t>(submesh.materialID), submesh.indexOffset });
+----
+
+LUT バッファ作成に関する残りのコードは `createDescriptorSets()` と `createInstanceLUTBuffer()` にあります。対応するバインディングはすでにシェーダーで定義済みです。
+
+[,slang]
+----
+// TASK09: Instance look-up table
+struct InstanceLUT {
+    uint materialID;
+    uint indexBufferOffset;
+};
+[[vk::binding(4,0)]]
+StructuredBuffer<InstanceLUT> instanceLUTBuffer;
+----
+
+次に、これらのリソースをレイクエリと組み合わせて透明交差を扱う方法を見ます。
+
+== タスク 10: アルファテスト付きレイクエリ
+
+`Proceed()` が `RayQuery` オブジェクトの状態をレイ沿いの次の交差候補へ進めることを思い出してください。ここでアルファテストロジックを実装します。当たった三角形のシェーディングに使われるテクスチャのアルファ値を確認し、ある閾値未満なら次の不透明三角形を探すためにトラバーサルを続けます。見つかったらそれを 'commit' し、トラバーサルは終了します。
+
+まず呼び出しをループに置き換え、候補ヒットから必要な属性を取得します。それらをヘルパー関数 `intersection_uv` に渡し、三角形内の当たった点のテクスチャ座標を取得します。
+
+[,slang]
+----
+    while (sq.Proceed())
+    {
+        uint instanceID = sq.CandidateRayInstanceCustomIndex();
+        uint primIndex = sq.CandidatePrimitiveIndex();
+
+        float2 uv = intersection_uv(instanceID, primIndex, sq.CandidateTriangleBarycentrics());
+    }
+----
+
+このヘルパー関数の定義は次のとおりです。
+
+[,slang]
+----
+float2 intersection_uv(uint instanceID, uint primIndex, float2 barycentrics) {
+    uint indexOffset = instanceLUTBuffer[NonUniformResourceIndex(instanceID)].indexBufferOffset;
+
+    uint i0 = indexBuffer[indexOffset + (primIndex * 3 + 0)];
+    uint i1 = indexBuffer[indexOffset + (primIndex * 3 + 1)];
+    uint i2 = indexBuffer[indexOffset + (primIndex * 3 + 2)];
+
+    float2 uv0 = uvBuffer[i0];
+    float2 uv1 = uvBuffer[i1];
+    float2 uv2 = uvBuffer[i2];
+
+    float w0 = 1.0 - barycentrics.x - barycentrics.y;
+    float w1 = barycentrics.x;
+    float w2 = barycentrics.y;
+
+    return w0 * uv0 + w1 * uv1 + w2 * uv2;
+}
+----
+
+. `instanceID` により、インスタンス LUT から `indexBufferOffset` と `materialID` を取得できる。
+. `indexBufferOffset` はインスタンスのインデックスバッファを見つけるために使う。インデックスバッファはシーン内の全モデルのインデックスを含むため、ヒットしたモデル（例: 葉）に絞り込む必要がある。
+. `primIndex` は、インスタンス分のインデックスバッファ内での三角形のインデックス。
+. `NonUniformResourceIndex()` は、単一の draw／dispatch 呼び出し内でリソースインデックスがシェーダー起動ごとに変わり得ることを示し、望ましくないコンパイラ最適化を防ぐ。
+
+ヒットをモデル内の特定の三角形に絞り込んだら、シーン内の全頂点の UV 座標を含む `uvBuffer` からそのテクスチャ座標を取得できます。
+
+最後に、交差の重心座標に基づいてヒット三角形のテクスチャ座標を補間します。
+
+これらの UV 座標を使ってテクスチャをサンプリングし、アルファ値を取得できます。
+
+[,slang]
+----
+        uint materialID = instanceLUTBuffer[NonUniformResourceIndex(instanceID)].materialID;
+        float4 intersection_color = textures[NonUniformResourceIndex(materialID)].SampleLevel(textureSampler, uv, 0);
+----
+
+アルファ値に基づき、トレースを続けるかヒットをコミットするかを決められます。
+
+[,slang]
+----
+        if (intersection_color.a < 0.5) {
+            // If the triangle is transparent, we continue to trace
+            // to find the next opaque triangle.
+        } else {
+            // If we hit an opaque triangle, we stop tracing.
+            sq.CommitNonOpaqueTriangleHit();
+        }
+----
+
+完全な `Proceed()` ループは次のようになります。
+
+[,slang]
+----
+    while (sq.Proceed())
+    {
+        uint instanceID = sq.CandidateRayInstanceCustomIndex();
+        uint primIndex = sq.CandidatePrimitiveIndex();
+
+        float2 uv = intersection_uv(instanceID, primIndex, sq.CandidateTriangleBarycentrics());
+
+        uint materialID = instanceLUTBuffer[NonUniformResourceIndex(instanceID)].materialID;
+        float4 intersection_color = textures[NonUniformResourceIndex(materialID)].SampleLevel(textureSampler, uv, 0);
+
+        if (intersection_color.a < 0.5) {
+            // If the triangle is transparent, we continue to trace
+            // to find the next opaque triangle.
+        } else {
+            // If we hit an opaque triangle, we stop tracing.
+            sq.CommitNonOpaqueTriangleHit();
+        }
+    }
+----
+
+不透明ヒットは自動的にコミットされ、ループには入らないことに注意してください。
+
+次を使って再ビルドして実行します。
+
+[,c{pp}]
+----
+#define LAB_TASK_LEVEL 10
+----
+
+この時点で、レイクエリによる透明度対応の堅牢なシャドウができています！細かいアルファ詳細では従来のシャドウマッピングでは難しい、重要な機能です。
+
+image::../../../images/38_TASK10_alphacut_shadows.png[]
+
+シャドウでの透明度サポートの土台が整ったので、反射などの他の効果の実装は非常に素直です！
+
+== ナビゲーション
+- 前へ: xref:./04_TLAS_animation.adoc[TLAS アニメーション]
+- 次へ: xref:./06_Reflections.adoc[反射]

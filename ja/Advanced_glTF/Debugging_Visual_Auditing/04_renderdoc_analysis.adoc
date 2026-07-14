@@ -1,0 +1,86 @@
+:pp: {plus}{plus}
+= RenderDoc 解析: コンピュートスキニング出力の検査
+
+== RenderDoc が与えるもの
+
+RenderDoc はフレームキャプチャと GPU デバッガで、単一の描画フレームを凍結し、キャプチャ時点のすべての GPU リソースとコマンドを検査し、個々のドローコールとコンピュートディスパッチを孤立して再実行できます。キャラクターパイプラインでは、最も価値のある機能は、フレーム内の任意の時点で任意の GPU バッファの内容を調べられること—ラスタライザが読む前の、コンピュートスキニングディスパッチの出力バッファを含めて—です。
+
+これは GPU レベルの真値チェックです。参照ビューア（第 7 章）はアセット自体が正しいことを確立しました。デバッグドロワーは物理シミュレーション状態を示します。RenderDoc は最も狭い問い—コンピュートスキニングシェーダー実行後、出力バッファ内の頂点位置と法線は幾何的に正しいか—に答えます。正しければ、ラスタライザ・マテリアル・シーングラフは問題ありません。正しくなければ、エラーはコンピュートスキニングパイプライン—シェーダー、ジョイント行列、または入力頂点形式—にあります。
+
+== フレームのキャプチャ
+
+RenderDoc のキャプチャは単純です。アプリケーションを RenderDoc 経由で起動し、キャプチャしたい瞬間に F12（または設定したキャプチャキー）を押すと、フレームが凍結されます。その後 RenderDoc の UI で開けます。
+
+Vulkan アプリケーション向けの重要なセットアップ手順: アプリケーションが `-DNDEBUG` フラグ（または同等物）なしでビルドされ、`vkSetDebugUtilsObjectNameEXT` でデバッグオブジェクト名がセットされていることを確認します。これにより RenderDoc のリソースブラウザが理解しやすくなります—`VkBuffer (0x12345678)` の代わりに `character_skin_output_buffer` が見えます。コンピュートスキニング出力バッファについては特に:
+
+[source,cpp]
+----
+void set_debug_name(VkDevice device, VkBuffer buffer, const char* name)
+{
+#ifdef VULKAN_DEBUG
+    VkDebugUtilsObjectNameInfoEXT info{};
+    info.sType        = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    info.objectType   = VK_OBJECT_TYPE_BUFFER;
+    info.objectHandle = reinterpret_cast<uint64_t>(buffer);
+    info.pObjectName  = name;
+    vkSetDebugUtilsObjectNameEXT(device, &info);
+#endif
+}
+
+// When creating the skinning output buffer:
+set_debug_name(device, skinning_output.buffer, "skinning_output_buffer");
+----
+
+同様に、`vkCmdBeginDebugUtilsLabelEXT` と `vkCmdEndDebugUtilsLabelEXT` でコマンドバッファセクションにラベルを付けます。
+
+[source,cpp]
+----
+VkDebugUtilsLabelEXT label{};
+label.sType      = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+label.pLabelName = "Compute Skinning Pass";
+label.color[0]   = 0.2f; label.color[1] = 0.8f;
+label.color[2]   = 0.2f; label.color[3] = 1.0f;
+vkCmdBeginDebugUtilsLabelEXT(cmd, &label);
+
+// ... dispatch compute skinning ...
+
+vkCmdEndDebugUtilsLabelEXT(cmd);
+----
+
+これらのラベルは RenderDoc のイベントリストに名前付きセクションとして現れ、数千の GPU コマンドがあるフレームでもスキニングディスパッチへのナビゲートが容易になります。
+
+== 出力バッファの検査
+
+キャプチャを取得したら、イベントリストでコンピュートスキニングディスパッチへナビゲートします。それを選択し、**Resource Inspector** または **Buffer Viewer** パネルを開きます。出力バッファ（デバッグ名をセットしていれば `skinning_output_buffer`）を見つけます。RenderDoc はこのバッファの生の内容を構造化テーブルとして表示できます。
+
+頂点構造体のレイアウトを RenderDoc に伝える必要があります。Buffer Viewer で、各フィールドのバイトオフセット・ストライド・フォーマットを設定できます。典型的な頂点構造体では:
+
+[source,slang]
+----
+Position:    float3, offset 0,  stride sizeof(Vertex)
+Normal:      float3, offset 12, stride sizeof(Vertex)
+Tangent:     float4, offset 24, stride sizeof(Vertex)
+TexCoord:    float2, offset 40, stride sizeof(Vertex)
+JointIdx:    uint4,  offset 48, stride sizeof(Vertex)
+JointWeight: float4, offset 64, stride sizeof(Vertex)
+----
+
+このレイアウトを設定すると、RenderDoc は頂点ごとに位置・法線・その他フィールドを人間が読める値として行表示します。これで次ができます。
+
+**レストポーズの検証。** キャラクターがバインドポーズ（すべてのアニメーションが時刻 0）にあるフレームでアプリケーションを一時停止します。出力頂点位置は元の glTF 頂点位置と正確に一致すべきです—レストポーズでは変形があってはいけません。アニメーションが時刻 0 なのに位置がレストポーズと異なる場合、inverse bind matrices またはジョイント階層走査が間違っています。
+
+**既知のポーズの検証。** キャラクターがどう見えるかが正確に分かるフレーム—例えば片腕を 90 度上げた T ポーズ—へアニメーションを動かします。上げた腕上の頂点を調べます。その出力位置は、適切な軸まわりに 90 度回転した元の位置であるべきです。誤った方向に動いている場合、ジョイント回転の座標系が間違っています。
+
+**法線の確認。** 平面上の頂点を選びます。その法線は表面から離れる向きの単位ベクトルであるべきです。Y を向くべきなのに大きな X または Z 成分がある、または大きさが 1.0 と大きく異なる場合、コンピュートシェーダーの法線変換が不正です。
+
+**巻き順の検証。** RenderDoc ではメッシュをワイヤーフレームオーバーレイとして再描画できます。前面であるべきジオメトリに背面トライアングルが見える場合、出力バッファの巻き順が反転しています。これは、スキニングシェーダーが負の行列式を持つ行列（例: 一軸のスケール -1）を適用して座標系を反転した場合に起こり得ます。
+
+== シェーダーデバッガの使用
+
+RenderDoc のシェーダーデバッガでは、キャプチャしたフレームの任意のピクセルを選び、それを生んだシェーダーコードをステップ実行できます。コンピュートスキニングディスパッチでは、任意の起動（スレッドグループとスレッドインデックスで）を選び、出力値がどう計算されたかを正確に見るためにシェーダー実行をステップできます。
+
+これは、バッファビューアで位置がおかしく見える特定の疑わしい頂点があるときに最も有用です。頂点インデックスを見つけ、ディスパッチスレッド ID を計算し（グループは vertex_index / 64、スレッドは vertex_index % 64）、その起動のデバッガを起動します。その後、ジョイント行列ルックアップ、線形ブレンド計算、位置変換をステップし、各中間値を監視できます。値が期待から外れる点で、バグを見つけたことになります。
+
+シェーダーデバッガはバッファ内容を調べるだけより起動と使用が遅いですが、微妙な数値エラー—行列要素の符号誤り、クォータニオンから行列への変換での軸誤り—では最も直接的な診断経路を提供します。
+
+xref:Advanced_glTF/Debugging_Visual_Auditing/03_skinning_heatmaps.adoc[前へ: スキニングヒートマップ] | xref:Advanced_glTF/Debugging_Visual_Auditing/05_conclusion.adoc[次へ: まとめ]

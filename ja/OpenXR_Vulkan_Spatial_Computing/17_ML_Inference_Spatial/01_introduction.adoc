@@ -1,0 +1,10 @@
+:pp: {plus}{plus}
+= Cooperative Matrices による ML 推論
+
+前の章で見たように、最新の XR ヘッドセット上のセンサは生の物理データの洪水を提供します。しかし三角形を捉えるのは戦いの半分にすぎません。真に知的な空間アプリケーションを作るには、そのデータをリアルタイムで「理解する」必要があります。
+
+その動く頂点の塊はユーザーの手か？ソファに飛び乗る猫か？レンダリングパイプラインを止めずにこれらの問いに答えるため、**ML 推論**（機械学習）に目を向けます。この章では、Vulkan 1.3 の **Cooperative Matrices** を活用し、GPU 上で直接高速ニューラルネット計算を行う方法を探ります。
+
+推論を CPU から GPU の専用行列ハードウェア（**Tensor Cores** や **Matrix Accelerators** など）へ移すことで、手ポーズの洗練、セマンティックセグメンテーション、メッシュ再構成などのタスクでサブミリ秒レイテンシを達成できます。これらの ML カーネルをエンジンのコンピュートパイプラインへ統合し、ノイズの多いセンサデータをクリーンで対話可能な入力へ変える方法を学びます。
+
+xref:OpenXR_Vulkan_Spatial_Computing/16_Scene_Understanding/04_incorporating_into_the_engine.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/17_ML_Inference_Spatial/02_on_gpu_inference.adoc[Next]

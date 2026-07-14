@@ -1,0 +1,577 @@
+:pp: {plus}{plus}
+
+= モデルの読み込み: glTF モデルの PBR の実装
+
+== glTF モデルへの PBR の適用
+
+=== PBR の知識に基づく構築
+
+xref:Building_a_Simple_Engine/Lighting_Materials/01_introduction.adoc[照明とマテリアルの章] では、中核となる原理、BRDF、マテリアル プロパティなど、物理ベース レンダリング (PBR) の基礎を検討しました。次に、その知識を応用して、ロードした glTF モデルの PBR パイプラインを実装します。
+
+xref:15_GLTF_KTX2_Migration.adoc[glTF と KTX2 の移行の章] で学んだように、glTF はマテリアル システムに金属粗さワークフローで PBR を使用します。これは、すでに説明した PBR の概念と完全に一致しており、物理的に正確なライティングを使用して glTF モデルをレンダリングすることが簡単になります。
+
+=== glTFのPBRマテリアルの活用
+
+glTF 形式には、PBR に必要なすべての材料特性がすでに含まれています。
+
+* *ベースカラー*:baseColorFactorとbaseColorTextureによって定義されます。
+* *メタリックと粗さ*: metallicFactor、roughnessFactor、および metallicRoughnessTexture によって定義されます。
+* *法線マップ*: 追加のジオメトリを使用しないサーフェスの詳細用
+* *オクルージョン マップ*: アンビエント オクルージョンを近似するための
+* *エミッシブ マップ*: マテリアルの自己発光部分用
+
+これらのプロパティを直接使用することで、レンダリングがアーティストの意図と一致し、物理的に正確な結果が得られることを確認できます。
+
+=== エンジンへの PBR の実装
+
+PBR の背後にある理論を理解したので、それをエンジンに実装してみましょう。前の章で glTF ファイルからロードしたマテリアル データを基に構築していきます。
+
+==== PBR用の均一バッファ
+
+PBR パラメータを含めるようにユニフォーム バッファを拡張する必要があります。
+
+[source,cpp]
+----
+// Structure for uniform buffer object
+struct UniformBufferObject {
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+
+    // PBR parameters
+    alignas(16) glm::vec4 lightPositions[4];  // Position and radius
+    alignas(16) glm::vec4 lightColors[4];     // RGB color and intensity
+    alignas(16) glm::vec4 camPos;             // Camera position for view-dependent effects
+    alignas(4) float exposure = 4.5f;         // Exposure for HDR rendering
+    alignas(4) float gamma = 2.2f;            // Gamma correction value
+    alignas(4) float prefilteredCubeMipLevels = 1.0f;  // For image-based lighting
+    alignas(4) float scaleIBLAmbient = 1.0f;  // Scale factor for ambient lighting
+};
+----
+
+この均一バッファには次のものが含まれます。
+
+1. *標準変換行列*: 頂点変換用のモデル、ビュー、および投影行列
+2. *光情報*: 最大 4 つの光源の位置と色
+3. *カメラ位置*: フレネルなどのビュー依存の効果に必要です
+4. *レンダリング パラメーター*: 後処理のための露出、ガンマ、およびその他の値
+5. *画像ベースの照明パラメータ*: 環境反射用 (これについては後の章で説明します)
+
+==== マテリアルのプッシュ定数
+
+[NOTE]
+====
+xref:Building_a_Simple_Engine/Lighting_Materials/03_push_constants.adoc[プッシュ定数] でプッシュ定数を以前に導入しました。ここでは、同じメカニズムが描画ごとに glTF 金属粗さマテリアルのノブをどのように効率的に運ぶかに焦点を当てます。
+====
+
+link:https://www.khronos.org/registry/vulkan/specs/1.2-extensions/html/vkspec.html#descriptorsets-pushconstant[プッシュ定数] を使用してマテリアルのプロパティをシェーダーに渡します。
+
+[source,cpp]
+----
+// Structure for push constants
+struct PushConstantBlock {
+    glm::vec4 baseColorFactor;            // RGB base color and alpha
+    float metallicFactor;                 // How metallic the surface is
+    float roughnessFactor;                // How rough the surface is
+    int baseColorTextureSet;              // Texture coordinate set for base color
+    int physicalDescriptorTextureSet;     // Texture coordinate set for metallic-roughness
+    int normalTextureSet;                 // Texture coordinate set for normal map
+    int occlusionTextureSet;              // Texture coordinate set for occlusion
+    int emissiveTextureSet;               // Texture coordinate set for emission
+    float alphaMask;                      // Whether to use alpha masking
+    float alphaMaskCutoff;                // Alpha threshold for masking
+};
+----
+
+プッシュ定数は、次の理由から材料特性に最適です。
+
+* 描画呼び出しの合間に素早く更新できます
+* ディスクリプタセットは必要ありません
+* マテリアルプロパティなどのオブジェクトごとのデータに最適です
+
+==== ディスクリプタセットのセットアップ
+
+PBR を実装するには、テクスチャとユニフォーム バッファーのディスクリプタセットをセットアップする必要があります。
+
+[source,cpp]
+----
+// Create descriptor set layout
+void createDescriptorSetLayout() {
+    // Binding for uniform buffer
+    vk::DescriptorSetLayoutBinding uboBinding{
+        .binding = 0,
+        .descriptorType = vk::DescriptorType::eUniformBuffer,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment
+    };
+
+    // Bindings for textures
+    std::array<vk::DescriptorSetLayoutBinding, 5> textureBindings{};
+
+    // Base color texture
+    textureBindings[0].binding = 1;
+    textureBindings[0].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    textureBindings[0].descriptorCount = 1;
+    textureBindings[0].stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+    // Metallic-roughness texture
+    textureBindings[1].binding = 2;
+    textureBindings[1].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    textureBindings[1].descriptorCount = 1;
+    textureBindings[1].stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+    // Normal map
+    textureBindings[2].binding = 3;
+    textureBindings[2].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    textureBindings[2].descriptorCount = 1;
+    textureBindings[2].stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+    // Occlusion map
+    textureBindings[3].binding = 4;
+    textureBindings[3].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    textureBindings[3].descriptorCount = 1;
+    textureBindings[3].stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+    // Emissive map
+    textureBindings[4].binding = 5;
+    textureBindings[4].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    textureBindings[4].descriptorCount = 1;
+    textureBindings[4].stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+    // Combine all bindings
+    std::array<vk::DescriptorSetLayoutBinding, 6> bindings = {
+        uboBinding,
+        textureBindings[0],
+        textureBindings[1],
+        textureBindings[2],
+        textureBindings[3],
+        textureBindings[4]
+    };
+
+    // Create the descriptor set layout
+    vk::DescriptorSetLayoutCreateInfo layoutInfo{
+        .bindingCount = static_cast<uint32_t>(bindings.size()),
+        .pBindings = bindings.data()
+    };
+
+    descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
+}
+----
+
+==== パイプラインのセットアップ
+
+PBR パイプラインは、物理ベース レンダリングの特定の要件に合わせて構成する必要があります。
+
+[source,cpp]
+----
+void createPipeline() {
+    // ... (standard pipeline setup code)
+
+    // Enable alpha blending
+    vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+        .blendEnable = vk::True,
+        .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+        .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+        .colorBlendOp = vk::BlendOp::eAdd,
+        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+        .dstAlphaBlendFactor = vk::BlendFactor::eZero,
+        .alphaBlendOp = vk::BlendOp::eAdd,
+        .colorWriteMask =
+            vk::ColorComponentFlagBits::eR |
+            vk::ColorComponentFlagBits::eG |
+            vk::ColorComponentFlagBits::eB |
+            vk::ColorComponentFlagBits::eA
+    };
+
+    // Set up push constants for material properties
+    vk::PushConstantRange pushConstantRange{
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        .offset = 0,
+        .size = sizeof(PushConstantBlock)
+    };
+
+    // Create the pipeline layout
+    vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
+        .setLayoutCount = 1,
+        .pSetLayouts = &descriptorSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushConstantRange
+    };
+
+    pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
+
+    // ... (rest of pipeline creation)
+}
+----
+
+=== PBR シェーダーの実装
+
+PBR 実装の中心はフラグメント シェーダーにあります。以下は、Slang で書かれた PBR フラグメント シェーダーの簡略版です。
+
+[source,slang]
+----
+
+// Input from vertex shader
+struct VSOutput {
+    float3 WorldPos : POSITION;  // Automatically assigned to location 0
+    float3 Normal : NORMAL;      // Automatically assigned to location 1
+    float2 UV : TEXCOORD0;       // Automatically assigned to location 2
+    float4 Tangent : TANGENT;    // Automatically assigned to location 3
+};
+
+// Uniform buffer
+struct UniformBufferObject {
+    float4x4 model;
+    float4x4 view;
+    float4x4 proj;
+    float4 lightPositions[4];
+    float4 lightColors[4];
+    float4 camPos;
+    float exposure;
+    float gamma;
+    float prefilteredCubeMipLevels;
+    float scaleIBLAmbient;
+};
+
+// Push constants for material properties
+struct PushConstants {
+    float4 baseColorFactor;
+    float metallicFactor;
+    float roughnessFactor;
+    int baseColorTextureSet;
+    int physicalDescriptorTextureSet;
+    int normalTextureSet;
+    int occlusionTextureSet;
+    int emissiveTextureSet;
+    float alphaMask;
+    float alphaMaskCutoff;
+};
+
+// Constants
+static const float PI = 3.14159265359;
+
+// Bindings
+ConstantBuffer<UniformBufferObject> ubo;
+Texture2D baseColorMap;
+SamplerState baseColorSampler;
+Texture2D metallicRoughnessMap;
+SamplerState metallicRoughnessSampler;
+Texture2D normalMap;
+SamplerState normalSampler;
+Texture2D occlusionMap;
+SamplerState occlusionSampler;
+Texture2D emissiveMap;
+SamplerState emissiveSampler;
+
+[[vk::push_constant]] PushConstants material;
+
+// PBR functions
+float DistributionGGX(float NdotH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH2 = NdotH * NdotH;
+
+    float nom = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+
+    return nom / denom;
+}
+
+float GeometrySmith(float NdotV, float NdotL, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+
+    float ggx1 = NdotV / (NdotV * (1.0 - k) + k);
+    float ggx2 = NdotL / (NdotL * (1.0 - k) + k);
+
+    return ggx1 * ggx2;
+}
+
+float3 FresnelSchlick(float cosTheta, float3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+// Main fragment shader function
+float4 main(VSOutput input) : SV_TARGET
+{
+    // Sample material textures
+    float4 baseColor = baseColorMap.Sample(baseColorSampler, input.UV) * material.baseColorFactor;
+    float2 metallicRoughness = metallicRoughnessMap.Sample(metallicRoughnessSampler, input.UV).bg;
+    float metallic = metallicRoughness.x * material.metallicFactor;
+    float roughness = metallicRoughness.y * material.roughnessFactor;
+    float ao = occlusionMap.Sample(occlusionSampler, input.UV).r;  // link:https://learnopengl.com/Advanced-Lighting/SSAO[Ambient occlusion]
+    float3 emissive = emissiveMap.Sample(emissiveSampler, input.UV).rgb;  // link:https://learnopengl.com/PBR/Lighting[Emissive lighting] (self-illumination)
+
+    // Calculate normal in link:https://learnopengl.com/Advanced-Lighting/Normal-Mapping[tangent space]
+    float3 N = normalize(input.Normal);
+    if (material.normalTextureSet >= 0) {
+        // Apply link:https://learnopengl.com/Advanced-Lighting/Normal-Mapping[normal mapping]
+        float3 tangentNormal = normalMap.Sample(normalSampler, input.UV).xyz * 2.0 - 1.0;
+        float3 T = normalize(input.Tangent.xyz);
+        float3 B = normalize(cross(N, T)) * input.Tangent.w;
+        float3x3 TBN = float3x3(T, B, N);
+        N = normalize(mul(tangentNormal, TBN));
+    }
+
+    // Calculate view and reflection vectors
+    float3 V = normalize(ubo.camPos.xyz - input.WorldPos);
+    float3 R = reflect(-V, N);
+
+    // Calculate F0 (base reflectivity)
+    float3 F0 = float3(0.04, 0.04, 0.04);
+    F0 = lerp(F0, baseColor.rgb, metallic);
+
+    // Initialize lighting
+    float3 Lo = float3(0.0, 0.0, 0.0);
+
+    // Calculate lighting for each light
+    for (int i = 0; i < 4; i++) {
+        float3 lightPos = ubo.lightPositions[i].xyz;
+        float3 lightColor = ubo.lightColors[i].rgb;
+
+        // Calculate light direction and distance
+        float3 L = normalize(lightPos - input.WorldPos);
+        float distance = length(lightPos - input.WorldPos);
+        float attenuation = 1.0 / (distance * distance);
+        float3 radiance = lightColor * attenuation;
+
+        // Calculate half vector (the normalized vector halfway between view and light direction)
+        // Used in link:https://en.wikipedia.org/wiki/Blinn%E2%80%93Phong_reflection_model[Blinn-Phong] and PBR models
+        float3 H = normalize(V + L);
+
+        // Calculate BRDF terms
+        float NdotL = max(dot(N, L), 0.0);
+        float NdotV = max(dot(N, V), 0.0);
+        float NdotH = max(dot(N, H), 0.0);
+        float HdotV = max(dot(H, V), 0.0);
+
+        // Specular BRDF
+        float D = DistributionGGX(NdotH, roughness);
+        float G = GeometrySmith(NdotV, NdotL, roughness);
+        float3 F = FresnelSchlick(HdotV, F0);
+
+        float3 numerator = D * G * F;
+        float denominator = 4.0 * NdotV * NdotL + 0.0001;
+        float3 specular = numerator / denominator;
+
+        // link:https://learnopengl.com/PBR/Theory[Energy conservation]
+        float3 kS = F;
+        float3 kD = float3(1.0, 1.0, 1.0) - kS;
+        kD *= 1.0 - metallic;
+
+        // Add to outgoing radiance
+        Lo += (kD * baseColor.rgb / PI + specular) * radiance * NdotL;
+    }
+
+    // Add ambient and emissive
+    float3 ambient = float3(0.03, 0.03, 0.03) * baseColor.rgb * ao;
+    float3 color = ambient + Lo + emissive;
+
+    // link:https://en.wikipedia.org/wiki/High-dynamic-range_rendering[HDR] link:https://en.wikipedia.org/wiki/Tone_mapping[tonemapping] and link:https://en.wikipedia.org/wiki/Gamma_correction[gamma correction]
+    color = color / (color + float3(1.0, 1.0, 1.0));
+    color = pow(color, float3(1.0 / ubo.gamma, 1.0 / ubo.gamma, 1.0 / ubo.gamma));
+
+    return float4(color, baseColor.a);
+}
+----
+
+このシェーダは、以下を含むコア PBR ライティング モデルを実装します。
+
+* マテリアル テクスチャのサンプリング
+* 法線マッピングの計算
+* D、F、G 項を使用した鏡面 BRDF の計算
+* 省エネの適用
+* 複数の光源の処理
+* トーンマッピングとガンマ補正
+
+==== PBR の照明セットアップ
+
+PBR では、現実的な結果を得るために光源を慎重にセットアップする必要があります。アプリケーションでライトを設定する方法は次のとおりです。
+
+[source,cpp]
+----
+void setupLights() {
+    // Set up four lights with different positions and colors
+    std::array<glm::vec4, 4> lightPositions = {
+        glm::vec4(-10.0f, 10.0f, 10.0f, 1.0f),
+        glm::vec4(10.0f, 10.0f, 10.0f, 1.0f),
+        glm::vec4(-10.0f, -10.0f, 10.0f, 1.0f),
+        glm::vec4(10.0f, -10.0f, 10.0f, 1.0f)
+    };
+
+    std::array<glm::vec4, 4> lightColors = {
+        glm::vec4(300.0f, 300.0f, 300.0f, 1.0f),  // White
+        glm::vec4(300.0f, 300.0f, 0.0f, 1.0f),    // Yellow
+        glm::vec4(0.0f, 0.0f, 300.0f, 1.0f),      // Blue
+        glm::vec4(300.0f, 0.0f, 0.0f, 1.0f)       // Red
+    };
+
+    // Update uniform buffer with light data
+    for (size_t i = 0; i < maxConcurrentFrames; i++) {
+        UniformBufferObject ubo{};
+        // ... (set up transformation matrices)
+
+        // Set light positions and colors
+        for (int j = 0; j < 4; j++) {
+            ubo.lightPositions[j] = lightPositions[j];
+            ubo.lightColors[j] = lightColors[j];
+        }
+
+        // Set camera position for view-dependent effects
+        ubo.camPos = glm::vec4(camera.getPosition(), 1.0f);
+
+        // Set other PBR parameters
+        ubo.exposure = 4.5f;
+        ubo.gamma = 2.2f;
+
+        // Copy to uniform buffer (per frame-in-flight)
+        memcpy(uniformBuffers[i].mapped, &ubo, sizeof(ubo));
+    }
+}
+----
+
+==== PBR のためのカメラの統合
+
+PBR はフレネル効果などのビュー依存の効果に依存しているため、カメラシステムを統合する必要があります。
+
+[source,cpp]
+----
+void updateUniformBuffer(uint32_t currentFrame) {
+    UniformBufferObject ubo{};
+
+    // Update transformation matrices
+    ubo.model = glm::mat4(1.0f);  // Or get from the model's node
+    ubo.view = camera.getViewMatrix();
+    ubo.proj = camera.getProjectionMatrix(swapChainExtent.width / (float)swapChainExtent.height);
+
+    // Vulkan's Y coordinate is inverted compared to OpenGL
+    ubo.proj[1][1] *= -1;
+
+    // Update camera position for PBR calculations
+    ubo.camPos = glm::vec4(camera.getPosition(), 1.0f);
+
+    // ... (update other PBR parameters)
+
+    // Copy to uniform buffer (per frame-in-flight)
+    memcpy(uniformBuffers[currentFrame].mapped, &ubo, sizeof(ubo));
+}
+----
+
+=== PBRを使用したレンダリング
+
+最後に、PBR を使用してモデルをレンダリングするためにすべてをまとめてみましょう。
+
+[source,cpp]
+----
+void drawModel(vk::raii::CommandBuffer& commandBuffer, Model* model) {
+    // Bind descriptor set with uniform buffer and textures
+    commandBuffer.bindDescriptorSets(
+        vk::PipelineBindPoint::eGraphics,
+        pipelineLayout,
+        0,
+        1,
+        &descriptorSets[currentFrame],
+        0,
+        nullptr
+    );
+
+    // Traverse the model's scene graph
+    for (auto& node : model->linearNodes) {
+        if (node->mesh.indices.size() > 0) {
+            // Get the global transformation matrix
+            glm::mat4 nodeMatrix = node->getGlobalMatrix();
+
+            // Update model matrix in uniform buffer
+            // (In a real implementation, we'd use a separate UBO for each model)
+
+            // Set up push constants for material properties
+            if (node->mesh.materialIndex >= 0) {
+                Material& mat = model->materials[node->mesh.materialIndex];
+
+                PushConstantBlock pushConstants{};
+                pushConstants.baseColorFactor = mat.baseColorFactor;
+                pushConstants.metallicFactor = mat.metallicFactor;
+                pushConstants.roughnessFactor = mat.roughnessFactor;
+                pushConstants.baseColorTextureSet = mat.baseColorTextureIndex;
+                pushConstants.physicalDescriptorTextureSet = mat.metallicRoughnessTextureIndex;
+                pushConstants.normalTextureSet = mat.normalTextureIndex;
+                pushConstants.occlusionTextureSet = mat.occlusionTextureIndex;
+                pushConstants.emissiveTextureSet = mat.emissiveTextureIndex;
+
+                commandBuffer.pushConstants(
+                    pipelineLayout,
+                    vk::ShaderStageFlagBits::eFragment,
+                    0,
+                    sizeof(PushConstantBlock),
+                    &pushConstants
+                );
+            }
+
+            // Bind vertex and index buffers
+            vk::Buffer vertexBuffers[] = {*node->mesh.vertexBuffer};
+            vk::DeviceSize offsets[] = {0};
+            commandBuffer.bindVertexBuffers(0, 1, vertexBuffers, offsets);
+            commandBuffer.bindIndexBuffer(*node->mesh.indexBuffer, 0, vk::IndexType::eUint32);
+
+            // Draw the mesh
+            commandBuffer.drawIndexed(
+                static_cast<uint32_t>(node->mesh.indices.size()),
+                1,
+                0,
+                0,
+                0
+            );
+        }
+    }
+}
+----
+
+=== 高度な PBR テクニック
+
+PBR 実装の基本について説明しましたが、レンダリングのリアリズムを向上させる高度なテクニックがいくつかあります。
+
+==== イメージベース ライティング (IBL)
+
+link:https://learnopengl.com/PBR/IBL/Diffuse-irradiance[IBL] は環境マップを使用してグローバル イルミネーションをシミュレートします。
+* *拡散 IBL*: 周囲照明に link:https://learnopengl.com/PBR/IBL/Diffuse-irradiance[放射照度マップ] を使用します
+* *鏡面 IBL*: 反射に link:https://learnopengl.com/PBR/IBL/Specular-IBL[事前にフィルタリングされた環境マップ] と link:https://learnopengl.com/PBR/IBL/Specular-IBL[BRDF統合マップ] を使用します
+
+==== 表面下散乱
+
+光が表面を透過する皮膚、ワックス、大理石などのマテリアルの場合:
+
+* link:https://developer.nvidia.com/gpugems/gpugems3/part-iii-rendering/chapter-14-advanced-techniques-realistic-real-time-skin[半透明のマテリアル内で光がどのように散乱するかをシミュレートします]
+* 表面下散乱プロファイルなどの手法で近似可能
+
+==== クリアコート
+
+上部に薄い光沢のある層がある素材の場合:
+
+* link:https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_clearcoat[自動車塗装、ニス塗装木材など]
+* 追加の鏡面反射ローブとして実装
+
+==== 異方性
+
+指向性反射のあるマテリアルの場合:
+
+* link:https://google.github.io/filament/Filament.html#materialsystem/anisotropicmodel[つや消し金属、髪の毛、布地など。]
+* 追加の材料パラメータと変更された BRDF が必要です
+
+=== 結論と次のステップ
+
+この章では、照明とマテリアルの章で得た PBR の知識を適用して、glTF モデルに PBR パイプラインを実装しました。私たちは次のことを学びました:
+
+* PBR レンダリングに glTF のマテリアル プロパティを活用する方法
+* 均一バッファを設定し、PBR パラメータの定数をプッシュする方法
+* glTF マテリアルで動作する PBR シェーダを実装する方法
+* カメラシステムを PBR と統合してビュー依存の効果を実現する方法
+* 物理的に正確なライティングで glTF モデルをレンダリングする方法
+
+この実装により、前の章でロードした glTF モデルを物理的に正確なマテリアルでレンダリングできるようになり、さまざまな照明条件にわたってより現実的で一貫したレンダリングが可能になります。
+
+次の章では、さまざまな変換を使用して複数のオブジェクトをレンダリングする方法を検討します。これにより、PBR 対応エンジンを使用してより複雑なシーンを作成できるようになります。
+
+照明とマテリアルについてさらに詳しく知りたい場合は、PBR の背後にある理論を詳しく説明した「照明とマテリアル」の章を参照してください。
+
+xref:Building_a_Simple_Engine/Loading_Models/04_loading_gltf.adoc[前: glTF モデルのロード] | xref:Building_a_Simple_Engine/Loading_Models/06_multiple_objects.adoc[次へ: 複数のオブジェクトのレンダリング]

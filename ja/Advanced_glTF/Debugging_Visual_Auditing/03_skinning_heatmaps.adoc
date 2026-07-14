@@ -1,0 +1,183 @@
+:pp: {plus}{plus}
+= スキニングヒートマップ: ウェイトペイントの可視化
+
+== ヒートマップが示すこと
+
+スケルタルスキニングは、`JOINTS_0` と `WEIGHTS_0` 頂点属性に格納された頂点ごとのジョイントインデックスとウェイト値だけで駆動されます。通常の描画では見えません。生じる変形は見えますが、ウェイト自体は見えません。スキニングに問題があるとき—肩でのピンチ、誤ったボーンに剛体のまま付着する頂点、アニメーション中にあり得ないほど伸びる領域—原因はほぼ常に不正なジョイントウェイトです。しかしウェイトを可視化する手段がなければ、診断は極めて困難です。
+
+スキニングヒートマップは、各ピクセルの色がマテリアルの PBR 特性ではなく、対応する頂点のスキニングウェイトデータで決まる描画モードです。最も有用なのは **支配ボーンヒートマップ** です。各頂点は、最も影響の大きいジョイントに基づいて色付けされます。各ボーンが主に制御するメッシュの「領域」がすぐ分かり、ジョイント境界の誤りが明らかになります。本来ボーン B の色であるべき頂点がボーン A の色なら、ウェイトペイントの誤りで、その頂点が誤ったボーンに追従します。
+
+2 番目に有用なのは **ウェイト分布ヒートマップ** です。各頂点は、影響するジョイント数とウェイトの均等さに基づくヒートスケール（青 → 緑 → 赤）で色付けされます。1 ボーンだけが影響する頂点は純粋な青（または単純で予測可能な挙動を示す別の「冷たい」色）。4 ジョイントがほぼ等しい影響の頂点は赤（複雑でアーティファクトを起こしやすい）。このヒートマップは、意図せずノイズが多い、または過度に複雑なウェイトペイントの領域を特定するのに役立ちます。
+
+== ヒートマップ描画モードの実装
+
+ヒートマップは、標準 PBR フラグメントシェーダーを、頂点データからジョイントインデックスとウェイトを読み、色に変換する診断シェーダーに置き換えて描画します。スキニングデータは頂点フォーマットの一部なので、追加バッファは不要—関連属性を頂点パイプラインからフラグメント段へ渡し、そこで色を計算すればよいです。
+
+[source,slang]
+----
+// Camera data — declared as a push constant for simplicity.
+struct CameraPushConstants { float4x4 view_proj; };
+[[vk::push_constant]] CameraPushConstants camera;
+
+// Vertex data without embedded joint indices/weights —
+// joint data is stored in separate parallel buffers (same pattern as skinning.slang).
+struct Vertex {
+    float3 position;
+    float3 normal;
+    float4 tangent;
+    float2 texcoord;
+};
+
+// Five bindings: vertex geometry, joint matrices, joint indices, joint weights, joint colors.
+[[vk::binding(0, 0)]] StructuredBuffer<Vertex>    vertices;
+[[vk::binding(1, 0)]] StructuredBuffer<float4x4>  joint_matrices;  // For world position
+[[vk::binding(2, 0)]] StructuredBuffer<uint4>     joint_indices;
+[[vk::binding(3, 0)]] StructuredBuffer<float4>    joint_weights;
+[[vk::binding(4, 0)]] StructuredBuffer<float4>    joint_colors;   // One RGBA per joint
+
+// Vertex shader passes joint data to the fragment stage for coloring.
+struct VertexOut {
+    float4 position : SV_Position;
+    float4 weights  : TEXCOORD0;
+    uint4  joints   : TEXCOORD1;
+};
+
+[shader("vertex")]
+VertexOut vertex_main(uint vertex_id : SV_VertexID)
+{
+    Vertex v   = vertices[vertex_id];
+    uint4 j_idx = joint_indices[vertex_id];
+    float4 j_w  = joint_weights[vertex_id];
+
+    // Apply skinning to get world position (same LBS as skinning.slang)
+    float4x4 skin_matrix =
+        j_w.x * joint_matrices[j_idx.x] +
+        j_w.y * joint_matrices[j_idx.y] +
+        j_w.z * joint_matrices[j_idx.z] +
+        j_w.w * joint_matrices[j_idx.w];
+
+    VertexOut out;
+    out.position = mul(camera.view_proj, mul(skin_matrix, float4(v.position, 1.0)));
+    out.weights  = j_w;
+    out.joints   = j_idx;
+    return out;
+}
+
+// Colors each pixel by the dominant (highest-weight) joint using a per-joint color table.
+[shader("fragment")]
+float4 fragment_dominant_bone(VertexOut input) : SV_Target
+{
+    uint  dominant = 0;
+    float max_w    = input.weights.x;
+
+    if (input.weights.y > max_w) { max_w = input.weights.y; dominant = 1; }
+    if (input.weights.z > max_w) { max_w = input.weights.z; dominant = 2; }
+    if (input.weights.w > max_w) { max_w = input.weights.w; dominant = 3; }
+
+    uint actual_joint = input.joints[dominant];
+    return joint_colors[actual_joint];
+}
+----
+
+`jointColors` バッファにはスケルトン内のジョイントごとに 1 つの RGBA 色があります。隣接するボーン領域をすぐ区別できるよう、色は視覚的に区別できる必要があります。単純な方法は HSV 色相環上に色を均等に配分することです。
+
+[source,cpp]
+----
+std::vector<glm::vec4> generate_joint_colors(uint32_t joint_count)
+{
+    std::vector<glm::vec4> colors(joint_count);
+    for (uint32_t i = 0; i < joint_count; ++i) {
+        float hue = static_cast<float>(i) / joint_count; // 0..1
+        // Convert HSV (hue, 1, 1) to RGB
+        float h = hue * 6.0f;
+        float x = 1.0f - std::abs(std::fmod(h, 2.0f) - 1.0f);
+        glm::vec3 rgb;
+        if      (h < 1) rgb = {1, x, 0};
+        else if (h < 2) rgb = {x, 1, 0};
+        else if (h < 3) rgb = {0, 1, x};
+        else if (h < 4) rgb = {0, x, 1};
+        else if (h < 5) rgb = {x, 0, 1};
+        else            rgb = {1, 0, x};
+        colors[i] = glm::vec4(rgb, 1.0f);
+    }
+    return colors;
+}
+----
+
+== ヒートマップの読み方
+
+よくペイントされたキャラクターの支配ボーンヒートマップでは、境界で滑らかなグラデーションを伴う、はっきり分離した色領域が見えるはずです。太ももは全体が 1 色。すねも全体が別の 1 色。膝での移行は、2 ボーン間で皮膚がブレンドする狭い帯です。
+
+**探すべき問題:**
+
+ある色の領域の真ん中に別の色の小さなパッチ—例えば赤い領域の真ん中の黄色い頂点—がある場合、これは迷いの頂点グループ割り当てです。誤ったボーンに割り当てられた頂点です。アニメーション中、この頂点は誤ったボーンに追従し、目に見える幾何の「ピクセル」状の変位を生みます。Blender では、影響を受けたボーンでウェイトペイントモードを使えばこの頂点を特定できます。
+
+2 ボーン間の色の移行が非常に急—ブレンド帯なしに色がすぐ変わる—場合、ボーン間にスムーズなフォールオフがないウェイトペイントを示します。メッシュはジョイントで滑らかに変形せず、鋭く折れます。移行ゾーンにウェイト値のグラデーションを追加してください。
+
+メッシュ全体が単一の色なら、キャラクターが非常に単純（すべての頂点が 1 ボーンだけの影響。稀）か、ウェイトデータが正しくエクスポートされなかった（すべての頂点が最初のボーンにデフォルト）かのどちらかです。
+
+== ウェイト分布ヒートマップ
+
+ウェイト分布ヒートマップでは、フラグメントシェーダーが各頂点の「複雑度スコア」—有意な影響を持つジョイント数—を計算し、ヒートカラースケールにマッピングします。
+
+[source,slang]
+----
+[shader("fragment")]
+float4 fragment_weight_distribution(VertexOut input) : SV_Target
+{
+    // Count how many joints have non-trivial influence on this vertex.
+    // "Non-trivial" means weight > 0.05 (5% or more).
+    float complexity = 0.0f;
+    float4 w = input.weights;
+    if (w.x > 0.05f) complexity += 1.0f;
+    if (w.y > 0.05f) complexity += 1.0f;
+    if (w.z > 0.05f) complexity += 1.0f;
+    if (w.w > 0.05f) complexity += 1.0f;
+
+    // Normalize to 0..1 range (0 = single bone, 1 = four bones)
+    float t = (complexity - 1.0f) / 3.0f;
+
+    // Map to a blue (simple) -> green (moderate) -> red (complex) heat scale
+    float3 cool_color = float3(0, 0, 1);
+    float3 warm_color = float3(1, 0, 0);
+    float3 mid_color  = float3(0, 1, 0);
+
+    float3 color;
+    if (t < 0.5f) color = lerp(cool_color, mid_color, t * 2.0f);
+    else          color = lerp(mid_color, warm_color, (t - 0.5f) * 2.0f);
+
+    return float4(color, 1.0f);
+}
+----
+
+よくペイントされたキャラクターでは、主要ジョイント（肩、股関節、膝、肘）以外はどこも青と緑の領域で、そこでは複数ボーンの影響が期待され望ましいです。メッシュの広い領域が赤なら、その領域のウェイトペイントが不要に複雑で、整理の余地があります。
+
+== ランタイムでのヒートマップモード切替
+
+通常の PBR パイプラインとヒートマップパイプラインをランタイムで切り替えるには 2 つの選択肢があります。
+
+1. **複数パイプライン**: 同じ `VkPipelineLayout` を使い、2 つの別々の `VkPipeline` オブジェクトを作成します。1 つは PBR フラグメントシェーダー、もう 1 つはヒートマップフラグメントシェーダーです。描画時に希望のパイプラインをバインドするだけです。
+2. **特殊化定数**: Vulkan の特殊化定数で、単一フラグメントシェーダー内のヒートマップロジックを切り替えます。
+
+複数パイプライン方式（明確さのため推奨）を選ぶ場合、ヒートマップモードでは `jointColors` バッファがバインドされていることを確認してください。
+
+[source,cpp]
+----
+// Bind the appropriate pipeline
+if (render_mode == RenderMode::HEATMAP) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, heatmap_pipeline);
+
+    // Bind the joint colors buffer (assumes it's in a separate descriptor set)
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+                           2, 1, &joint_colors_descriptor_set, 0, nullptr);
+} else {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pbr_pipeline);
+}
+
+// Issue the draw call as usual
+vkCmdDrawIndexed(cmd, index_count, 1, 0, 0, 0);
+----
+
+これにより、3D ツールの静的解析に頼るよりはるかに効果的に、エンジン内でライブにアセットを監査できます。
+
+xref:Advanced_glTF/Debugging_Visual_Auditing/02_debug_drawers.adoc[前へ: デバッグドロワー] | xref:Advanced_glTF/Debugging_Visual_Auditing/04_renderdoc_analysis.adoc[次へ: RenderDoc 解析]

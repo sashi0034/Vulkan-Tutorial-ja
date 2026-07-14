@@ -1,0 +1,194 @@
+:pp: {plus}{plus}
+
+= 入力としてのモデル形式
+
+グラフを手動で構築してきました——addTensor、addOperation を呼び、すべてを手で接続しました。グラフとは何か、どう動くかを学びました。しかし実用的ではありません。実モデルは数百の演算があります。ファイルから読み込む必要があります。
+
+業界は標準モデル形式でこの問題を解いています。自前形式を発明する代わりに、既存のものを使います: ONNX、TensorFlow Lite、NNEF です。
+
+== なぜ標準形式か
+
+独自のバイナリや JSON モデル記述を設計することは可能です。問題は、異なる学習スタックからモデルを読み込もうとした瞬間に現れます。フレームワークごとにエクスポータが必要になります。今日は PyTorch、明日は TensorFlow、来週は JAX。見返りの少ない忙しい作業です。
+
+業界は共通形式に落ち着き、どこで学習したモデルでも 1 つのローダーで取り込めるようにしました。PyTorch と TensorFlow は ONNX または TFLite にエクスポートし、Khronos のツールは NNEF を出力したり変換したりできます。ディスク上の標準があれば、仕事は明確に定義されたグラフを `ComputationGraph` に変えて実行することに縮小します。
+
+== ONNX: 包括的な形式
+
+ONNX（Open Neural Network Exchange）は相互運用性のために設計されています。数百の演算子、複数のデータ型、複雑なグラフ構造をサポートします。デスクトップやサーバー向けなら、ONNX が第一候補でしょう。
+
+ONNX は Protocol Buffers でシリアライズします——スキーマで定義されたバイナリ形式です。スキーマはモデル、グラフ、ノード、テンソル、属性のメッセージ型を定義します。ONNX ファイルをパースすると、これらの protobuf メッセージをデシリアライズします。
+
+ONNX ファイル内には、バージョンとプロデューサ情報を持つモデルヘッダ、演算と接続テンソルを列挙するグラフ、定数テンソルとして学習済みパラメータを保持する initializer セット、形状とデータ型を運びグラフの検証と最適化に役立つ value information があります。すべて Protocol Buffer メッセージとしてシリアライズされています。
+
+ONNX ファイルを読むには ONNX C++ ライブラリを使います。
+
+[source,cpp]
+----
+#include <onnx/onnx_pb.h>
+#include <fstream>
+
+onnx::ModelProto loadONNX(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    onnx::ModelProto model;
+    model.ParseFromIstream(&input);
+    return model;
+}
+----
+
+パース済み protobuf が得られます。必要なものを取り出します。
+
+[source,cpp]
+----
+const auto& graph = model.graph();
+
+// Iterate operations
+for (const auto& node : graph.node()) {
+    std::string opType = node.op_type();  // "Conv", "Relu", "Gemm", etc.
+
+    for (const auto& inputName : node.input()) {
+        // Connect to input tensor
+    }
+
+    for (const auto& outputName : node.output()) {
+        // Connect to output tensor
+    }
+
+    // Extract attributes (kernel_shape, strides, etc.)
+    for (const auto& attr : node.attribute()) {
+        // Store in operation
+    }
+}
+
+// Extract weights
+for (const auto& initializer : graph.initializer()) {
+    std::string name = initializer.name();
+    std::vector<int64_t> shape(initializer.dims().begin(), initializer.dims().end());
+
+    // Get float data
+    const float* data = reinterpret_cast<const float*>(initializer.raw_data().data());
+    size_t count = initializer.raw_data().size() / sizeof(float);
+
+    // Create tensor with this data
+}
+----
+
+重要な洞察: ONNX は手動で作っていたのと同じ情報——演算型、テンソル形状、接続、学習済み重み——を与えます。取り出して ComputationGraph を構築するだけです。
+
+== TensorFlow Lite: モバイル向け最適化形式
+
+TFLite はモバイルと組み込み向けに設計されています。FlatBuffers でシリアライズ——ゼロコピーアクセスと最小パースオーバーヘッドに最適化された形式です。すべてをデシリアライズせずにモデルの一部を読めます。
+
+構造は ONNX と精神は似ていますが、小さなデバイス向けに最適化されています。複数サブグラフを含むモデルオブジェクトがあります。演算子はノードに相当しますが TFLite の builtin 列挙を使います。テンソルは一時値とパラメータの両方で明示的です。重みの生バイトはテンソルメタデータが参照する別バッファにあります。FlatBuffers なので、完全なデシリアライズなしにメモリから直接フィールドにアクセスできます。
+
+TFLite の読み込みには TFLite スキーマが必要です。
+
+[source,cpp]
+----
+#include "tensorflow/lite/schema/schema_generated.h"
+#include <fstream>
+
+const tflite::Model* loadTFLite(const std::string& path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    size_t size = input.tellg();
+    input.seekg(0);
+
+    std::vector<char> buffer(size);
+    input.read(buffer.data(), size);
+
+    return tflite::GetModel(buffer.data());
+}
+----
+
+FlatBuffers はメモリマップファイルへの直接ポインタを与えます——デシリアライズ不要です。
+
+[source,cpp]
+----
+const tflite::Model* model = loadTFLite("model.tflite");
+const auto* subgraph = model->subgraphs()->Get(0);  // Primary graph
+
+// Iterate operators
+for (size_t i = 0; i < subgraph->operators()->size(); ++i) {
+    const auto* op = subgraph->operators()->Get(i);
+    const auto* opcode = model->operator_codes()->Get(op->opcode_index());
+
+    // Get operator type
+    auto builtin = opcode->builtin_code();  // ADD, CONV_2D, etc.
+
+    // Get inputs/outputs (indices into tensor array)
+    for (int32_t inputIdx : *op->inputs()) {
+        const auto* tensor = subgraph->tensors()->Get(inputIdx);
+        // Process input tensor
+    }
+}
+
+// Extract weights
+for (size_t i = 0; i < subgraph->tensors()->size(); ++i) {
+    const auto* tensor = subgraph->tensors()->Get(i);
+
+    if (tensor->buffer() > 0) {  // Has data (not an intermediate)
+        const auto* buffer = model->buffers()->Get(tensor->buffer());
+        const auto* data = buffer->data();  // Raw bytes
+
+        // Create tensor with this data
+    }
+}
+----
+
+ゼロコピー性により、ファイルから直接読みます。高速でメモリ効率が良いです。
+
+== NNEF: Khronos 交換形式（ネイティブに使う）
+
+NNEF（Neural Network Exchange Format）は Khronos 標準で、学習済みモデルを読みやすいテキストグラフとテンソルデータ用の別バイナリファイルとして保存します。ツール、コンパイラ、ランタイム間の交換形式として設計されました。精密で検査可能なモデルと自前 IR へのきれいな引き渡しを重視するなら、NNEF は適しています。
+
+NNEF パッケージは通常ディレクトリです。`graph.nnef` が演算子、テンソル、形状、データ型、属性をテキストで記述します。グラフで参照されるパラメータは 1 つ以上の付随バイナリファイルにあります。本チュートリアルでは、出発点が ONNX で NNEF に標準化したい場合、ONNX→NNEF を取得ステップとみなします。実行では、ONNX に戻すのではなく、NNEF‑Tools の公式 Khronos C{pp} パーサで NNEF を直接読み込みます。
+
+[source,cpp]
+----
+// Abbreviated sketch: ingest NNEF with the official Khronos C++ API,
+// then adapt to our ComputationGraph. See NNEF‑Tools cpp_api.md for exact APIs.
+// Repo: https://github.com/KhronosGroup/NNEF-Tools/tree/main/nnef-pyproject#nnef-parser---repository
+
+#include <nnef.h>          // Provided by NNEF‑Tools
+#include <filesystem>
+
+bool loadNNEFIntoEngine(const std::string& modelDir) {
+    // 1) Parse the text graph + associated weight binaries using the official API
+    //    (Open the directory and let the parser resolve referenced tensor files.)
+    //    Pseudocode:
+    //    nnef::Graph graph = nnef::parseDirectory(modelDir);
+
+    // 2) Create tensors in our engine (I/O + constants)
+    //    Iterate the NNEF graph’s tensors; for constants, map the external binary
+    //    and upload into device buffers.
+
+    // 3) Create operations and wire their inputs/outputs
+    //    For each NNEF node, map op type + attributes to our Operation.
+
+    // Handle common shims: NCHW↔NHWC layout, dtype normalization, default strides/padding.
+    return true;
+}
+----
+
+この経路をスムーズにする習慣がいくつかあります。パースと実行を分離し、薄い NNEF→IR アダプタが ONNX や TFLite と同じ Vulkan コードに供給できるようにします。演算子が未サポートなら、演算名、期待するランクとデータ型、次に実装すべき内容を含む有用なメッセージで明示的に失敗します。インポート概要——入出力、総パラメータ数、演算子ヒストグラム——をコンパクトに出力し、意図したモデルを読み込んだか検証できるようにします。
+
+インポート後、実行は ONNX/TFLite と同一です: バッファを計画し、ディスクリプタをバインドし、Vulkan コンピュートをディスパッチします。NNEF の目的と公式 spec/ツールへのリンクの概要は xref:ML_Inference/Building_the_Inference_Engine/06_nnef_introduction.adoc[NNEF 入門] を参照してください。
+
+== ONNX vs TFLite vs NNEF: どれをいつ使うか
+
+デスクトップやサーバーアプリケーションで広い相互運用性が欲しいなら、ONNX は成熟したエコシステムを持つ実用的な選択です（最初に protobuf 全体をパースするコストはあります）。スマートフォンや小さな組み込みをターゲットにするなら、TFLite の FlatBuffers と delegate・量子化まわりのエコシステムが自然な fit です。テキストで検査可能な交換形式と精密な演算子意図、自前 IR への単純な橋が欲しいなら NNEF をネイティブに使います。本チュートリアルでは ONNX をデスクトップ向けの便利な drop-in として、NNEF を公式パーサ経由の第一級パスとして扱います。3 つとも同じ到達点——実行可能な `ComputationGraph`——に収束します。
+
+== 形式からグラフへ
+
+どの形式を読んでも、IR への変換は同じ流れに従います。まずコンテナを開きます——ONNX なら protobuf をデシリアライズ、TFLite なら FlatBuffer をマップ——グラフを走査し始めます。テンソルに遭遇したらエンジン内の対応物を作成します。ノードを訪れるたびに属性付きの演算を作成し、正しい入出力に配線します。定数を見たら GPU メモリへアップロードできるようデータを取得します。最後に、モデルの公式入出力テンソルを記録します。完了時には、手動の `addTensor` と `addOperation` ではなく、学習済みファイルから得た `ComputationGraph` を手にしています。
+
+== 全体像
+
+学習から結果までの経路は単純です。PyTorch や TensorFlow などのフレームワークがモデルを定義・学習し、標準形式にエクスポートします。エンジンがそのファイルを読み込み、`ComputationGraph` を構築し、必要な GPU バッファを割り当て、学習済みパラメータをアップロードします。推論時に入力をデバイスへコピーし、依存順に演算をディスパッチし、予測を読み戻します。ファイル形式は、ネットワークを学習した世界と実行するランタイムの橋にすぎません。
+
+== 実装上の注記
+
+本番品質のパーサーは多数の演算子、データ型、厄介な corner case を扱い、入門チュートリアルに収まらない規模にすぐ膨らみます。本章を支える動作コードは link:/attachments/ml_inference/[ml_inference] にあります。Dense、Conv2D、ReLU、MaxPool など本章の中核演算子をカバーし、同じパターンが残りにもスケールします: ノードを読み、パラメータを取得し、テンソルを配線します。チュートリアルの概念はコードとは独立に学ぶことを推奨します。これらの概念を示す実装例は、準備ができたときに本章に添付されています。
+
+次章: NNEF 入門。
+
+xref:ML_Inference/Building_the_Inference_Engine/04_model_representation.adoc[前へ: モデル表現] | xref:ML_Inference/Building_the_Inference_Engine/06_nnef_introduction.adoc[次へ: NNEF 入門]

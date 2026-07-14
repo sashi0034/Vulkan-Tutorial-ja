@@ -1,0 +1,65 @@
+:pp: {plus}{plus}
+
+= Advanced Vulkan Compute: 並列性の力
+
+== はじめに
+
+「Advanced Vulkan Compute」チュートリアルシリーズへようこそ。このシリーズは、Vulkan コンピュートシェーダの基礎をマスターし、現代の GPU ハードウェアで可能なことの限界を押し広げたい開発者向けです。
+
+Vulkan は単なるグラフィックス API ではありません。汎用 GPU プログラミング（GPGPU）のための強力な低レベルフレームワークです。初期のチュートリアルでは単純なコンピュートシェーダのディスパッチを扱いましたが、本シリーズでは、高性能シミュレーション、複雑なデータ構造、ヘテロジニアス実行を可能にするアーキテクチャ、メモリモデル、高度な機能を深く掘り下げます。
+
+=== 基礎を超えて
+
+基本的なコンピュートシェーダでは、float の配列を乗算する程度かもしれません。高度なコンピュートでは、次のことを行います。
+
+*   **何千ものスレッドを協調させ**、ひとつの問題に取り組む。
+*   **メモリ一貫性を管理し**、あるスレッドが書いたデータを別のスレッドが安全に読めるようにする。
+*   サブグループシャッフルやコオペラティブ行列といった**専用ハードウェアを活用し**、遅い **VRAM**（Video Random Access Memory）を回避する。
+*   **BVH**（Bounding Volume Hierarchies）や Octree のような**GPU 常駐データ構造を構築し**、CPU に触れる必要をなくす。
+
+これを効果的に行うには、GLSL や Slang の表面的な知識だけでは足りません。基盤となるハードウェアアーキテクチャと Vulkan の実行モデルを理解する必要があります。
+
+=== 学べること
+
+このチュートリアルシリーズは、次の主要な領域に分かれています。
+
+1.  **コンピュートアーキテクチャ** - ワークグループを Compute Unit（CU）や Streaming Multiprocessor（SM）へマッピングし、占有率を極める。
+2.  **メモリモデルと一貫性** - Vulkan Memory Model、共有メモリ（**LDS** - Local Data Store）、細粒度の同期を理解する。
+3.  **サブグループ演算** - 呼び出し間通信を使い、VRAM 往復を避けて **SIMD**（Single Instruction, Multiple Data）スループットを最大化する。
+4.  **ヘテロジニアスエコシステム** - `clspv`（AOT コンパイラ）と `clvk`（Vulkan 上にレイヤされた適合 OpenCL 3.0 ランタイム）で、レガシー OpenCL C を Vulkan 上で動かす。
+5.  **高度なデータ構造** - 64 ビットアトミックと **BDA**（Buffer Device Address）を使い、木やリンクリストなどの複雑な構造を GPU 上に完全に置く。
+6.  **GPU 駆動パイプライン** - コマンド生成とワークロード管理を GPU 側へ移し、自律実行する。
+7.  **非同期オーケストレーション** - Synchronization 2 と複数のハードウェアクューで、コンピュートとグラフィックスを並行実行する。
+8.  **高度な数学と最適化** - 線形代数にコオペラティブ行列を使い、発散とスループットについてカーネルを監査する。
+9.  **モバイル＆組み込みコンピュート** - Android や組み込みデバイスでコンピュートを動かし、電力と帯域を最適化し、スマートフォンを超えたヘッドレス実行へ進む。
+
+=== 前提知識
+
+このシリーズは、次の内容に慣れていることを前提とします。
+
+*   標準的な Vulkan 初期化（Instance、Device、Queues）。
+*   基本的なコンピュートパイプラインとディスクリプタセット。
+*   C{pp}20 と GLSL/Slang シェーダ言語。
+*   メインチュートリアルの xref:11_Compute_Shader.adoc[コンピュートシェーダ] 章で扱った概念。
+
+=== このチュートリアルの使い方
+
+各章は独立して読めますが、前の章の概念の上に積み上がっています。高度なコンピュートが初めてなら順に追うことを推奨します。特定の問題を解くなら、該当セクションへ直接飛んでも構いません。
+
+高性能 GPU コンピューティングの世界へ飛び込んでいきましょう。
+
+== 章一覧
+
+* xref:Advanced_Vulkan_Compute/02_Compute_Architecture/01_introduction.adoc[コンピュートアーキテクチャと実行モデル]
+* xref:Advanced_Vulkan_Compute/03_Memory_Models/01_introduction.adoc[メモリモデルと一貫性]
+* xref:Advanced_Vulkan_Compute/04_Subgroup_Operations/01_introduction.adoc[サブグループ演算: 隠れた力]
+* xref:Advanced_Vulkan_Compute/05_OpenCL_on_Vulkan/01_introduction.adoc[ヘテロジニアスエコシステム: OpenCL on Vulkan]
+* xref:Advanced_Vulkan_Compute/06_Advanced_Data_Structures/01_introduction.adoc[GPU 上の高度なデータ構造]
+* xref:Advanced_Vulkan_Compute/07_GPU_Driven_Pipelines/01_introduction.adoc[インダイレクトディスパッチと GPU 駆動パイプライン]
+* xref:Advanced_Vulkan_Compute/08_Asynchronous_Compute/01_introduction.adoc[非同期コンピュートのオーケストレーション]
+* xref:Advanced_Vulkan_Compute/09_Specialized_Math/01_introduction.adoc[コオペラティブ行列と専用数学]
+* xref:Advanced_Vulkan_Compute/10_Performance_Optimization/01_introduction.adoc[パフォーマンス監査と最適化]
+* xref:Advanced_Vulkan_Compute/11_Diagnostics_and_Refinement/01_introduction.adoc[診断と AI 支援によるコンピュート改善]
+* xref:Advanced_Vulkan_Compute/12_Mobile_and_Embedded_Compute/01_introduction.adoc[モバイルと組み込みコンピュート]
+
+xref:11_Compute_Shader.adoc[前へ: 基本的なコンピュートシェーダ] | xref:Advanced_Vulkan_Compute/02_Compute_Architecture/01_introduction.adoc[次へ: コンピュートアーキテクチャ]

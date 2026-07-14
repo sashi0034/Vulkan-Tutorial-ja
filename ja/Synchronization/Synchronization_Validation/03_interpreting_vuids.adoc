@@ -1,0 +1,40 @@
+:pp: {plus}{plus}
+= VUID の解釈: ハザードエラーの解読
+
+== VUID の解剖
+
+Vulkan の **Validation Unique Identifiers（VUID）** は、バリデーションレイヤが問題を見つけたときに出す特定のエラーコードです。`VUID-VkImageMemoryBarrier2-image-01199` のようなこれらの ID は、単なるランダムな数字ではありません。Vulkan 仕様の特定のルールに対応します。
+
+同期バリデーションレイヤがハザードを見つけると、次のようなエラーメッセージを出します。
+
+----
+VALIDATION [SYNC-HAZARD-READ-AFTER-WRITE] (0x01234567)
+VUID: VUID-vkCmdDraw-None-07892
+Message: Write-After-Read (WAR) hazard on Image (0x89abcdef) in VkCommandBuffer (0x12345678).
+    - Current Stage: VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+    - Current Access: VK_ACCESS_2_SHADER_READ_BIT
+    - Previous Stage: VK_PIPELINE_STAGE_2_COPY_BIT
+    - Previous Access: VK_ACCESS_2_TRANSFER_WRITE_BIT
+----
+
+== メッセージの解読
+
+新しい開発者には、このメッセージは圧倒的に感じられます。しかし分解すれば、何が間違っているかを正確に伝えています。
+
+1.  **ハザードの種類**: `[SYNC-HAZARD-READ-AFTER-WRITE]` タグが問題の性質を伝えます。この場合、前の書き込みが終わる前に読み取りが起きています。
+2.  **リソース**: メッセージは特定のリソース（`Image (0x89abcdef)`）と、ハザードが起きたコマンドバッファを特定します。
+3.  **犯人**: メッセージは「Current」と「Previous」のステージとアクセスマスクを列挙します。この例では、フラグメントシェーダが、コピー操作でまさに更新されていたイメージを読もうとしています。
+
+== 実行可能な修正
+
+メッセージが何を伝えているかが分かれば、修正は通常ストレートフォワードです。
+
+-   **バリアを追加する**: 現在のステージが読み取りを始めるときに前のステージがまだ書き込んでいるなら、書き込みが終わり見えるようにするため、二つのステージの間に `vk::ImageMemoryBarrier2`（または `vk::MemoryBarrier2`）を追加する必要があります。
+-   **ステージを洗練する**: すでにバリアがあるなら、`srcStageMask` と `dstStageMask` が正しいか確認します。正しいステージを待ちましたか？正しいアクセスマスクを使いましたか？
+-   **サブミッションを確認する**: ハザードが二つの異なるサブミッション間で起きるなら、それらを協調させるためにセマフォやフェンスを使っていますか？
+
+すべての VUID を学習の機会として扱うことで、同期コードの品質と性能を体系的に向上できます。最終章では、最大の GPU スループットのためにこれらのパターンをどう最適化するかを見ます。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Synchronization_Validation/02_validation_layer.adoc[バリデーションレイヤ] | 次へ: xref:Synchronization/Profiling_Optimization/01_introduction.adoc[プロファイリング、バッチ化、最適化]

@@ -1,7 +1,11 @@
 // Copyright 2023-2026 The Khronos Group, Inc.
 // SPDX-License-Identifier: CC-BY-4.0
 
-= Khronos Vulkan^®^ Tutorial
+= Khronos Vulkan^®^ Tutorial（日本語版）
+
+このリポジトリは link:https://docs.vulkan.org/tutorial/latest[Khronos Vulkan Tutorial] の日本語訳フォークです。
+英語原文は `en/`、日本語訳は `ja/` に並存します。Antora のビルド対象は `ja/` です。
+用語の統一については link:TRANSLATION_GLOSSARY.md[TRANSLATION_GLOSSARY.md] を参照してください。
 
 == Attribution
 
@@ -9,7 +13,7 @@ The Khronos Vulkan^®^ Tutorial is based on the "link:https://vulkan-tutorial.co
 
 == About
 
-This repository hosts the contents of the link:https://docs.vulkan.org/tutorial/latest[Khronos Vulkan Tutorial]. The tutorial is part of the link:https://github.com/KhronosGroup/Vulkan-Site[Vulkan Documentation Project].
+This repository hosts the contents of the link:https://docs.vulkan.org/tutorial/latest[Khronos Vulkan Tutorial] (Japanese translation). The upstream tutorial is part of the link:https://github.com/KhronosGroup/Vulkan-Site[Vulkan Documentation Project].
 
 == Differences
 
@@ -28,14 +32,15 @@ It also contains Vulkan usage clarifications, improved synchronization and new c
 
 The repository is organized into several important directories:
 
-* `en/` - Contains the tutorial content in English, organized by chapters
+* `en/` - 英語原文（章立てのチュートリアル本文）
 ** The main tutorial covers fundamental Vulkan concepts (chapters 00-17)
 ** The "Building a Simple Engine" section builds upon these fundamentals to create a structured rendering engine
+* `ja/` - 日本語訳（`en/` と同構造。ファイル名は英語のまま）
 * `attachments/` - Contains code examples, shader files, and resources used in the tutorial
 * `images/` - Contains illustrations, diagrams, and screenshots used in the tutorial
 * `scripts/` - Contains utility scripts, including dependency installation scripts
-* `antora/` - Contains configuration files for the Antora documentation system
-
+* `antora/` - Contains configuration files for the Antora documentation system（pages は `ja/` から同期）
+* `TRANSLATION_GLOSSARY.md` - 日本語訳の用語集
 == Installation Dependencies
 
 The project provides scripts to help you install the necessary dependencies:

@@ -1,0 +1,52 @@
+= よくある質問
+
+このページでは、Vulkan アプリケーション開発中に遭遇しがちな一般的な問題の解決策を挙げます。
+
+== コアバリデーションレイヤでアクセス違反エラーが出る
+
+MSI Afterburner / RivaTuner Statistics Server が動作していないことを確認してください。Vulkan との互換性の問題があります。
+
+== バリデーションレイヤからのメッセージが見えない / バリデーションレイヤが使えない
+
+まず、プログラム終了後もターミナルを開いたままにして、バリデーションレイヤがエラーを出力する機会があることを確認してください。
+Visual Studio では F5 ではなく Ctrl-F5 でプログラムを実行し、Linux ではターミナルウィンドウからプログラムを実行できます。
+それでもメッセージがなく、バリデーションレイヤが有効になっている確信がある場合は、https://vulkan.lunarg.com/doc/view/1.3.280.0/windows/getting_started.html[このページ]の「Verify the Installation」手順に従い、Vulkan SDK が正しくインストールされていることを確認してください。
+また、`VK_LAYER_KHRONOS_validation` レイヤをサポートするため、SDK バージョンが少なくとも 1.1.106.0 であることも確認してください。
+
+== vkCreateSwapchainKHR が SteamOverlayVulkanLayer64.dll でエラーを起こす
+
+これは Steam クライアントベータの互換性問題のようです。
+いくつかの回避策があります。
+
+* Steam ベータプログラムからオプトアウトする。
+* 環境変数 `DISABLE_VK_LAYER_VALVE_steam_overlay_1` を `1` に設定する
+* レジストリの `HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers` にある Steam オーバーレイ Vulkan レイヤのエントリを削除する
+
+例:
+
+image::/images/steam_layers_env.png[]
+
+== vkCreateInstance が VK_ERROR_INCOMPATIBLE_DRIVER で失敗する
+
+最新の MoltenVK SDK を使った MacOS では、`vkCreateInstance` が `VK_ERROR_INCOMPATIBLE_DRIVER` エラーを返すことがあります。
+これは、https://vulkan.lunarg.com/doc/sdk/1.3.216.0/mac/getting_started.html[Vulkan SDK バージョン 1.3.216 以降]では、現時点で完全準拠ではないため MoltenVK を使うには `VK_KHR_PORTABILITY_subset` 拡張を有効にする必要があるからです。
+
+`VkInstanceCreateInfo` に `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR` フラグを追加し、インスタンス拡張リストに `VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME` を追加する必要があります。
+
+コード例:
+
+[,c++]
+----
+...
+
+std::vector<const char*> requiredExtensions;
+
+for(uint32_t i = 0; i < glfwExtensionCount; i++) {
+    requiredExtensions.emplace_back(glfwExtensions[i]);
+}
+
+requiredExtensions.emplace_back(vk::KHRPortabilityEnumerationExtensionName);
+
+vk::InstanceCreateInfo createInfo(vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR, &appInfo, {}, requiredExtensions);
+instance = std::make_unique<vk::raii::Instance>(context, createInfo);
+----

@@ -1,0 +1,107 @@
+= レイクエリによるシャドウ（不透明ジオメトリ）
+
+*目的*: フラグメントシェーダーでレイクエリを使い、単純なシャドウテストを追加する。各フラグメント点からライトへレイを飛ばし、何かが当たればフラグメントを暗くする（ハードシャドウ）。
+
+おめでとうございます。シーン用の有効な TLAS/BLAS ができました！次はそれを使ってレイを飛ばしましょう。
+
+== タスク 5: レイクエリによるシャドウを実装する
+
+フラグメントシェーダーでは、フラグメント位置から光源へ向かうシャドウレイをレイクエリで飛ばします。レイがライトに届く前にジオメトリに当たると、フラグメントの色を暗くします。
+
+image::../../../images/38_TASK06_concept_shadows.png[]
+
+[,slang]
+----
+// TASK05: Implement ray query shadows
+bool in_shadow(float3 P)
+{
+    bool hit = false;
+
+    return hit;
+}
+
+[shader("fragment")]
+float4 fragMain(VSOutput vertIn) : SV_TARGET {
+   float4 baseColor = textures[pc.materialIndex].Sample(textureSampler, vertIn.fragTexCoord);
+
+   float3 P = vertIn.worldPos;
+
+   bool inShadow = in_shadow(P);
+
+   // Darken if in shadow
+   if (inShadow) {
+       baseColor.rgb *= 0.2;
+   }
+
+   return baseColor;
+}
+----
+
+このために、レイクエリを行うヘルパー `in_shadow()` 関数を実装します。まずレイ記述を定義し、フラグメント位置とライト方向で初期化します。
+
+[,slang]
+----
+bool in_shadow(float3 P)
+{
+    // Build the shadow ray from the world position toward the light
+    RayDesc shadowRayDesc;
+    shadowRayDesc.Origin = P;
+    shadowRayDesc.Direction = normalize(lightDir);
+    shadowRayDesc.TMin = EPSILON;
+    shadowRayDesc.TMax = 1e4;
+----
+
+`TMin` と `TMax` は、原点からレイが進む最小／最大距離を定義します。`EPSILON` は自己交差を避けるための小さな値で、`1e4` は遠いオブジェクトにも当たれるようにする大きな値です。
+
+次に、レイトラバーサルを行う `RayQuery` オブジェクトを初期化します。高速化のために使うフラグの選択に注意してください。
+
+- 三角形のみの単純なシーンなので `RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES`。
+- 最初の不透明交差が見つかったらすぐにトラバーサルを終える `RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH`。シャドウテストでは何かがライトを遮るかだけ分かれば十分なためです。
+
+[,slang]
+----
+    // Initialize a ray query for shadows
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES |
+             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+    let rayFlags = RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES |
+             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+----
+
+次に、レイ記述、`RayQuery` オブジェクト、アクセラレーション構造を組み合わせたレイトレーシング操作を開始します。
+
+[,slang]
+----
+    sq.TraceRayInline(accelerationStructure, rayFlags, 0xFF, shadowRayDesc);
+
+    sq.Proceed();
+----
+
+`Proceed()` は `RayQuery` オブジェクトの状態を、レイ沿いの次の交差「候補」へ進めます。`Proceed()` を呼ぶたびに、処理すべき別の交差があるかを確認します。ある場合、現在の候補交差の情報にアクセスできるようクエリの内部状態を更新します。これにより、透明サーフェスをスキップする（本ラボの後半で再訪します）や、最初の不透明ヒットで止めるなど、交差処理のカスタムロジックを実装できます。通常は潜在的な交差をすべて反復するループ内で呼びますが、シャドウでは最初のヒットだけで足ります。
+
+[,slang]
+----
+    // If the shadow ray intersects an opaque triangle, we consider the pixel in shadow
+    bool hit = (sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT);
+
+    return hit;
+}
+----
+
+これで完了です！レイクエリを使った基本的なシャドウテストを実装しました。`in_shadow()` 関数は、レイがライトに届く前にジオメトリに当たると `true` を返し、フラグメントがシャドウ内であることを示します。
+
+次を使って再ビルドして実行します。
+
+[,c{pp}]
+----
+#define LAB_TASK_LEVEL 5
+----
+
+何かおかしいことに気づくでしょう。
+
+image::../../../images/38_TASK06_shadows_static.gif[]
+
+オブジェクトは回転していますが、シャドウは静止しています。オブジェクトのアニメーションを反映するよう TLAS をまだ更新していないためです。オブジェクトが動いたりアニメーションしたりするたびに TLAS を再構築する必要があるので、次にそれを実装しましょう。
+
+== ナビゲーション
+- 前へ: xref:./02_Acceleration_structures.adoc[アクセラレーション構造]
+- 次へ: xref:./04_TLAS_animation.adoc[TLAS アニメーション]

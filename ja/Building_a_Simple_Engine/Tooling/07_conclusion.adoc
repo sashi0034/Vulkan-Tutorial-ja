@@ -1,0 +1,232 @@
+:pp: {plus}{plus}
+
+= ツール: 結論
+
+== 結論
+
+この章では、Vulkan アプリケーションの開発、デバッグ、配布のための包括的なツールとテクニックのセットについて説明しました。これまで学んだことを要約し、これらのテクニックを自分のプロジェクトに適用する方法について話し合いましょう。
+
+=== 私たちが学んだこと
+
+==== Vulkan プロジェクトの CI/CD
+
+私たちは、Vulkan アプリケーション向けに特別に調整された継続的インテグレーションと継続的デプロイメント パイプラインを実装することから始めました。これには以下が含まれます:
+
+* GitHub Actions を使用した基本的な CI/CD パイプラインのセットアップ
+* SDK のインストールや GPU の可用性など、Vulkan 固有の考慮事項の処理
+* Vulkan アプリケーションのテストの自動化
+* Vulkan アプリケーションをパッケージ化し、さまざまなプラットフォームに配布する
+
+適切に設計された CI/CD パイプラインは、開発プロセスの早い段階で問題を発見し、ビルドとプラットフォーム全体で一貫した品質を確保するのに役立ちます。
+
+==== VK_KHR_debug_utils と RenderDoc を使用したデバッグ
+
+次に、Vulkan アプリケーション用の強力なデバッグ ツールを検討しました。
+
+* アプリケーション内デバッグのための VK_KHR_debug_utils 拡張機能の使用
+* デバッグを改善するためのオブジェクト、コマンド バッファ、およびキュー操作のラベル付け
+* フレームのキャプチャと分析のための RenderDoc の統合
+* これらのアプローチを組み合わせて包括的なデバッグを行う
+
+これらのツールは GPU 上で起きている複雑な操作を可視化し、レンダリングパイプラインの問題を特定して修正しやすくします。
+
+==== クラッシュ処理とミニダンプ
+
+次に、堅牢なクラッシュ処理メカニズムを実装しました。
+
+* 例外とシグナルの基本的なクラッシュ処理
+* 詳細なクラッシュ分析のためのミニダンプの生成
+* クラッシュ レポートでの Vulkan 固有の情報の収集
+* 運用アプリケーション用のテレメトリ システムとの統合
+
+適切なクラッシュ処理は、運用環境で発生する問題の診断と修正に役立ち、アプリケーションの安定性と信頼性が向上します。
+
+==== 堅牢性を高めるための Vulkan 拡張機能
+
+最後に、アプリケーションの未定義の動作に対する耐性を高めるのに役立つ Vulkan 拡張機能を検討しました。
+
+* VK_EXT_robustness2 を使用して境界外アクセスと null ディスクリプタを処理する
+* VK_KHR_buffer_device_address や VK_EXT_descriptor_indexing などの他の堅牢性拡張機能の実装
+* 堅牢性拡張機能とデバッグ ツールを組み合わせて最大限の効果を実現
+
+これらの拡張機能は、一般的なエラーに対してアプリケーションをより堅牢にするための貴重なツールを提供しますが、根本的な問題を修正するための代替として見なされるべきではありません。
+
+=== すべてをまとめる
+
+この章全体を通じて、リソース管理に最新の C++20 モジュールと vk::raii 名前空間を使用してきました。このアプローチにはいくつかの利点があります。
+
+* モジュールによるコード構成の改善
+* RAII による自動リソースクリーンアップ
+* より読みやすく保守しやすいコード
+* 例外によるエラー処理の改善
+
+これらすべてのコンポーネントが完全なアプリケーションでどのように連携できるかを見てみましょう。
+
+[source,cpp]
+----
+import std;
+import vulkan_raii;
+
+class VulkanApplication {
+public:
+    VulkanApplication() {
+        // Initialize crash handler
+        crash_handler::initialize("MyVulkanApp", "crash_logs");
+
+        // Initialize Vulkan with debugging and robustness
+        initialize_vulkan();
+    }
+
+    void run() {
+        // Main application loop
+        while (!should_close()) {
+            try {
+                update();
+                render();
+            } catch (const vk::SystemError& e) {
+                // Handle recoverable Vulkan errors
+                std::cerr << "Vulkan error: " << e.what() << std::endl;
+                if (!recover_from_error()) {
+                    break;
+                }
+            }
+        }
+
+        cleanup();
+    }
+
+private:
+    void initialize_vulkan() {
+        // Create instance with validation layers in debug builds
+        #ifdef _DEBUG
+        enable_validation_layers = true;
+        #else
+        enable_validation_layers = false;
+        #endif
+
+        // Create instance
+        instance = create_instance();
+
+        // Set up debug messenger if validation is enabled
+        if (enable_validation_layers) {
+            debug_messenger = create_debug_messenger(instance);
+        }
+
+        // Select physical device
+        physical_device = select_physical_device(instance);
+
+        // Check for robustness support
+        has_robustness2 = check_robustness2_support(physical_device);
+
+        // Create logical device with robustness if available
+        device = create_device(physical_device);
+
+        // Name Vulkan objects for debugging
+        if (enable_validation_layers) {
+            debug_utils::set_name(device, *device, "Main Device");
+            // Name other objects as they're created
+        }
+
+        // Initialize other Vulkan resources
+        // ...
+    }
+
+    void render() {
+        // Begin frame
+        auto cmd_buffer = begin_frame();
+
+        // Label command buffer regions for debugging
+        if (enable_validation_layers) {
+            vk::DebugUtilsLabelEXT label_info{};
+            label_info.setPLabelName("Main Render Pass");
+            label_info.setColor(std::array<float, 4>{0.0f, 1.0f, 0.0f, 1.0f});
+            cmd_buffer.beginDebugUtilsLabelEXT(label_info);
+        }
+
+        // Record rendering commands
+        // ...
+
+        // End debug label
+        if (enable_validation_layers) {
+            cmd_buffer.endDebugUtilsLabelEXT();
+        }
+
+        // End frame
+        end_frame(cmd_buffer);
+
+        // Capture frame with RenderDoc if requested
+        if (capture_next_frame) {
+            if (renderdoc_api) {
+                renderdoc_api->TriggerCapture();
+            }
+            capture_next_frame = false;
+        }
+    }
+
+    // Vulkan objects
+    vk::raii::Context context;
+    vk::raii::Instance instance{nullptr};
+    vk::raii::DebugUtilsMessengerEXT debug_messenger{nullptr};
+    vk::raii::PhysicalDevice physical_device{nullptr};
+    vk::raii::Device device{nullptr};
+
+    // Flags
+    bool enable_validation_layers = false;
+    bool has_robustness2 = false;
+    bool capture_next_frame = false;
+
+    // RenderDoc API
+    RENDERDOC_API_1_4_1* renderdoc_api = nullptr;
+};
+----
+
+=== プロフェッショナルな Vulkan 開発のベスト プラクティス
+
+この章で説明した内容に基づいて、プロフェッショナルな Vulkan 開発のベスト プラクティスをいくつか示します。
+
+1. *ワークフローを自動化*: CI/CD パイプラインを使用して、アプリケーションの構築、テスト、パッケージ化を自動化します。
+
+2. *早期かつ頻繁にデバッグする*: 問題が発生したときだけでなく、開発全体を通じて検証レイヤーとデバッグ ツールを使用します。
+
+3. *オブジェクトに名前を付ける*: VK_KHR_debug_utils を使用して、Vulkan オブジェクトに意味のある名前を付けると、デバッグがはるかに簡単になります。
+
+4. *クラッシュに備える*: プロジェクトの開始時から、堅牢なクラッシュ処理とレポートのメカニズムを実装します。
+
+5. *堅牢性を考慮する*: アプリケーションのニーズに基づいて、堅牢性拡張機能を使用する場合のトレードオフを評価します。
+
+6. *プラットフォーム間でのテスト*: Vulkan アプリケーションは、ハードウェアやドライバーが異なると動作が異なる可能性があるため、広範囲にテストしてください。
+
+7. *要件を文書化*: アプリケーションに必要な Vulkan 拡張機能と機能を明確に文書化します。
+
+8. *最新情報を入手*: Vulkan エコシステムは常に進化しているため、新しい拡張機能やツールに関する最新情報を常に入手してください。
+
+=== 今後の方向性
+
+Vulkan が進化し続けるにつれて、アプリケーションの開発、デバッグ、配布のための新しいツールや技術が登場します。注目すべき分野には次のようなものがあります。
+
+* *改善されたデバッグ ツール*: RenderDoc などのツールは、Vulkan デバッグ用の新機能を追加し続けています。
+* *レイ トレーシング ツール*: レイ トレーシングがより一般的になるにつれて、レイ トレーシング パイプラインのデバッグと最適化のためのより特化したツールが期待されます。
+* *機械学習の統合*: 機械学習を使用して潜在的な問題を特定し、パフォーマンスを最適化するツール。
+* *クロス API 開発*: 複数のグラフィックス API (Vulkan、DirectX、Metal) にわたる開発の管理を支援するツール。
+
+=== 最終的な考え
+
+プロフェッショナルな Vulkan アプリケーションを開発するには、API を理解するだけではなく、開発ライフサイクル全体をサポートする包括的なツール エコシステムが必要です。この章で説明するツールとテクニックを実装すると、高品質の Vulkan アプリケーションを開発、デバッグ、配布するための準備が整います。
+
+ツールは開発プロセス全体を通じて利益をもたらす投資であることを忘れないでください。適切な CI/CD パイプライン、デバッグ ツール、クラッシュ処理メカニズムのセットアップに時間を費やすことで、その後のトラブルシューティングや手作業にかかる膨大な時間を節約できます。
+
+=== コード例
+
+この章の完全なコードは、次のファイルにあります。
+
+* `simple_engine/32_cicd_setup.cpp`: Vulkan プロジェクトの CI/CD の実装
+* `simple_engine/33_debug_utils.cpp`: VK_KHR_debug_utils と RenderDoc によるデバッグの実装
+* `simple_engine/34_crash_handling.cpp`: クラッシュ処理とミニダンプの実装
+* `simple_engine/35_robustness_extensions.cpp`: 堅牢性を高めるための Vulkan 拡張機能の実装
+
+link:{attachmentsdir}/simple_engine/32_cicd_setup.cpp[CI/CD セットアップ C{pp} コード]
+link:{attachmentsdir}/simple_engine/33_debug_utils.cpp[Utils C{pp} コードをデバッグする]
+link:{attachmentsdir}/simple_engine/34_crash_handling.cpp[クラッシュ処理 C{pp} コード]
+link:{attachmentsdir}/simple_engine/35_robustness_extensions.cpp[ロバストネス拡張機能 C{pp} コード]
+
+xref:Building_a_Simple_Engine/Tooling/06_packaging_and_distribution.adoc[前: パッケージングと流通] | xref:Building_a_Simple_Engine/Mobile_Development/01_introduction.adoc[次へ: モバイル開発]

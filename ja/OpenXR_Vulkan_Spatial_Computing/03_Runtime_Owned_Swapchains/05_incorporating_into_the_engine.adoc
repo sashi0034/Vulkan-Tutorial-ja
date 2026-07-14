@@ -1,0 +1,72 @@
+:pp: {plus}{plus}
+= エンジンへの組み込み
+
+デスクトップ制御のスワップチェーンから OpenXR ランタイム所有のものへ移行するには、`renderer_rendering.cpp` のエンジンのリソース作成とフレーム取得ロジックを横取りする必要があります。実装例は link:../../../attachments/openxr_engine/xr_context.cpp[xr_context.cpp] と link:../../../attachments/openxr_engine/renderer_resources.cpp[renderer_resources.cpp] にあります。
+
+== スワップチェーン作成の調整
+
+`renderer_rendering.cpp` では、XR モード時に標準の Vulkan サーフェスベーススワップチェーンを迂回するよう `Renderer::createSwapChain` を修正する必要があります。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+bool Renderer::createSwapChain() {
+    if (xrMode) {
+        // NEW: Negotiate with OpenXR instead of the windowing system
+        vk::Extent2D xrExtent = xrContext.getRecommendedExtent();
+        xrContext.createSwapchains(*device, vk::Format::eB8G8R8A8Srgb, xrExtent);
+
+        // Use a single swapchain with 2 layers for multiview
+        eyeSwapchainImages[0] = xrContext.enumerateSwapchainImages();
+        eyeSwapchainImages[1].clear(); // Not used in multiview mode
+
+        swapChainExtent = xrContext.getSwapchainExtent();
+        swapChainImageFormat = xrContext.getSwapchainFormat();
+
+        return createImageViews();
+    }
+
+    // ... original desktop vk::raii::SwapchainKHR logic ...
+}
+----
+
+== フレームライフサイクルの扱い
+
+「Wait-Acquire-Release」のリズムは毎フレーム起きます。デスクトップウィンドウではなく XR コンポジタと同期するよう、`Renderer::Render` を更新しなければなりません。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+void Renderer::Render(...) {
+    // ...
+    uint32_t imageIndex;
+
+    if (xrMode) {
+        // 1. ACQUIRE: Get the index of the next available XR image from the runtime
+        imageIndex = xrContext.acquireSwapchainImage();
+
+        // 2. WAIT: Block until the image is safe to be written to
+        xrContext.waitSwapchainImage();
+    } else {
+        // Standard desktop acquisition
+        auto result = swapChain.acquireNextImage(UINT64_MAX, *imageAvailableSemaphores[currentFrame]);
+        imageIndex = result.second;
+    }
+
+    // ... record and submit command buffers ...
+
+    if (xrMode) {
+        // 3. RELEASE: Hand the image back to the compositor for display
+        xrContext.releaseSwapchainImage();
+    } else {
+        // Standard desktop present
+        presentQueue.presentKHR(presentInfo);
+    }
+}
+----
+
+== なぜこれらの変更か？
+
+これらの呼び出しを `createSwapChain` と `Render` に注入することで、エンジンの高水準抽象（`vk::raii::Image` など）を維持しつつ、**ライフサイクル** の制御を XR ランタイムに委ねます。`xrContext` はブリッジとして機能し、コンポジタがヘッドセットのレンズへ投影するために読んでいるイメージへエンジンが描画しようとしないことを保証します。
+
+xref:OpenXR_Vulkan_Spatial_Computing/03_Runtime_Owned_Swapchains/04_memory_ownership_lifecycle.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/04_Dynamic_Rendering/01_introduction.adoc[次へ]

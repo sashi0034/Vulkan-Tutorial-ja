@@ -1,0 +1,529 @@
+:pp: {plus}{plus}
+
+= 行列演算
+
+== 導入
+
+行列演算はニューラルネットワークの計算上の workhorse です。非線形性を導入する活性化関数が注目を集めますが、重い計算は行列演算が担います。全結合レイヤは行列–ベクトル乗算です。畳み込みレイヤの核心は行列乗算として再定式化できます。transformer の基盤である attention メカニズムは行列–行列乗算上に構築されています。
+
+GPU 上で行列演算を効率的に実装する方法の理解は、高性能な推論エンジン構築に不可欠です。embarrassingly parallel でメモリバウンドな要素ごと演算と異なり、行列演算はより複雑なアクセスパターンと、データ再利用による最適化の機会を持ちます。
+
+本章では行列–ベクトル乗算（全結合レイヤの基盤）と行列–行列乗算（GEMM——General Matrix Multiply、現代アーキテクチャ全体で使用）の実装を扱います。基本を理解するため素朴な実装から始め、共有メモリとタイル化を使った最適化版へ進み、大幅な性能向上を達成します。
+
+== 行列演算が重要な理由
+
+実装に入る前に、これらの操作がニューラルネットワーク計算を支配する理由と、何が課題かを理解しましょう。
+
+=== 計算集約度
+
+行列演算はコンピュート集約的です。M×N 行列と N 次元ベクトルの行列–ベクトル乗算には M×N 回の multiply-add が必要です。4096 入力・4096 出力の典型的な全結合レイヤでは 1600 万回の演算です。
+
+行列–行列乗算はさらに集約的です。2 つの N×N 行列の乗算には N³ 回の multiply-add が必要です。1024×1024 行列では 10 億回超の演算です。この計算集約度こそ GPU がニューラルネットワークに優れる理由——数千の演算を並列実行できます。
+
+=== メモリアクセスパターン
+
+行列演算の課題は計算だけでなくメモリアクセスパターンです。行列–ベクトル乗算を考えると、各出力要素は行列の 1 行全体と入力ベクトル全体の読み取りを必要とします。出力を独立に計算すると、入力ベクトルを複数回読み、メモリ帯域幅を無駄にします。
+
+行列–行列乗算はさらに複雑なパターンです。素朴な実装では入力行列の各要素を複数回読みます。最適化実装はタイル化と共有メモリでデータを再利用し、メモリトラフィックを劇的に削減します。
+
+=== データ再利用の機会
+
+各入力が 1 回だけ使われる要素ごと演算と異なり、行列演算には significant なデータ再利用があります。行列–行列乗算では、入力行列の各要素が N 回（行列次元）使われます。共有メモリを通じたこの再利用の活用が高性能の鍵です。
+
+== 行列–ベクトル乗算
+
+行列–ベクトル乗算は全結合（dense）レイヤの基盤です。サイズ M×N の行列 A とサイズ N のベクトル x が与えられると、y = A×x を計算し、y はサイズ M のベクトルです。
+
+数学的に各出力要素は次のとおりです。
+
+[source]
+----
+y[i] = Σ(j=0 to N-1) A[i][j] * x[j]
+----
+
+各出力要素は行列の 1 行と入力ベクトルの内積です。
+
+=== 素朴な実装
+
+各スレッドが 1 出力要素を計算する素直な実装から始めましょう。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer MatrixBuffer {
+    float matrix[];  // M x N matrix in row-major order
+};
+
+layout(set = 0, binding = 1) readonly buffer VectorBuffer {
+    float vector[];  // N-dimensional vector
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputBuffer {
+    float output[];  // M-dimensional output vector
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;  // Number of rows
+    uint N;  // Number of columns
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+
+    if (row >= pc.M) {
+        return;
+    }
+
+    // Compute dot product of matrix row with vector
+    float sum = 0.0;
+    for (uint col = 0; col < pc.N; col++) {
+        uint matrix_index = row * pc.N + col;
+        sum += matrix[matrix_index] * vector[col];
+    }
+
+    output[row] = sum;
+}
+----
+
+この実装は単純で正しいです。各スレッドは次を行います。
+
+1. 計算する出力要素（行）を特定
+2. すべての列をループし、内積を累積
+3. 結果を書き込み
+
+メモリアクセスパターンは素直です。各スレッドは行列の 1 行を順次読み（coalesce に有利）、入力ベクトル全体を読み（すべてのスレッドで共有）。
+
+=== 性能分析
+
+素朴な実装には問題があります。すべてのスレッドが入力ベクトル全体を読みます。M スレッドでベクトルを M 回読み、同じデータなのに無駄です。
+
+良い点として、行列読み取りは coalesced です——スレッドは連続行を読み、連続スレッドが連続メモリ位置にアクセスします。メモリ効率に有利です。
+
+計算自体は効率的——最新 GPU は multiply-add を非常に高速に実行できます。ボトルネックはメモリ帯域幅、特に冗長なベクトル読み取りです。
+
+=== 共有メモリを使った最適化実装
+
+ワークグループあたり 1 回ベクトルを共有メモリにロードすれば、冗長なベクトル読み取りを排除できます。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer MatrixBuffer {
+    float matrix[];
+};
+
+layout(set = 0, binding = 1) readonly buffer VectorBuffer {
+    float vector[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer OutputBuffer {
+    float output[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+} pc;
+
+// Shared memory for the input vector
+shared float shared_vector[256];  // Adjust size based on N
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint row = gl_GlobalInvocationID.x;
+
+    // Cooperatively load vector into shared memory
+    // Each thread loads one element (or more if N > 256)
+    for (uint i = local_id; i < pc.N; i += 256) {
+        shared_vector[i] = vector[i];
+    }
+
+    // Synchronize to ensure all threads have loaded their data
+    barrier();
+
+    if (row >= pc.M) {
+        return;
+    }
+
+    // Compute dot product using shared memory
+    float sum = 0.0;
+    for (uint col = 0; col < pc.N; col++) {
+        uint matrix_index = row * pc.N + col;
+        sum += matrix[matrix_index] * shared_vector[col];
+    }
+
+    output[row] = sum;
+}
+----
+
+主な改善点:
+
+*協調ロード*: ワークグループ内の全スレッドがベクトルを共有メモリに協調ロードします。各スレッドが 1 要素以上をロードし、ベクトル全体を効率的にロードします。
+
+*バリア同期*: `barrier()` は計算開始前に全スレッドのロード完了を保証します。レース条件を防ぎます。
+
+*共有メモリアクセス*: スレッドはグローバルメモリではなく共有メモリから読みます。共有メモリははるかに高速——通常グローバルメモリの 10–100 倍です。
+
+この最適化は大ベクトルで 2–5 倍の性能改善が得られることが多く、ハードウェアとベクトルサイズに依存します。
+
+=== 大ベクトルの扱い
+
+ベクトルが共有メモリに収まらない場合（例: N > 16384）、計算をタイル化する必要があります。
+
+[source,slang]
+----
+// Process vector in tiles
+const uint TILE_SIZE = 256;
+
+for (uint tile_start = 0; tile_start < pc.N; tile_start += TILE_SIZE) {
+    uint tile_end = min(tile_start + TILE_SIZE, pc.N);
+    uint tile_size = tile_end - tile_start;
+
+    // Load tile into shared memory
+    if (local_id < tile_size) {
+        shared_vector[local_id] = vector[tile_start + local_id];
+    }
+    barrier();
+
+    // Compute partial dot product for this tile
+    for (uint i = 0; i < tile_size; i++) {
+        uint col = tile_start + i;
+        uint matrix_index = row * pc.N + col;
+        sum += matrix[matrix_index] * shared_vector[i];
+    }
+    barrier();
+}
+----
+
+ベクトルをチャンクで処理し、メモリ使用量を bounded に保ちつつ共有メモリの利点を維持します。
+
+== 行列–行列乗算（GEMM）
+
+行列–行列乗算はより複雑ですが、同様の原則に従います。行列 A（M×K）と B（K×N）が与えられると、C = A×B を計算し、C は M×N です。
+
+数学的には次のとおりです。
+
+[source]
+----
+C[i][j] = Σ(k=0 to K-1) A[i][k] * B[k][j]
+----
+
+各出力要素は A の 1 行と B の 1 列の内積です。
+
+=== 素朴な実装
+
+最も単純なアプローチ: 各スレッドが 1 出力要素を計算します。
+
+[source,slang]
+----
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer MatrixA {
+    float A[];  // M x K matrix
+};
+
+layout(set = 0, binding = 1) readonly buffer MatrixB {
+    float B[];  // K x N matrix
+};
+
+layout(set = 0, binding = 2) writeonly buffer MatrixC {
+    float C[];  // M x N output matrix
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    if (row >= pc.M || col >= pc.N) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint k = 0; k < pc.K; k++) {
+        float a_val = A[row * pc.K + k];
+        float b_val = B[k * pc.N + col];
+        sum += a_val * b_val;
+    }
+
+    C[row * pc.N + col] = sum;
+}
+----
+
+2D 出力を計算するため 2D ワークグループ（16×16）を使います。各スレッドは次を行います。
+
+1. 出力位置（row, col）を特定
+2. K をループし、内積を累積
+3. 結果を書き込み
+
+この実装は正しいですが非効率です。A と B の各要素をグローバルメモリから複数回読みます。大行列では enormous なメモリ帯域幅の無駄です。
+
+=== 共有メモリを使ったタイル実装
+
+重要な最適化はタイル化です。行列をタイルに分割し、タイルを共有メモリにロードし、部分結果を計算します。データ再利用を活用——タイル要素は共有メモリ内で複数回使われます。
+
+最適化実装は次のとおりです。
+
+[source,slang]
+----
+#version 450
+
+#define TILE_SIZE 16
+
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer MatrixA {
+    float A[];
+};
+
+layout(set = 0, binding = 1) readonly buffer MatrixB {
+    float B[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer MatrixC {
+    float C[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} pc;
+
+// Shared memory for tiles
+shared float tile_A[TILE_SIZE][TILE_SIZE];
+shared float tile_B[TILE_SIZE][TILE_SIZE];
+
+void main() {
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+    uint global_row = gl_GlobalInvocationID.y;
+    uint global_col = gl_GlobalInvocationID.x;
+
+    float sum = 0.0;
+
+    // Loop over tiles
+    uint num_tiles = (pc.K + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint tile = 0; tile < num_tiles; tile++) {
+        // Load tile of A into shared memory
+        uint a_col = tile * TILE_SIZE + local_col;
+        if (global_row < pc.M && a_col < pc.K) {
+            tile_A[local_row][local_col] = A[global_row * pc.K + a_col];
+        } else {
+            tile_A[local_row][local_col] = 0.0;
+        }
+
+        // Load tile of B into shared memory
+        uint b_row = tile * TILE_SIZE + local_row;
+        if (b_row < pc.K && global_col < pc.N) {
+            tile_B[local_row][local_col] = B[b_row * pc.N + global_col];
+        } else {
+            tile_B[local_row][local_col] = 0.0;
+        }
+
+        // Synchronize to ensure tiles are loaded
+        barrier();
+
+        // Compute partial dot product using tiles
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += tile_A[local_row][k] * tile_B[k][local_col];
+        }
+
+        // Synchronize before loading next tile
+        barrier();
+    }
+
+    // Write result
+    if (global_row < pc.M && global_col < pc.N) {
+        C[global_row * pc.N + global_col] = sum;
+    }
+}
+----
+
+この実装はより複雑ですがはるかに高速です。何が起きているか分解します。
+
+*タイル戦略*: K 次元を TILE_SIZE のタイルに分割します。各タイルについて、A と B から TILE_SIZE×TILE_SIZE ブロックを共有メモリにロードします。
+
+*協調ロード*: ワークグループ内の全スレッドがタイルを協調ロードします。各スレッドが A と B から 1 要素ずつロードします。
+
+*タイル上で計算*: タイルロード後、スレッドは共有メモリで部分内積を計算します。タイル内の各要素は TILE_SIZE 回再利用されます。
+
+*累積*: すべてのタイルにわたって部分結果を累積し、最終出力を得ます。
+
+*境界処理*: `if` 文は行列次元が TILE_SIZE の倍数でない場合を扱い、ゼロでパディングします。
+
+=== 性能分析
+
+タイル実装はメモリトラフィックを劇的に削減します。1024×1024 行列の乗算を考えると:
+
+*素朴*: 各出力要素は A から 1024 要素、B から 1024 要素の読み取りが必要。合計: 1024² × 2 × 1024 = 20 億回の読み取り。
+
+*タイル（16×16）*: 各タイルは 1 回ロードされ 16 回再利用。合計読み取り: 約 2 × 1024² × 1024 / 16 = 1 億 2800 万回。
+
+16 倍のメモリトラフィック削減です。実際の speedup は他の要因（計算時間、メモリレイテンシ）により通常 5–10 倍ですが、依然 substantial です。
+
+=== タイルサイズの最適化
+
+タイルサイズは性能に影響します。大きいタイルはより多くのデータ再利用ですが、より多くの共有メモリが必要です。典型的なタイルサイズは 8×8、16×16、32×32 です。
+
+考慮事項:
+
+*共有メモリ制限*: GPU のワークグループあたり共有メモリは限られています（通常 16–64 KB）。float の TILE_SIZE×TILE_SIZE タイル 2 枚は 2 × TILE_SIZE² × 4 バイト。32×32 タイルでは 8 KB——制限内です。
+
+*オキュパンシ*: 大きいワークグループ（大きいタイル）は同時実行ワークグループ数を減らします。オキュパンシ（アクティブに使われる GPU リソースの割合）が低下することがあります。
+
+*レジスタ圧力*: 大きいタイルはスレッドあたりより多くのレジスタを必要とし、オキュパンシも低下することがあります。
+
+最適タイルサイズは GPU アーキテクチャに依存します。異なるサイズをプロファイルしてください。ほとんどの最新 GPU では 16×16 が良いデフォルトです。
+
+== 高度な最適化
+
+基本タイル化を超えて、さらに性能を改善する高度な技法がいくつかあります。
+
+=== ベクトル化
+
+ベクトル型でスレッドあたり複数要素を処理します。
+
+[source,slang]
+----
+// Load 4 elements at once
+vec4 a_vec = vec4(A[index], A[index+1], A[index+2], A[index+3]);
+vec4 b_vec = vec4(B[index], B[index+1], B[index+2], B[index+3]);
+sum += dot(a_vec, b_vec);
+----
+
+一部 GPU でメモリ帯域幅と演算ユニットをより活用し、10–30% スループット改善が得られることがあります。
+
+=== レジスタブロッキング
+
+スレッドあたり複数出力要素を計算し、算術集約度を上げます。
+
+[source,slang]
+----
+// Each thread computes a 2x2 block of outputs
+float sum00 = 0.0, sum01 = 0.0;
+float sum10 = 0.0, sum11 = 0.0;
+
+for (uint k = 0; k < TILE_SIZE; k++) {
+    float a0 = tile_A[local_row * 2 + 0][k];
+    float a1 = tile_A[local_row * 2 + 1][k];
+    float b0 = tile_B[k][local_col * 2 + 0];
+    float b1 = tile_B[k][local_col * 2 + 1];
+
+    sum00 += a0 * b0;
+    sum01 += a0 * b1;
+    sum10 += a1 * b0;
+    sum11 += a1 * b1;
+}
+----
+
+コンピュート対メモリ比が上がり、GPU の演算ユニットをより活用できます。
+
+=== プリフェッチ
+
+次タイルのロードを現在タイルの計算と重ねます。
+
+[source,slang]
+----
+// Load first tile
+load_tile(0);
+barrier();
+
+for (uint tile = 0; tile < num_tiles - 1; tile++) {
+    // Start loading next tile (asynchronous if supported)
+    load_tile(tile + 1);
+
+    // Compute using current tile
+    compute_tile();
+
+    // Wait for next tile to finish loading
+    barrier();
+}
+
+// Compute last tile
+compute_tile();
+----
+
+メモリレイテンシを計算の裏に隠し、全体スループットを改善します。
+
+== 行列演算のディスパッチ
+
+Vulkan アプリケーションからタイル化行列乗算をディスパッチする方法は次のとおりです。
+
+[source,cpp]
+----
+// Assuming matrices are M x K, K x N, producing M x N output
+uint32_t M = 1024, K = 1024, N = 1024;
+const uint32_t TILE_SIZE = 16;
+
+// Calculate work group counts
+uint32_t num_groups_x = (N + TILE_SIZE - 1) / TILE_SIZE;
+uint32_t num_groups_y = (M + TILE_SIZE - 1) / TILE_SIZE;
+
+// Update descriptor sets with matrix buffers
+// ... (similar to previous examples)
+
+// Record commands
+commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *gemmPipeline);
+commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 *pipelineLayout, 0, *descriptorSet, nullptr);
+
+// Push constants
+struct {
+    uint32_t M, K, N;
+} pushConstants = {M, K, N};
+
+commandBuffer.pushConstants(*pipelineLayout,
+                           vk::ShaderStageFlagBits::eCompute, 0, sizeof(pushConstants), &pushConstants);
+
+// Dispatch
+commandBuffer.dispatch(num_groups_x, num_groups_y, 1);
+----
+
+要点は出力次元とタイルサイズに基づくワークグループ数の計算です。
+
+== 性能上の考慮
+
+行列演算は複雑で、性能は多くの要因に依存します。
+
+*行列サイズ*: 小行列（< 256×256）は GPU を十分に活用できないことがあります。大行列（> 4096×4096）はより良い並列性を提供します。
+
+*メモリレイアウト*: 行優先対列優先はアクセスパターンに影響します。coalesce のためレイアウトとアクセスパターンを一致させてください。
+
+*データ型*: Float16（半精度）は専用ハードウェアを持つ GPU では float32 の 2 倍速になることがあり、多くのモデルでは精度損失は最小です。
+
+*バッチ処理*: 複数の行列乗算を並列処理（バッチ）すると GPU 利用が改善します。
+
+*専用ハードウェア*: 最新 GPU には tensor core や行列エンジンがあり、行列乗算を加速します。ベンダー固有拡張の利用で 5–10 倍の speedup が得られることがあります。
+
+== まとめ
+
+行列演算はニューラルネットワークの計算の核心です。要点:
+
+*行列–ベクトル乗算* は全結合レイヤの基盤です。共有メモリで冗長なベクトル読み取りを排除して最適化します。
+
+*行列–行列乗算*（GEMM）はより複雑ですが同様の原則に従います。共有メモリによるタイル化が性能に不可欠で、メモリトラフィックを 10–20 倍削減します。
+
+*タイルサイズ* は性能に影響します。16×16 が良いデフォルトですが、ハードウェア向けに異なるサイズをプロファイルしてください。
+
+*ベクトル化、レジスタブロッキング、プリフェッチ* などの高度な最適化は追加 speedup を提供しますが、複雑さも増します。
+
+*メモリレイアウト* とアクセスパターンが重要です。coalesced アクセスを確保し、データ再利用の機会を考慮してください。
+
+効率的な行列演算を実装すれば、ニューラルネットワーク推論の計算基盤が揃います。次章ではデータ管理——テンソルデータを効率的に整理・転送する方法——を扱います。
+
+xref:ML_Inference/Vulkan_Compute_for_ML/03_element_wise_operations.adoc[前へ: 要素ごと演算] | xref:ML_Inference/Vulkan_Compute_for_ML/05_data_management.adoc[次へ: データ管理]

@@ -1,0 +1,339 @@
+:pp: {plus}{plus}
+
+= 付録：
+
+== 詳細なアーキテクチャ パターン
+
+この付録では、最新のレンダリングとゲーム エンジンで使用される一般的なアーキテクチャ パターンに関する詳細な情報を提供します。これらのパターンは、メインのエンジンアーキテクチャ セクションで参照されており、メイン チュートリアルではコンポーネントベースのアーキテクチャに重点が置かれています。
+
+[[階層構造]]
+=== 階層化されたアーキテクチャ
+
+最も基本的なアーキテクチャ パターンの 1 つは階層化アーキテクチャです。このアーキテクチャでは、システムが個別の層に分割され、それぞれが特定の責任を負います。
+
+image::../../../images/layered_architecture_diagram.png[Layered Architecture Diagram, width=600]
+
+==== レンダリング エンジンの一般的なレイヤー
+
+1. *プラットフォーム抽象化レイヤー* - プラットフォーム固有の機能への一貫したインターフェイスを提供します。
+2. *リソース管理レイヤー* - 資産のロード、キャッシュ、アンロードを管理します。
+3. *レンダリング レイヤー* - レンダリングパイプライン、シェーダー、グラフィックス API の対話を処理します。
+4. *シーン管理レイヤー* - シーン グラフ、空間分割、およびカリングを管理します。
+5. *アプリケーション層* - ユーザー入力、ゲーム ロジック、および高レベルのアプリケーション フローを処理します。
+
+==== 階層化アーキテクチャの利点
+
+* 懸念事項の明確な分離
+* 理解と保守が容易になる
+* 他のレイヤーに影響を与えることなく、個々のレイヤーを置換または変更できます
+* 個々のレイヤーのテストを容易にする
+
+==== 実装例
+
+[source,cpp]
+----
+// Platform Abstraction Layer
+class Platform {
+public:
+    virtual void Initialize() = 0;
+    virtual void* CreateWindow(int width, int height) = 0;
+    virtual void ProcessEvents() = 0;
+    // ...
+};
+
+// Resource Management Layer
+class ResourceManager {
+public:
+    virtual Texture* LoadTexture(const std::string& path) = 0;
+    virtual Mesh* LoadMesh(const std::string& path) = 0;
+    // ...
+};
+
+// Rendering Layer
+class Renderer {
+public:
+    virtual void Initialize(Platform* platform) = 0;
+    virtual void RenderScene(Scene* scene) = 0;
+    // ...
+};
+
+// Scene Management Layer
+class SceneManager {
+public:
+    virtual void AddEntity(Entity* entity) = 0;
+    virtual void UpdateScene(float deltaTime) = 0;
+    // ...
+};
+
+// Application Layer
+class Application {
+private:
+    Platform* platform;
+    ResourceManager* resourceManager;
+    Renderer* renderer;
+    SceneManager* sceneManager;
+
+public:
+    void Run() {
+        platform->Initialize();
+        renderer->Initialize(platform);
+
+        // Main loop
+        while (running) {
+            platform->ProcessEvents();
+            sceneManager->UpdateScene(deltaTime);
+            renderer->RenderScene(sceneManager->GetActiveScene());
+        }
+    }
+};
+----
+
+[[データ指向設計]]
+=== データ指向の設計
+
+データ指向設計 (DOD) は、オブジェクトを中心にコードを編成するのではなく、効率的に処理できるようにデータを編成することに重点を置いています。
+
+image::../../../images/data_oriented_design_diagram.svg[Data-Oriented Design Diagram, width=600]
+
+==== 主要な概念
+
+1. *データ レイアウト* - キャッシュに適したアクセス パターンに合わせてデータを整理します。
+2. *システム* - 多くの場合 SIMD 命令を使用して、データを一括処理します。
+3. *Entity-Component-System (ECS)* - DOD 原則の一般的な実装。
+
+==== データ指向設計の利点
+
+* キャッシュ使用率の向上
+* より効率的なメモリ使用
+* 並列化が容易になる
+* 大幅なパフォーマンスの向上につながる可能性があります
+
+==== 実装例
+
+[source,cpp]
+----
+// A simple ECS implementation
+struct TransformData {
+    std::vector<glm::vec3> positions;
+    std::vector<glm::quat> rotations;
+    std::vector<glm::vec3> scales;
+};
+
+struct RenderData {
+    std::vector<Mesh*> meshes;
+    std::vector<Material*> materials;
+};
+
+class TransformSystem {
+private:
+    TransformData& transformData;
+
+public:
+    TransformSystem(TransformData& data) : transformData(data) {}
+
+    void Update(float deltaTime) {
+        // Process all transforms in bulk
+        for (size_t i = 0; i < transformData.positions.size(); ++i) {
+            // Update transforms
+        }
+    }
+};
+
+class RenderSystem {
+private:
+    RenderData& renderData;
+    TransformData& transformData;
+
+public:
+    RenderSystem(RenderData& rData, TransformData& tData)
+        : renderData(rData), transformData(tData) {}
+
+    void Render() {
+        // Render all entities in bulk
+        for (size_t i = 0; i < renderData.meshes.size(); ++i) {
+            // Render mesh with transform
+        }
+    }
+};
+----
+
+[[サービスロケーターパターン]]
+=== サービス ロケーター パターン
+
+Service Locator パターンは、コンシューマを具体的な実装に結び付けることなく、サービスへのグローバル アクセス ポイントを提供します。
+
+image::../../../images/service_locator_pattern_diagram.svg[Service Locator Pattern Diagram, width=600]
+
+==== 主要な概念
+
+1. *サービス インターフェイス* - サービスのコントラクトを定義します。
+2. *サービス プロバイダー* - サービス インターフェイスを実装します。
+3. *サービス ロケーター* - サービスへのアクセスを提供します。
+
+==== サービス ロケーター パターンの利点
+
+* サービス利用者をサービスプロバイダーから切り離す
+* 簡単なサービスの置き換えが可能
+* 模擬サービスによるテストを容易にする
+
+==== 実装例
+
+[source,cpp]
+----
+// Audio service interface
+class IAudioService {
+public:
+    virtual ~IAudioService() = default;
+    virtual void PlaySound(const std::string& soundName) = 0;
+    virtual void StopSound(const std::string& soundName) = 0;
+};
+
+// Concrete audio service
+class OpenALAudioService : public IAudioService {
+public:
+    void PlaySound(const std::string& soundName) override {
+        // Implementation using OpenAL
+    }
+
+    void StopSound(const std::string& soundName) override {
+        // Implementation using OpenAL
+    }
+};
+
+// Service locator
+class ServiceLocator {
+private:
+    static IAudioService* audioService;
+    static IAudioService nullAudioService; // Default null service
+
+public:
+    static void Initialize() {
+        audioService = &nullAudioService;
+    }
+
+    static IAudioService& GetAudioService() {
+        return *audioService;
+    }
+
+    static void ProvideAudioService(IAudioService* service) {
+        if (service == nullptr) {
+            audioService = &nullAudioService;
+        } else {
+            audioService = service;
+        }
+    }
+};
+
+// Usage example
+void PlayGameSound() {
+    ServiceLocator::GetAudioService().PlaySound("explosion");
+}
+----
+
+=== アーキテクチャパターンの比較分析
+
+以下は、この付録で説明するアーキテクチャ パターンの比較分析です。
+
+|===
+|パターン |強み |弱点 |最適な用途
+
+|階層化されたアーキテクチャ
+あ| * 懸念事項を明確に分離
+* わかりやすい
+※初心者にも優しい
+あ| *「層の肥大化」を引き起こす可能性があります
+* 不必要な間接的な説明が含まれる可能性があります
+* レイヤートラバーサルによるパフォーマンスのオーバーヘッドの可能性
+あ| * 小型エンジン
+* 教育プロジェクト
+* パフォーマンスよりも鮮明さが重要な場合
+
+|コンポーネントベースのアーキテクチャ
+あ| * 柔軟性が高くモジュール式
+* コードの再利用を促進します
+* 深い継承階層を回避します
+* 新機能による拡張が容易になりました
+あ| * 最初に実装するのはより複雑です
+* デバッグが難しくなる可能性があります
+* コンポーネントの検索による潜在的なパフォーマンスのオーバーヘッド
+あ| * 最新のレンダリング エンジン
+* 多様なオブジェクトタイプを持つシステム
+* 頻繁に延長が必要なプロジェクト
+
+|データ指向の設計
+あ| *優れたパフォーマンス
+* キャッシュフレンドリーなメモリアクセス
+* 並列処理に適しています
+あ| * OOP よりも直感的ではありません
+* 急峻な学習曲線
+* コードが読みにくくなる可能性があります
+あ| * パフォーマンスが重要なシステム
+* モバイルプラットフォーム
+* 大量の同様のデータを処理するシステム
+
+|サービス ロケーター パターン
+あ| * サービスプロバイダーを消費者から切り離す
+* テストを容易にする
+* ランタイムサービスのスワップが可能
+あ| * 依存関係を非表示にすることができます
+* 実行時エラーの可能性
+* 世界情勢への懸念
+あ| * 横断的な懸念事項
+* ランタイム設定が必要なシステム
+* 疎結合が重要な場合
+|===
+
+== 高度なレンダリング技術
+
+このセクションでは、最新のレンダリング エンジンで一般的に使用される高度なレンダリング技術の概要を説明します。より包括的な情報については、次の優れたリソースを参照してください。
+
+* *物理ベースのレンダリング: 理論から実装まで* - https://www.pbr-book.org/
+* *リアルタイム レンダリング* - https://www.realtimerendering.com/
+* *GPU Gems* シリーズ - https://developer.nvidia.com/gpugems/gpugems/contributors
+
+=== 遅延レンダリング
+
+遅延レンダリングでは、ジオメトリとライティングの計算が個別のパスに分割されるため、ライトが多いシーンではより効率的になります。
+
+1. *ジオメトリ パス* - シーン ジオメトリを G バッファ テクスチャ (位置、法線、アルベドなど) にレンダリングします。
+2. *ライティング パス* - G バッファ テクスチャを使用してライティング計算を適用します。
+
+=== フォワード+レンダリング
+
+Forward+ (またはタイル化された前方) レンダリングは、前方レンダリングのシンプルさと遅延レンダリングの効率上の利点を組み合わせたものです。
+
+1. *ライト カリング パス* - 画面をタイルに分割し、どのライトが各タイルに影響を与えるかを決定します。
+2. *フォワード レンダリング パス* - 各タイルに影響を与えるライトのみを使用してシーン ジオメトリをレンダリングします。
+
+=== 物理ベースのレンダリング (PBR)
+
+PBR は、光が現実世界の表面とどのように相互作用するかをシミュレートすることにより、より現実的なマテリアルを作成することを目的としています。
+
+1. *マテリアル パラメータ* - 物理的に意味のあるパラメータ (アルベド、金属性、粗さなど) を使用してマテリアルを定義します。
+2. *BRDF* - 物理ベースの双方向反射率分布関数を使用します。
+3. *イメージベースの照明* - 環境照明に環境マップを使用します。
+
+=== 高度なカメラ技術
+
+このセクションでは、3D アプリケーションで高度なカメラシステムを実装するための高度なテクニックについて説明します。
+
+* *カメラ衝突*: カメラが壁を通過しないように衝突ボリュームを実装します。
+* *コンテキストアウェアな位置決め*: 環境に基づいてカメラの位置を調整します (例: 広いオープンエリアではズームアウト、狭いスペースではズームイン)
+* *インテリジェント フレーミング*: キャラクターと重要なオブジェクトの両方がフレーム内に収まるようにカメラを調整します。
+* *予測追従*: キャラクターの動きを予測してカメラのラグを軽減します。
+* *カメラ障害物の透明度*: ビューを妨げるオブジェクトを部分的に透明にします。
+* *動的視野*: 移動速度または環境コンテキストに基づいて FOV を調整します。
+
+== 結論
+
+これらのアーキテクチャ パターンとレンダリング技術は、レンダリング エンジンを設計するための基盤となります。実際には、ほとんどのエンジンはこれらのパターンを組み合わせて使用​​して、システムのさまざまな側面に対処します。
+
+エンジンアーキテクチャを設計するときは、次の点を考慮してください。
+
+1. *パフォーマンス要件* - パターンが異なれば、パフォーマンス特性も異なります。
+2. *柔軟性のニーズ* - 将来の拡張にはどの程度の柔軟性が必要ですか?
+3. *チームの規模と経験* - より複雑なアーキテクチャは、小規模なチームにとって作業が困難になる可能性があります。
+4. *プロジェクトの範囲* - 小規模なプロジェクトでは、完全な ECS のような複雑さは必要ない場合があります。
+
+xref:Building_a_Simple_Engine/Engine_Architecture/02_architectural_patterns.adoc[アーキテクチャパターンに戻る]
+xref:Building_a_Simple_Engine/Engine_Architecture/05_rendering_pipeline.adoc[レンダリングパイプラインに戻る]

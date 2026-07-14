@@ -1,0 +1,15 @@
+:pp: {plus}{plus}
+
+= モバイル開発
+
+
+この章では、Vulkan エンジンをモバイルプラットフォーム向けに適応させる本質的な側面を扱います。Android と iOS 開発、パフォーマンス最適化、レンダリング手法、モバイル固有の Vulkan 拡張に焦点を当てます。
+
+* xref:Building_a_Simple_Engine/Mobile_Development/01_introduction.adoc[はじめに]
+* xref:Building_a_Simple_Engine/Mobile_Development/02_platform_considerations.adoc[Android と iOS のプラットフォーム考慮事項]
+* xref:Building_a_Simple_Engine/Mobile_Development/03_performance_optimizations.adoc[モバイル向けパフォーマンス最適化]
+* xref:Building_a_Simple_Engine/Mobile_Development/04_rendering_approaches.adoc[レンダリング手法: TBR 対 IMR]
+* xref:Building_a_Simple_Engine/Mobile_Development/05_vulkan_extensions.adoc[モバイル向け Vulkan 拡張]
+* xref:Building_a_Simple_Engine/Mobile_Development/06_conclusion.adoc[まとめ]
+
+xref:Building_a_Simple_Engine/Tooling/07_conclusion.adoc[前へ: ツーリングのまとめ] | xref:../index.adoc[シンプルなエンジンの構築へ戻る]

@@ -1,0 +1,76 @@
+:pp: {plus}{plus}
+= ML 推論のエンジンへの組み込み
+
+**ML 推論** を統合すると、`simple_game_engine` は高レベルの空間洗練を行えます。最大スループットのため **Cooperative Matrices** を利用する専用コンピュートパスを `Renderer` に追加して実装します。*現時点では、実装は読者への演習として残されています。*
+
+== 推論パスの統合
+
+`renderer_rendering.cpp` では、`Renderer::render()` ループ内に専用ステップを導入します。このパスは最新センサデータを取り込んだ後、オクルージョンや物理にそのデータを使う前に実行されなければなりません。
+
+[source,cpp]
+----
+// renderer_rendering.cpp
+void Renderer::executeSpatialInference(vk::raii::CommandBuffer& cmd, uint32_t frameIndex) {
+    if (!xrMode || !mlEnabled) return;
+
+    // 1. Bind the specialized ML compute pipeline
+    // This pipeline is configured with VK_KHR_cooperative_matrix enabled
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *mlInferencePipeline);
+
+    // 2. Bind descriptors for weights, raw sensor data, and refined output
+    cmd.bindDescriptorSets(
+        vk::PipelineBindPoint::eCompute,
+        *mlPipelineLayout,
+        0,
+        *mlDescriptorSets[frameIndex],
+        nullptr
+    );
+
+    // 3. Dispatch the ML kernel
+    // We dispatch in subgroup-sized tiles (e.g., 16x16 fragments)
+    uint32_t groupsX = (inferenceWidth + 15) / 16;
+    uint32_t groupsY = (inferenceHeight + 15) / 16;
+    cmd.dispatch(groupsX, groupsY, 1);
+
+    // 4. Memory Barrier: Ensure ML results are visible to subsequent vertex/fragment stages
+    vk::MemoryBarrier2 refinementBarrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eVertexAttributeInput |
+                         vk::PipelineStageFlagBits2::eFragmentShader,
+        .dstAccessMask = vk::AccessFlagBits2::eAttributeRead |
+                         vk::AccessFlagBits2::eShaderRead
+    };
+
+    vk::DependencyInfo dependencyInfo{ .memoryBarrierCount = 1, .pMemoryBarriers = &refinementBarrier };
+    cmd.pipelineBarrier2(dependencyInfo);
+}
+----
+
+== エンジンでの ML 重み管理
+
+ニューラルネットの重みは本質的に大きな静的配列です。`resource_manager.cpp` では、これらを特殊なアセット型として扱い、ディスクから `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` 付きの高性能 `vk::raii::Buffer` へ読み込みます。
+
+[source,cpp]
+----
+// resource_manager.cpp
+std::shared_ptr<Buffer> ResourceManager::loadMLWeights(const std::string& path) {
+    auto rawWeights = loadBinaryFile(path);
+
+    // Create a staging buffer and then transfer to GPU-local memory
+    // for optimal cooperative matrix loading speed
+    return createGpuLocalBuffer(
+        rawWeights.size(),
+        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+        rawWeights.data()
+    );
+}
+----
+
+== なぜこれらの変更が必要か？
+
+ML 推論パスを `Renderer` 内に直接置き、**Vulkan 1.3** 同期（Synchronization 2）を使うことで、データが必要になるまさに最後のマイクロ秒で空間洗練が起きることが保証されます。これにより **モーション・ツー・フォトン** ギャップが最小化されます。さらに、重みを標準エンジンリソースとして扱うことで、エンジンを再起動せずに異なる ML モデル（例: 高性能「Mobile」モデルから高忠実度「Desktop」モデルへの切り替え）をホットリロードできます。
+
+この統合により、エンジンは単純なラスタライザから、ユーザーの物理環境を理解し反応できる文脈認識型の空間コンピューティング基盤へと変わります。
+
+xref:OpenXR_Vulkan_Spatial_Computing/17_ML_Inference_Spatial/03_refining_spatial_data.adoc[Previous] | xref:OpenXR_Vulkan_Spatial_Computing/18_Semantic_Occlusion/01_introduction.adoc[Next]

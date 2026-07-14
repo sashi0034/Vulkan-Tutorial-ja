@@ -1,0 +1,79 @@
+:pp: {plus}{plus}
+= キューファミリー所有権: ハンドシェイク
+
+== なぜ所有権を転送するのか
+
+多くの高性能 Vulkan エンジンでは、すべてに単一の「Graphics」キューだけを使いません。バックグラウンドのアセットストリーミング用に専用の **転送キュー** を使ったり、非同期ポストプロセス用に **コンピュートキュー** を使ったりします。しかし、Vulkan リソース（バッファとイメージ）は、`vk::SharingMode::eExclusive` で作成された場合、一般に特定のキューファミリーに「所有」されます。
+
+イメージを転送キュー（アップロードしたばかり）からグラフィックスキュー（描画したい）へ移したい場合、明示的な **キューファミリー所有権転送** を行わなければなりません。これは、ソースキューでのリリース操作と宛先キューでのアクワイア操作からなる二段階の「ハンドシェイク」です。
+
+== リリースとアクワイアのハンドシェイク
+
+転送は、両方のキューでパイプラインバリアを記録することで行われます。重要なのは、両方のバリアがソースと宛先のキューファミリーインデックスを指定しなければならないことです。
+
+=== 1. リリース操作（ソースキュー）
+
+リソースを現在所有しているキューで、「リリース」するバリアを記録します。`srcQueueFamilyIndex` は現在のキュー、`dstQueueFamilyIndex` は送る先のキューです。
+
+[,cpp]
+----
+auto releaseBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+    .dstStageMask = vk::PipelineStageFlagBits2::eNone, // No stage on this queue
+    .dstAccessMask = vk::AccessFlagBits2::eNone,     // No access on this queue
+    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .srcQueueFamilyIndex = transferQueueIndex,
+    .dstQueueFamilyIndex = graphicsQueueIndex,
+    .image = texture.image(),
+    .subresourceRange = subresourceRange
+};
+
+// Record on Transfer Command Buffer
+transferCommandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &releaseBarrier});
+----
+
+=== 2. アクワイア操作（宛先キュー）
+
+ターゲットキューで、リソースを「アクワイア」するバリアを記録します。インデックスは同じままですが、今度は `srcStageMask` と `srcAccessMask` を `eNone` に設定します。それらのステージは別のキューで起きたからです。
+
+[,cpp]
+----
+auto acquireBarrier = vk::ImageMemoryBarrier2{
+    .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+    .srcAccessMask = vk::AccessFlagBits2::eNone,
+    .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+    .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    .srcQueueFamilyIndex = transferQueueIndex,
+    .dstQueueFamilyIndex = graphicsQueueIndex,
+    .image = texture.image(),
+    .subresourceRange = subresourceRange
+};
+
+// Record on Graphics Command Buffer
+graphicsCommandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &acquireBarrier});
+----
+
+== セマフォによるオーケストレーション
+
+バリアの記録は戦いの半分に過ぎません。転送キューがリソースをリリースする前にグラフィックスキューがアクワイアしようとしないことも保証する必要があります。これは通常 **セマフォ** で扱います。転送キューはコマンドバッファ完了時にセマフォをシグナルし、グラフィックスキューは自身のアクワイアバリアを実行する前に同じセマフォを待ちます。
+
+このハンドシェイクは Vulkan 同期のより複雑な部分の一つですが、マルチスレッドでノンブロッキングなエンジンアーキテクチャを築くには不可欠です。モダン Vulkan では、このオーケストレーションに **タイムラインセマフォ** を好みます。単純な単調カウンタで進捗を追跡できるからです。詳細は次の章で扱います。
+
+== Simple Engine: リソースの引き渡し
+
+`Simple Engine` では、主要なバッファとイメージの作成時に可能な限り `vk::SharingMode::eConcurrent` を使い、所有権転送の複雑さを避けます。ハードウェアが対応していれば、明示的な「リリース／アクワイア」バリアなしに、複数のキューファミリー（`transferQueue` と `graphicsQueue` など）が同じメモリに同時にアクセスできます。
+
+[WARNING]
+====
+`eConcurrent` は便利ですが、**イメージ** に使うと、明示的な所有権転送付きの `eExclusive` と比べ、一部のハードウェア実装では性能が落ちることがあります。バッファでは影響は一般に無視できますが、高性能なイメージ処理では「ハンドシェイク」がしばしば好まれます。
+====
+
+ただし、`eConcurrent` でも、それらのキューの *実行* は依然として同期する必要があります。`Simple Engine` では、専用の **転送セマフォ** を使い、転送キューの作業が終わるまでグラフィックスキューがテクスチャのサンプリングを始めないようにしています。これは `Renderer::ProcessPendingMeshUploads` 呼び出しの中で扱われ、次のフレームが始まる前にすべてのバックグラウンドアップロードがグラフィックスハードウェアから正しく「見える」ようにしています。
+
+== ナビゲーション
+
+前へ: xref:Synchronization/Pipeline_Barriers_Transitions/02_image_barrier.adoc[イメージバリア] | 次へ: xref:Synchronization/Pipeline_Barriers_Transitions/04_global_vs_local_barriers.adoc[グローバルバリアとローカルバリア]

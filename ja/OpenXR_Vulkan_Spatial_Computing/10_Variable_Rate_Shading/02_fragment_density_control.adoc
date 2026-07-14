@@ -1,0 +1,56 @@
+:pp: {plus}{plus}
+= フラグメント密度制御と VRS
+
+Variable Rate Shading（VRS）は、シェーディングレートをラスタライズレートから切り離すことで、幾何的シャープネスを維持しつつシェーディングコストを削減できます。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準を超えて**。
+
+Vulkan はフォビエイテッドシェーディングに必要な強力な VRS 拡張を提供しますが、OpenXR 標準はまだその使用を必須としておらず、シェーディングレートマップの生成も調整しません。標準ランタイムの期待を超えてエンジン性能を押し上げるため、Vulkan でこれらの最適化を実装します。
+
+== 概念: ラスタライズとシェーディングの分離
+
+レガシーパイプラインでは、シェーディング品質を下げることはしばしば低解像度バッファへ描画してアップスケールすることを意味し、ぼけを導入しました。現代の Vulkan は **Variable Rate Shading（VRS）** 経由ではるかに優雅な解決策を提供します。
+
+1.  **ラスタライズ**: どのピクセルが三角形に覆われるかを決定する。
+2.  **シェーディング**: それらのピクセルの色を決めるためフラグメントシェーダーを実行する。
+
+**VRS** では、ラスタライザからの高解像度エッジと深度データを保ちつつ、ピクセルの *群*（例: 2x2 または 4x4 ブロック）に対して一つのフラグメントシェーダーを実行できます。これにより **幾何的シャープネス** を維持しつつ、複雑なライティングの **ALU** コストを大幅に削減します。
+
+== シェーディングレートイメージ: 密度マップ
+
+空間パイプラインでは **Shading Rate Image** を使います。これは低解像度のアタッチメントで、各「ピクセル」が画面のタイル（例: 8x8 または 16x16）を表します。
+
+[source,cpp]
+----
+// Configuring the shading rate state using designated initializers
+vk::PipelineFragmentShadingRateStateCreateInfoKHR shadingRateState{
+    .fragmentSize = {1, 1}, // Default fallback
+    .combinerOps = {
+        vk::FragmentShadingRateCombinerOpKHR::eReplace, // Use the image's rate
+        vk::FragmentShadingRateCombinerOpKHR::eKeep
+    }
+};
+
+vk::GraphicsPipelineCreateInfo pipelineInfo{
+    .pNext = &shadingRateState
+};
+----
+
+ランタイムはハードウェアがサポートするタイルサイズをチェックし、密度マップがこれらの制限に一致することを保証します。リプロジェクション中に密度マップを「ワープ」し、高解像度の「スイートスポット」がレンズ光学に揃ったままにすることさえあります。
+
+== 発展: 時間的安定性と非同期コンピュート
+
+Vulkan では OpenXR 標準を超えて VRS を押し進められます。
+
+*   **時間的シェーディング安定性**: コンピュートシェーダーで Vulkan の **サブグループ演算** を使い、前フレームの深度とモーションベクトルを解析し、周辺の「シマー」アーティファクトを防ぐ洗練された密度マップを生成できます。
+*   **非同期コンピュート調整**: プライマリグラフィックスパスのシェーディングレートマップを尊重する重いコンピュート作業を Vulkan で行い、ボリューメトリックやライティング計算がジオメトリと並んで最適化されることを保証できます。
+
+== 固定ビネットシェーディング
+
+XR レンズは端で自然によりぼけ、より歪むため、「ビネット」マップを事前計算できます。レンズ中心は 1x1、外側のリングは 2x2 または 4x4 に設定します。ユーザーが極端な端を見ることは稀なので、これは本質的に「無料の性能」です。
+
+TIP: VRS と密度マップの詳細は、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#primsrast-fragment-shading-rate[Vulkan Specification on VRS]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/10_Variable_Rate_Shading/01_introduction.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/10_Variable_Rate_Shading/03_gaze_driven_logic.adoc[次へ]

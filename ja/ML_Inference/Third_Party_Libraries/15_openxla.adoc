@@ -1,0 +1,53 @@
+:pp: {plus}{plus}
+
+= OpenXLA: XLA、StableHLO、そして Vulkan の位置づけ
+
+== 概要
+
+OpenXLA は、XLA、StableHLO、および関連プロジェクト（IREE を含む）を束ねる傘であり、これらが一体となって現代的でオープンな ML コンパイラスタックを形成します。StableHLO は多くのフレームワークがエクスポートできる標準化された IR であり（JAX と TensorFlow が最も直接的です）、XLA は CPU および GPU バックエンドへの成熟した lowering を提供します。Vulkan には通常 IREE 経由で到達します。IREE は StableHLO/MLIR を消費し、SPIR‑V を出力します。
+
+このページがある理由: IREE の章では StableHLO と XLA に早く触れます。本章は短い章ですが、それらの用語が業界内部の話に聞こえないよう、メンタルモデルを与えます。
+
+== どう考えるか
+
+モデルをエクスポートしたあとに話す言語として StableHLO を捉えてください。その共通言語から、ターゲット向けの下流コンパイラを選びます。Vulkan を目指すなら、IREE を使って StableHLO を SPIR‑V に lower し、Vulkan のディスパッチを記録する小さなランタイムを同梱します。CUDA/ROCm/CPU をターゲットにするなら、XLA のバックエンド（または他の下流）に留まり、Vulkan には触れません。
+
+この分離が有用なのは、学習チームが StableHLO の生成に標準化でき、デプロイチームは学習側のエクスポートを変えずにプラットフォームごとに適切な下流を選べるからです。
+
+実務上の注意: 現状、StableHLO のエクスポートは JAX と TensorFlow からが最も素直です。他のエコシステムでは変換の一手間が必要な場合があります。最終ターゲットが Vulkan なら、本チュートリアルで十分にサポートされた経路に留まるため、StableHLO → IREE を優先してください。
+
+== 小さな実務ワークフロー（Vulkan の場合）
+
+学習から StableHLO へエクスポート（または変換）し、`--iree-hal-target-backends=vulkan` で IREE を使って Vulkan 向けにコンパイルし、アプリ内で IREE のランタイム経由で `.vmfb` を読み込みます。完全なステップバイステップ版は xref:ML_Inference/Third_Party_Libraries/12_iree.adoc[IREE] にあります。
+
+チームがすでに学習で XLA を使っている場合、Vulkan をターゲットにするときは StableHLO/IREE 経路が摩擦を最小化します。
+
+== 制約と期待値
+
+OpenXLA/XLA 自体は、Vulkan バイナリをそのまま出荷するような形では Vulkan を直接ターゲットにしません。Vulkan は IREE の第一級ターゲットです。メンタルモデルを明確に保ってください: 本チュートリアルでは StableHLO → IREE → SPIR‑V（Vulkan）です。
+
+== IREE 出力を Vulkan アプリに組み込む
+
+IREE はモデルを成果物（一般的には `.vmfb` バイトコード、または事前コンパイルされたモジュール）にコンパイルし、IREE ランタイム経由で実行します。Vulkan アプリケーションでは、他のモデルランタイム（例: ONNX Runtime や TFLite）を使うのと同じ感覚です。
+
+- ランタイムを初期化し、Vulkan HAL バックエンドを選択する
+- コンパイル済み成果物を読み込む
+- 入出力バッファを作成する（通常はランタイムのヘルパー経由）
+- 名前で関数を呼び出し、結果を読み戻す
+
+つまり、アプリと並べて IREE のランタイムライブラリを埋め込み、SPIR‑V モジュール、ディスクリプタセット、ディスパッチのスケジューリングはランタイムに任せます。
+
+=== 「IREE のランタイムなしでコンパイル済みモデルを統合できるか？」
+
+概念的には、IREE は SPIR‑V カーネルとホスト側のスケジューリング論理に lower します。ただし、成果物とランタイムは「差し込み可能な SPIR‑V + スタンドアロンホストコード」として公開されていない ABI を共有します。カーネルを取り出し、自前の Vulkan エンジン内でホスト側スケジューリングを再実装することは理論上は可能ですが、現状はサポートされた／安定した経路ではありません——内部詳細に依存し、ランタイムの大部分（ディスクリプタ管理、プッシュ定数、同期、パイプラインなど）を再現する必要があります。
+
+本チュートリアルでの実務的な指針:
+
+- IREE を、ONNX Runtime や TFLite をリンクするのと同じようにリンクして呼び出すランタイムとして扱ってください。xref:ML_Inference/Third_Party_Libraries/12_iree.adoc[IREE の章] に最小限の埋め込み例があります。
+- アプリがより密な相互運用（例: VkDevice やメモリの共有）を必要とする場合は、完全に迂回しようとするのではなく、ランタイムがサポートするフックを探してください。
+
+== NNEF 相互運用
+
+ソースが NNEF の場合は、まず ONNX または StableHLO に変換します。StableHLO から、IREE の流れに従って Vulkan に到達します。これによりパイプラインが単純で再現可能になります。
+
+xref:ML_Inference/Third_Party_Libraries/14_mojo_max.adoc[前へ: Mojo / MAX] | xref:ML_Inference/Third_Party_Libraries/16_choosing_compiler.adoc[次へ: 適切なコンパイラの選択]

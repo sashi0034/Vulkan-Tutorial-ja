@@ -1,0 +1,97 @@
+:pp: {plus}{plus}
+
+= インダイレクトディスパッチ: GPU 上でパラメータを構築する
+
+== GPU 自律の核心
+
+伝統的なコンピュートパイプラインでは、CPU が `vkCmdDispatch(x, y, z)` を呼びます。`x, y, z` の値は、コマンドバッファが記録された瞬間に固定されます。
+
+しかし必要なワークグループ数が、前のコンピュートシェーダの結果に依存したらどうでしょう。たとえばオブジェクトのリストをカリングしている場合、何個が生き残ったかを知るのは GPU だけです。
+
+**インダイレクトディスパッチ**（`vkCmdDispatchIndirect`）は、コマンドバッファではなく **Vulkan バッファ**（`VkBuffer`）からワークグループ数を読むことでこれを解決します。
+
+== 仕組み
+
+1.  **準備**: `VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT` 付きでバッファを作成する。
+2.  **GPU 更新**: 「カリング」または「分析」コンピュートシェーダを実行する。このシェーダが次のステップに必要なワークグループ数を計算し、その値をインダイレクトバッファへ書く。
+3.  **ディスパッチ**: CPU が `vkCmdDispatchIndirect(myIndirectBuffer, offset)` の呼び出しを記録する。
+
+[source,cpp]
+----
+// インダイレクトバッファ内のデータのレイアウト（vk::DispatchIndirectCommand に一致）
+struct IndirectCommand {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+};
+----
+
+== シェーダからのインダイレクトコマンドの書き込み
+
+これを使うには、コンピュートシェーダ（「プロデューサ」）が `VkDispatchIndirectCommand` レイアウトに一致するバッファへ書かなければなりません。
+
+[source,slang]
+----
+// Slang 例: ディスパッチ数の書き込み
+struct IndirectCommand {
+    uint3 x;
+};
+
+[[vk::binding(0, 0)]]
+RWStructuredBuffer<IndirectCommand> cmdBuffer;
+
+[numthreads(1, 1, 1)]
+void main() {
+    uint numWorkgroups = calculateRequiredWorkgroups();
+    cmdBuffer[0].x = uint3(numWorkgroups, 1, 1);
+}
+----
+
+=== GLSL: 手動バッファレイアウト
+
+GLSL では、期待される構造に一致する `buffer` ブロックを定義します。GPU が正しいオフセットで値を読むよう、正しい整列（`std430`）を使うことが重要です。
+
+[source,glsl]
+----
+layout(std430, binding = 0) buffer IndirectBuffer {
+    uint x;
+    uint y;
+    uint z;
+} cmd;
+
+void main() {
+    uint numWorkgroups = calculateRequiredWorkgroups();
+    cmd.x = numWorkgroups;
+    cmd.y = 1;
+    cmd.z = 1;
+}
+----
+
+ここでの「勝利」は、同じバッファを `vkCmdDispatchIndirect` 呼び出しで使うことで、CPU 介入なしに GPU が自身のワークロードサイズを自律的に決められることです。
+
+== 同期が鍵
+
+GPU が後で読むバッファへ書いているため、書き込みが完了し、インダイレクトディスパッチハードウェアに**可視**であることを保証しなければなりません。
+
+これには次の設定を持つ **Vulkan バリア** が必要です。
+
+*   `srcStage`: `VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT`
+*   `dstStage`: `VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT`
+*   `srcAccess`: `VK_ACCESS_SHADER_WRITE_BIT`
+*   `dstAccess`: `VK_ACCESS_INDIRECT_COMMAND_READ_BIT`
+
+このバリアを省略すると、GPU が「ゴミ」や古いデータを読み、不正なディスパッチやデバイスクラッシュにつながります。
+
+== 実践例: 可変サイズワークロード
+
+パーティクルが毎フレーム死んだり生まれたりするパーティクルシステムを想像してください。
+
+1.  **ディスパッチ 1（カリング）**: コンピュートシェーダがすべてのパーティクルを反復し、生きているものを計算し、その ID を「ライブ」バッファに格納する。アトミックカウンタもインクリメントする。
+2.  **バリア**: カリングの完了を待ち、カウンタをインダイレクトハードウェアに可視にする。
+3.  **ディスパッチ 2（更新）**: `vkCmdDispatchIndirect` を呼ぶ。GPU がカウンタを読み、生きているパーティクルだけを更新するのにちょうど十分なワークグループをディスパッチする。
+
+これは常に「最大」パーティクル数向けにディスパッチする（何千ものアイドルスレッドを生む）よりはるかに効率的です。
+
+次のセクションでは、GPU がディスパッチサイズを変えるだけを超え、自身の **コマンドチェーン** の生成を始める方法を見ます。
+
+xref:Advanced_Vulkan_Compute/07_GPU_Driven_Pipelines/01_introduction.adoc[前へ: GPU 駆動パイプライン入門] | xref:Advanced_Vulkan_Compute/07_GPU_Driven_Pipelines/03_gpu_side_command_generation.adoc[次へ: GPU 側コマンド生成]

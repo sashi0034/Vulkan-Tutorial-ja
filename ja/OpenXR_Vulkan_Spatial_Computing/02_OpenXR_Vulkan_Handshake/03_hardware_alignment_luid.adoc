@@ -1,0 +1,73 @@
+:pp: {plus}{plus}
+= ハードウェア整合（LUID）
+
+多くの現代的コンピューティング環境、特にハイエンドのゲーミングデスクトップでは、プロセッサ上の統合 GPU と専用の高性能カードなど、複数 GPU を持つことが一般的です。空間コンピューティングでは、アプリケーションと OpenXR ランタイムの両方がまったく同じ物理ハードウェアを使うことが絶対に重要です。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR ランタイムと Vulkan を使う**。
+
+Vulkan の物理デバイスを XR ランタイムが好むハードウェアと揃えることは、高性能なリソース共有を保証する必須ステップです。LUID（Locally Unique Identifier）を使うことで、両システムが同じ物理シリコンと話していることを保証します。
+
+== 「PCIe 税」: なぜ整合が必須か
+
+LUID を気にする理由を理解するには、データ移動のコストを考える必要があります。PCIe バスは CPU、システム RAM、GPU 間の高速道路です。非常に高速ですが、現代 GPU の内部メモリバス（VRAM）よりは依然として桁違いに遅いです。
+
+*   **ディスプレイ発見**: ランタイムは OS（例: Windows では DXGI）と交渉し、ヘッドセットのディスプレイに電気的に接続されている物理 GPU を特定しています。
+*   **クロス GPU コピーの回避**: エンジンが GPU A でフレームを描画し、ヘッドセットが GPU B に接続されていると、OS はそのイメージを **PCIe** バス経由でコピーせざるを得ません。数ミリ秒のレイテンシが加わり——90Hz ヘッドセットではフレーム予算の半分にもなり得ます。
+*   **内部 VRAM 効率**: 同一 GPU 内でのイメージ移動はほぼ瞬間です。アプリケーションを同じ GPU に固定することで、ランタイムはフレームが常に高速 VRAM 内に留まることを保証します。
+
+== LUID とは？
+
+**LUID**（Locally Unique Identifier）は、次回再起動までローカルマシン上で一意であることが保証された 64 ビット値です。マシンをまたいで永続する **UUID** と異なり、LUID は OS が提供する一時的なハードウェアハンドルです。
+
+OpenXR-Vulkan ハンドシェイクの文脈では、LUID は GPU のハードウェア「指紋」として機能します。OpenXR が「私は現在この特定の LUID の GPU と話している」と伝え、私たちは利用可能な `VkPhysicalDevice` ハンドルを走査して一致するものを見つけなければなりません。
+
+== XR デバイスの問い合わせ
+
+`xr::Instance` を初期化した後、ランタイムが使うことを期待する特定のハードウェア識別子を問い合わせられます。これは `xrGetVulkanGraphicsDevice2KHR` を呼んで行います。
+
+[source,cpp]
+----
+VkPhysicalDevice xrRequiredDevice;
+xrGetVulkanGraphicsDevice2KHR(xrInstance, systemId, *instance, &xrRequiredDevice);
+----
+
+ランタイムから生のハンドルを直接取得することもできますが、特にエンジンのアーキテクチャが物理デバイス選択を抽象化している場合や、複数の Vulkan インスタンスがある場合、LUID によるマッチングの方がしばしば堅牢です。
+
+== Vulkan での LUID マッチング
+
+Vulkan 物理デバイスの LUID を見つけるには、`VkPhysicalDeviceIDProperties` 構造体を問い合わせます。`vulkan-hpp` の RAII 世界では、`getProperties2` 呼び出しで構造体をチェーンして取得できます。
+
+[source,cpp]
+----
+// Iterating through physical devices to find a match using vulkan-hpp RAII
+for (const auto& physicalDevice : instance.enumeratePhysicalDevices()) {
+    auto props2 = physicalDevice.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceIDProperties>();
+    const auto& idProps = props2.get<vk::PhysicalDeviceIDProperties>();
+
+    if (idProps.deviceLUIDValid) {
+        // Compare the 8-byte LUID against the target from OpenXR
+        if (std::memcmp(idProps.deviceLUID, targetLUID, VK_LUID_SIZE) == 0) {
+            return physicalDevice;
+        }
+    }
+}
+----
+
+== プロセス間メモリ可視性
+
+LUID は選択のためだけでなく、**プロセス間メモリ可視性** の基盤でもあります。XR ランタイムは通常エンジンと別プロセスに住むため、描画したイメージはプロセス境界を越えて共有されなければなりません。
+
+LUID によるハードウェア選択の整合により、「Wait-Acquire-Release」サイクルが完全にデバイス上で起き、高価な CPU 側同期やシステムメモリコピーなしで済むことが保証されます。
+
+== 発展: マルチ GPU 負荷分散とデバイスグループ
+
+OpenXR セッションは通常ディスプレイに接続された単一 GPU に紐づきますが、Vulkan ではさらに先へ進めます。
+
+*   **Vulkan デバイスグループ**: `VK_KHR_device_group` を使い、複数 GPU を単一の論理デバイスとして扱えます。副次 GPU を重いコンピュート（物理やシーン分解など）に使い、結果を主 GPU で集約してから最終フレームを XR コンポジタに渡せます。
+*   **ハードウェア変更への対応**: ハードウェア構成が変わった場合（例: 外付け GPU の切断）、Vulkan のハードウェア抽象を使って変更を検出し、クリーンなエンジン再起動をユーザーに促し、ハードウェア LUID ハンドシェイクが有効なままであることを保証できます。
+
+TIP: ハードウェア整合の詳細は、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#VkPhysicalDeviceIDProperties[Vulkan Specification on Device IDs]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/02_OpenXR_Vulkan_Handshake/02_system_integration.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/02_OpenXR_Vulkan_Handshake/04_vulkan_1_3_feature_requirements.adoc[次へ]

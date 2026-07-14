@@ -1,0 +1,477 @@
+:pp: {plus}{plus}
+
+= 同期
+
+== 導入
+
+ニューラルネットワークは依存する操作の列です。レイヤ 2 はレイヤ 1 が完了するまで始められません。レイヤ 5 はレイヤ 4 がまだ書き込んでいるバッファから読めません。根本的な課題は、これらの依存を強制しつつ、可能な限り並列性を許すことです。
+
+Vulkan は同期を明示的に制御できます。強力であると同時に危険でもあります。同期が不足するとレース条件——書き込み前にデータを読むなど——が起き、不正な結果になります。同期が過剰だと実行が直列化され、GPU の並列処理能力を無駄にし、性能を損ないます。
+
+本章では ML 操作を正しくかつ効率的に同期する方法を探ります。Vulkan の同期プリミティブ、逐次・並列操作のパターン、ニューラルネットワーク推論における依存管理の実践技法を扱います。
+
+== 問題の理解
+
+Vulkan の同期メカニズムに入る前に、何を解決しようとしているかを理解しましょう。
+
+=== ニューラルネットワークにおける依存
+
+単純な 3 レイヤネットワークを考えます。
+
+[source]
+----
+Input → Layer 1 (Conv) → Layer 2 (ReLU) → Layer 3 (Pool) → Output
+----
+
+依存は明確です。
+
+- レイヤ 2 はレイヤ 1 の出力に依存
+- レイヤ 3 はレイヤ 2 の出力に依存
+- 各レイヤは次が始まる前に完了する必要がある
+
+これは *逐次依存チェーン* です。適切な同期がなければ、レイヤ 2 がレイヤ 1 の出力バッファへの書き込み完了前に読み始める可能性があります。結果は？ゴミデータ、不正な予測、何時間ものデバッグです。
+
+=== 並列分岐
+
+現代のネットワークは常に逐次ではありません。残差ネットワーク（ResNet）ブロックを考えます。
+
+[source]
+----
+Input → Conv1 → Conv2 → Add → Output
+  ↓                        ↑
+  └────────────────────────┘
+----
+
+入力は 2 経路を流れます。Conv1 と Conv2 を通る経路と、Add 操作へ直接行く skip connection です。これらの経路は独立——Conv1 と skip connection は並列実行可能です。ただし Add は両経路の完了に依存します。
+
+これは *同期点を持つ並列分岐* を作ります。Conv1 と skip connection を同時実行したい（GPU 利用を最大化）が、Add が始まる前に両方が完了している必要があります。
+
+=== メモリ再利用
+
+メモリ使用量を最小化するためバッファを再利用します。レイヤ 1 の出力バッファは、レイヤ 2 が完了後レイヤ 1 の出力を不要にすれば、レイヤ 3 の出力に再利用されることがあります。
+
+これは *read-after-write 依存* を作ります。レイヤ 3 はレイヤ 2 の読み取りが終わるまでバッファへの書き込みを始められません。同期がなければ、レイヤ 3 がレイヤ 2 がまだ使っているデータを上書きする可能性があります。
+
+== Vulkan 同期プリミティブ
+
+Vulkan は複数の同期メカニズムを提供します。それぞれを理解し、いつ使うかが不可欠です。
+
+=== パイプラインバリア: workhorse
+
+パイプラインバリアはコンピュートワークロードの主要な同期メカニズムです。パイプラインバリアは「この点より前のすべての操作が、この点より後の操作が始まる前に完了しなければならない」と述べます。
+
+より正確には、パイプラインバリアは次を指定します。
+
+*ソースステージ*: バリアの前に完了すべきパイプラインステージ
+*デスティネーションステージ*: バリアを待つパイプラインステージ
+*メモリバリア*: 可視にすべきメモリアクセス
+
+ML 推論では通常次を使います。
+
+[source,cpp]
+----
+vk::MemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,  // Previous layer wrote
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead    // Next layer reads
+};
+
+commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,  // Source: compute shader finished
+    vk::PipelineStageFlagBits::eComputeShader,  // Dest: compute shader waits
+    {},
+    barrier,
+    nullptr,
+    nullptr
+);
+----
+
+前レイヤのシェーダ書き込みが次レイヤのシェーダ読み取りに可視であることを保証します。
+
+=== バッファメモリバリア: きめ細かい制御
+
+より細かい制御には、関与するバッファを明示指定するバッファメモリバリアを使います。
+
+[source,cpp]
+----
+vk::BufferMemoryBarrier bufferBarrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .buffer = *intermediateBuffer,
+    .offset = 0,
+    .size = VK_WHOLE_SIZE
+};
+
+commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {},
+    nullptr,
+    bufferBarrier,
+    nullptr
+);
+----
+
+より明示的です。「この特定のバッファは前シェーダが書き、次シェーダが読む」。
+
+=== 実行依存対メモリ依存
+
+Vulkan は 2 種類の依存を区別します。
+
+*実行依存*: 操作 A は操作 B が始まる前に終了しなければならない。順序の問題です。
+
+*メモリ依存*: 操作 A の書き込みは操作 B の読み取りに可視でなければならない。可視性の問題です。
+
+両方が必要です。メモリ依存だけでは、操作 B は操作 A の完了を待ちますが、キャッシュのため A の書き込みが見えないことがあります。実行依存なしのメモリ依存は意味がありません——書き込みが起きていなければ可視にできません。
+
+パイプラインバリアは両方を提供します。ステージマスクが実行依存を、access マスクがメモリ依存を作ります。
+
+== ML 操作向け同期パターン
+
+ML 推論で使う一般的な同期パターンを探ります。
+
+=== パターン 1: 逐次レイヤ
+
+最も単純なパターン: 依存レイヤのチェーン。
+
+[source,cpp]
+----
+// Dispatch Layer 1
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *layer1Pipeline);
+cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                       *pipelineLayout, 0, *layer1DescSet, nullptr);
+cmd.dispatch(workGroupsX, workGroupsY, 1);
+
+// Barrier: Layer 1 writes must be visible to Layer 2 reads
+vk::MemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead
+};
+
+cmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {}, barrier, nullptr, nullptr);
+
+// Dispatch Layer 2
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *layer2Pipeline);
+cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                       *pipelineLayout, 0, *layer2DescSet, nullptr);
+cmd.dispatch(workGroupsX, workGroupsY, 1);
+
+// Barrier: Layer 2 writes must be visible to Layer 3 reads
+cmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {}, barrier, nullptr, nullptr);
+
+// Dispatch Layer 3
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *layer3Pipeline);
+cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                       *pipelineLayout, 0, *layer3DescSet, nullptr);
+cmd.dispatch(workGroupsX, workGroupsY, 1);
+----
+
+このパターンは素直です。ディスパッチ、バリア、ディスパッチ、バリア、ディスパッチ。各バリアは前レイヤの書き込みが次レイヤの読み取りに可視であることを保証します。
+
+=== パターン 2: 並列分岐
+
+ResNet のような並列経路を持つネットワークでは、分岐を同時実行し、マージ点で同期したいです。
+
+[source,cpp]
+----
+// Dispatch both branches (no barrier between them - they're independent)
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *branch1Pipeline);
+cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                       *pipelineLayout, 0, *branch1DescSet, nullptr);
+cmd.dispatch(workGroupsX1, workGroupsY1, 1);
+
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *branch2Pipeline);
+cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                       *pipelineLayout, 0, *branch2DescSet, nullptr);
+cmd.dispatch(workGroupsX2, workGroupsY2, 1);
+
+// Barrier: Both branches must complete before merge
+vk::MemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead
+};
+
+cmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {}, barrier, nullptr, nullptr);
+
+// Dispatch merge operation (reads from both branches)
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *mergePipeline);
+cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                       *pipelineLayout, 0, *mergeDescSet, nullptr);
+cmd.dispatch(workGroupsX, workGroupsY, 1);
+----
+
+重要な洞察: 2 分岐の間にバリアはありません。並列実行可能です。バリアはマージの前——マージが両出力を読む前に両分岐が完了することを保証します。
+
+=== パターン 3: メモリ再利用
+
+バッファ再利用時は write-after-read 同期が必要です。
+
+[source,cpp]
+----
+// Layer 1 writes to buffer A
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *layer1Pipeline);
+cmd.dispatch(workGroupsX, workGroupsY, 1);
+
+// Barrier: Layer 1 writes must be visible to Layer 2 reads
+vk::MemoryBarrier barrier{
+    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+    .dstAccessMask = vk::AccessFlagBits::eShaderRead
+};
+cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    {}, barrier, nullptr, nullptr);
+
+// Layer 2 reads from buffer A, writes to buffer B
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *layer2Pipeline);
+cmd.dispatch(workGroupsX, workGroupsY, 1);
+
+// Barrier: Layer 2 reads must complete before Layer 3 writes to buffer A
+barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead;
+barrier.dstAccessMask = vk::AccessFlagBits::eShaderWrite;
+cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    {}, barrier, nullptr, nullptr);
+
+// Layer 3 writes to buffer A (reusing Layer 1's buffer)
+cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *layer3Pipeline);
+cmd.dispatch(workGroupsX, workGroupsY, 1);
+----
+
+2 番目のバリアが crucial です。レイヤ 3 がバッファ A への書き込みを始める前に、レイヤ 2 の読み取りが終わることを保証します。これがなければ、レイヤ 3 がレイヤ 2 がまだ使っているデータを上書きする可能性があります。
+
+== 同期の最適化
+
+同期にはコストがあります。各バリアは GPU を潜在的にストールさせます。このコストを最小化する方法を探ります。
+
+=== バリアの粒度
+
+すべての操作の後にバリアを挿入できます。
+
+[source,cpp]
+----
+dispatch(op1);
+barrier();
+dispatch(op2);
+barrier();
+dispatch(op3);
+barrier();
+// ... and so on
+----
+
+正しいですが非効率です。各バリアは GPU を待たせ、次の操作が実際に前に依存していなくても。
+
+より良い: 依存が存在する場所にだけバリアを挿入します。
+
+[source,cpp]
+----
+dispatch(op1);  // Writes to buffer A
+dispatch(op2);  // Writes to buffer B (independent of op1)
+barrier();      // Both must complete before op3
+dispatch(op3);  // Reads from buffers A and B
+----
+
+操作 1 と 2 は重なれます。バリアは必要なときだけ——両方に依存する操作 3 の前です。
+
+=== バリアのバッチ化
+
+同じ時点で複数バッファの同期が必要なら、複数のバッファメモリバリアを持つ 1 つのバリアを使います。
+
+[source,cpp]
+----
+vk::BufferMemoryBarrier barriers[3] = {
+    {/* buffer A */},
+    {/* buffer B */},
+    {/* buffer C */}
+};
+
+cmd.pipelineBarrier(
+    vk::PipelineStageFlagBits::eComputeShader,
+    vk::PipelineStageFlagBits::eComputeShader,
+    {}, nullptr, barriers, nullptr);
+----
+
+3 回の個別 pipelineBarrier 呼び出しより効率的です。
+
+=== 不要なバリアの回避
+
+一部の操作にはバリアが不要です。
+
+*読み取り専用操作*: 2 操作が同じバッファから書き込みなしで読むだけなら、間にバリアは不要です。読み取りは競合しません。
+
+*独立バッファ*: 操作 A がバッファ X に書き、操作 B がバッファ Y に書き、互いのバッファを読まないなら、バリアは不要です。
+
+*同一シェーダディスパッチ内*: 1 回のディスパッチ内では、ワークグループは終了時に暗黙的に同期されます。1 ディスパッチ内にバリアは不要です。
+
+== 同期問題のデバッグ
+
+同期バグは notoriously デバッグが困難です。症状——不正な結果、偶発的クラッシュ、非決定論的動作——は subtle なことがあります。
+
+=== バリデーションレイヤ
+
+開発中は Vulkan バリデーションレイヤを有効にしてください。
+
+[source,cpp]
+----
+const char* validationLayers[] = {
+    "VK_LAYER_KHRONOS_validation"
+};
+
+vk::InstanceCreateInfo createInfo{
+    .enabledLayerCount = 1,
+    .ppEnabledLayerNames = validationLayers
+};
+----
+
+バリデーションレイヤは多くの同期エラーを捕捉します。欠落バリア、不正な access マスク、write-after-write ハザード。
+
+=== 体系的テスト
+
+異なる入力サイズとバッチサイズでテストしてください。同期バグは特定のデータサイズや GPU 高負荷時のみ現れることがあります。
+
+同じ推論を複数回実行し、結果が同一であることを検証してください。非決定論的結果はレース条件を示唆します。
+
+=== 過剰に保守的な同期
+
+デバッグ時は everywhere にバリアを追加してみてください。
+
+[source,cpp]
+----
+dispatch(layer1);
+barrier();  // Overly conservative
+dispatch(layer2);
+barrier();  // Overly conservative
+dispatch(layer3);
+barrier();  // Overly conservative
+----
+
+これで問題が解決すれば、同期問題だと分かります。正しさが確立したら、バリアを 1 つずつ削除して最小必要集合を見つけます。
+
+=== RenderDoc と GPU デバッガ
+
+RenderDoc などのツールはコマンドバッファ実行をキャプチャ・可視化できます。ディスパッチとバリアの順序を見て、同期の欠落や誤りを特定できます。
+
+== 完全例: 3 レイヤネットワーク
+
+すべてをまとめた完全例: 適切な同期を持つ 3 レイヤネットワーク。
+
+[source,cpp]
+----
+class SynchronizedInference {
+private:
+    vk::raii::Device device;
+    vk::raii::CommandBuffer cmd;
+
+    // Pipelines for each layer
+    vk::raii::Pipeline convPipeline;
+    vk::raii::Pipeline reluPipeline;
+    vk::raii::Pipeline poolPipeline;
+
+    // Descriptor sets for each layer
+    vk::raii::DescriptorSet convDescSet;
+    vk::raii::DescriptorSet reluDescSet;
+    vk::raii::DescriptorSet poolDescSet;
+
+    vk::raii::PipelineLayout pipelineLayout;
+
+public:
+    void runInference(uint32_t width, uint32_t height) {
+        // Begin command buffer
+        vk::CommandBufferBeginInfo beginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
+        };
+        cmd.begin(beginInfo);
+
+        // Layer 1: Convolution
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *convPipeline);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                               *pipelineLayout, 0, *convDescSet, nullptr);
+
+        uint32_t groupsX = (width + 15) / 16;
+        uint32_t groupsY = (height + 15) / 16;
+        cmd.dispatch(groupsX, groupsY, 1);
+
+        // Barrier: Convolution writes must be visible to ReLU reads
+        vk::MemoryBarrier barrier{
+            .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead
+        };
+
+        cmd.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eComputeShader,
+            {}, barrier, nullptr, nullptr);
+
+        // Layer 2: ReLU activation
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *reluPipeline);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                               *pipelineLayout, 0, *reluDescSet, nullptr);
+        cmd.dispatch(groupsX, groupsY, 1);
+
+        // Barrier: ReLU writes must be visible to Pooling reads
+        cmd.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eComputeShader,
+            {}, barrier, nullptr, nullptr);
+
+        // Layer 3: Max pooling
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *poolPipeline);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                               *pipelineLayout, 0, *poolDescSet, nullptr);
+
+        // Pooling reduces dimensions by 2x
+        cmd.dispatch(groupsX / 2, groupsY / 2, 1);
+
+        // Final barrier: Ensure pooling completes before reading results
+        barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+
+        cmd.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eTransfer,
+            {}, barrier, nullptr, nullptr);
+
+        cmd.end();
+
+        // Submit and wait
+        vk::SubmitInfo submitInfo{
+            .commandBufferCount = 1,
+            .pCommandBuffers = &*cmd
+        };
+
+        vk::raii::Fence fence(device, vk::FenceCreateInfo{});
+        // RAII handles cleanup automatically
+
+        queue.submit(submitInfo, *fence);
+        auto result = device.waitForFences(*fence, VK_TRUE, UINT64_MAX);
+    }
+};
+----
+
+この例は次を示します。
+
+- レイヤ間バリア付きの逐次レイヤ実行
+- 適切な access マスク（SHADER_WRITE → SHADER_READ）
+- 結果読み取り前の最終バリア（SHADER_WRITE → TRANSFER_READ）
+- 異なるレイヤ次元向けワークグループ計算
+
+== まとめ
+
+同期は Vulkan コンピュートによる正しい ML 推論に不可欠です。パイプラインバリアは実行依存とメモリ依存を強制し、操作が正しい順序で完了し、書き込みが後続読み取りに可視であることを保証します。
+
+主要パターンには逐次レイヤ（各レイヤ間のバリア）、並列分岐（分岐間にバリアなし、マージ前にバリア）、メモリ再利用（write-after-read バリア）があります。最適化にはバリア数の最小化、バリアのバッチ化、不要な同期の回避が含まれます。
+
+同期問題のデバッグにはバリデーションレイヤ、体系的テスト、RenderDoc などのツールが必要です。迷ったら保守的な同期から始め、正しさが確立してから最適化してください。
+
+適切な同期があれば、ニューラルネットワークに固有の逐次依存を維持しつつ、GPU の並列処理能力を活用する正しく効率的な ML 推論パイプラインを構築できます。
+
+xref:ML_Inference/Vulkan_Compute_for_ML/05_data_management.adoc[前へ: データ管理] | xref:ML_Inference/Vulkan_Compute_for_ML/07_vector_addition_example.adoc[次へ: ベクトル加算の例]

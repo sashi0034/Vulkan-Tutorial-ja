@@ -1,0 +1,75 @@
+:pp: {plus}{plus}
+= 最後の瞬間の更新
+
+レイトラッチングを実装するには、GPU を可能な限り長く「準備状態」で待機させる仕組みが必要です。Vulkan 1.3 では、**タイムラインセマフォ** と **Synchronization 2** の組み合わせが完璧なツールセットを提供します。
+
+== エコシステムの視点
+
+この章は次のカテゴリに属します: **OpenXR 標準を超えて**。
+
+OpenXR がポーズを提供する一方、「レイトラッチング」という低レイテンシ同期技法は Vulkan のコア同期機能で実装します。標準的な統合より良い結果を得るために Vulkan で実装する強力な最適化です。
+
+== パイプラインのゲート: Wait-Before-Submit パターン
+
+タイムラインセマフォを **デジタルゲート** と考えてください。「レイトラッチング」ループでは、ポーズサンプリングとピクセル表示の間の時間を最小化するため、標準の操作順序を変えます。
+
+1.  **CPU がコマンドを記録**: プレースホルダ行列、またはフレーム開始時の「古い」データを使い、コマンドバッファ全体を記録する。
+2.  **CPU が作業を投入**: `vkQueueSubmit2` でコマンドバッファを GPU に投入する。
+3.  **GPU が待つ**: パイプラインの先頭（通常は頂点シェーダーステージ）で、特定のタイムラインセマフォが目標値に達するまで **ウェイト** するよう GPU に伝える。
+4.  **CPU がポール**: GPU がゲートで待っている間、CPU は絶対最新の頭のポーズを OpenXR にポールし続けられる。
+5.  **シグナル**: 可能な限り最後のマイクロ秒で、CPU がメモリ上の行列を更新しセマフォを **シグナル** する。GPU ゲートが開き、可能な限り新鮮なデータでドローコールが始まる。
+
+[source,cpp]
+----
+// Configure the timeline semaphore wait info using designated initializers
+vk::TimelineSemaphoreSubmitInfo timelineSubmitInfo{
+    .waitSemaphoreValueCount = 1,
+    .pWaitSemaphoreValues = &nextValue
+};
+
+// Define the semaphore wait at the Vertex Shader stage
+vk::SemaphoreSubmitInfo waitSemaphoreInfo{
+    .pNext = &timelineSubmitInfo,
+    .semaphore = *lateLatchingSemaphore,
+    .value = nextValue,
+    .stageMask = vk::PipelineStageFlagBits2::eVertexShader
+};
+
+// Submit the command buffer
+vk::SubmitInfo2 submitInfo{
+    .waitSemaphoreInfoCount = 1,
+    .pWaitSemaphoreInfos = &waitSemaphoreInfo,
+    .commandBufferInfoCount = 1,
+    .pCommandBufferInfos = &commandBufferInfo
+};
+
+// The GPU will now stall at the vertex shader until the CPU signals the semaphore
+queue.submit2(submitInfo);
+----
+
+== ステージマスクの選択: どこで待つか？
+
+重要な性能判断は、GPU が *どこで* 待つかです。`vk::SemaphoreSubmitInfo` で `stageMask` を指定します。
+
+*   **Top of Pipe**: ここで待つと、GPU は何もしない。
+*   **頂点シェーダー**: ここで待つと、GPU はコマンド解析やインデックス取得などの「Top of Pipe」作業をまだ行える。実際の頂点データが必要になったときだけストールする。
+*   **フラグメントシェーダー**: レイトラッチングには通常遅すぎる。ジオメトリはすでに頂点位置に基づきラスタライズ済みだからだ。
+
+**頂点シェーダー** ステージで待つことで、ハードウェア利用率を最大化しつつ、投影とビュー行列がハードウェアが許す限り新鮮であることを保証します。
+
+== 発展: リアルタイムスケジューリングとユニフォーム更新
+
+Vulkan では、OpenXR 標準がネイティブに容易にしないレベルのレイトバインディングを実装できます。
+
+*   **レイトバインディングユニフォーム更新**: Vulkan の **External Host Memory** と **Coherent Mapping** を使い、変換行列を含むバッファを CPU 可視メモリに直接マップできます。これにより、コマンドバッファ投入後でも CPU が頭のポーズを更新できます。
+*   **高優先度キュー**: ランタイムのコンポジタは高優先度ですが、アプリケーションは通常そうではありません。Vulkan の **優先度キュー** を使い、レイトラッチング作業向けに「高優先度」グラフィックスキューを要求し、低優先度のバックグラウンドタスクにプリエンプトされないことを保証できます。
+
+== これが「スウィム」を殺す理由
+
+「スウィム」は、頭を動かすと仮想オブジェクトがわずかに浮いたり滑ったりして見える吐き気を催す効果です。エンジンが頭のポーズをサンプリングしてからピクセルが実際に表示されるまでの **レイテンシギャップ** が原因です。
+
+Wait-Before-Submit パターンを使うことで、そのギャップを約 10–15ms から約 1–2ms へ削減します。GPU が使うビュー行列が最初の頂点処理のわずかマイクロ秒前に更新されているため、仮想世界は物理空間に「固定」されたように感じられます。
+
+TIP: 同期の詳細は、公式の link:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#synchronization[Vulkan Specification]、link:https://docs.vulkan.org/guide/latest/index.html[Vulkan Guide]、および link:00_introduction.adoc[メインチュートリアルシリーズ] を参照してください。
+
+xref:OpenXR_Vulkan_Spatial_Computing/06_Late_Latching/01_introduction.adoc[前へ] | xref:OpenXR_Vulkan_Spatial_Computing/06_Late_Latching/03_implementation.adoc[次へ]

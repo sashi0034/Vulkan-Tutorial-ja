@@ -1,0 +1,329 @@
+= シーン理解: XR パイプラインでの Vulkan 活用
+:pp: {plus}{plus}
+:stem: latexmath
+
+前章では「平面」画像や組み込みセンサーに焦点を当てました。Vulkan ML の最もエキサイティングな応用の一部は **Extended Reality（XR）** にあります。Meta、Apple、Magic Leap などの現代 OpenXR ランタイムは優れた「組み込み」シーン理解——床、壁、手の自動検出——を提供しますが、開発者はしばしばもっと欲しがります。
+
+これは **ボーナス探索** です。OpenXR の初期化方法を教えるのではありません——`XrSession` に慣れていると仮定します。代わりに、OpenXR 開発者がカスタム ML 推論——ランタイムが提供しない特定オブジェクト識別、ユーザープライバシー保護、超低レイテンシ生ステレオフィード処理——を扱う独特の Vulkan 活用方法を見ます。
+
+== XR 圧力鍋: 90Hz ML
+
+標準組み込みアプリでは 50ms 推論遅延は「わずかなラグ」。90 FPS の XR ヘッドセットでは 50ms 遅延は **4.5 フレーム分の履歴**。その「古い」データでオーバーレイを描くと、ユーザーが頭を動かすと実世界の後ろに浮き、即座に吐き気を引き起こします。
+
+XR で Vulkan を効果的に活用するには、「ストップ・アンド・ウェイト」モデルを超え、**OpenXR コンポジタ**、**Vulkan コンピュートキュー**、**グラフィックスレンダラー** を協調するパイプラインを取り入れる必要があります。
+
+== 高頻度ハンドシェイク
+
+OpenXR は「ハードウェアアクセス」を扱い、「描画」を Vulkan に委譲。カスタム ML 実行時は、OpenXR パススルー、ML エンジン、メインレンダラー間の「三者ハンドシェイク」が必要。
+
+=== グラフィックスハンドシェイク
+OpenXR と Vulkan 間でテクスチャを共有するには link:https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#XR_KHR_vulkan_enable2[`XR_KHR_vulkan_enable2`] 拡張を有効化。OpenXR ランタイムが要求する特定フラグで Vulkan Instance と Device を作成する必要があります。
+
+[source,cpp]
+----
+// 1. Ask OpenXR what it needs from Vulkan
+XrGraphicsRequirementsVulkanKHR graphicsRequirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
+xrGetVulkanGraphicsRequirementsKHR(xrInstance, systemId, &graphicsRequirements);
+
+// 2. Create the Vulkan Device with OpenXR-specific graphics binding
+// This structure tells the OpenXR runtime which Vulkan device we are using
+// so it can synchronize texture access between the OS and our app.
+XrGraphicsBindingVulkanKHR graphicsBinding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+graphicsBinding.instance = vkInstance;
+graphicsBinding.physicalDevice = vkPhysicalDevice;
+graphicsBinding.device = vkDevice;
+graphicsBinding.queueFamilyIndex = queueFamily;
+graphicsBinding.queueIndex = 0;
+
+// 3. Link to XrSessionCreateInfo
+XrSessionCreateInfo sessionCreateInfo{XR_TYPE_SESSION_CREATE_INFO};
+sessionCreateInfo.next = &graphicsBinding;
+sessionCreateInfo.systemId = systemId;
+xrCreateSession(xrInstance, &sessionCreateInfo, &session);
+----
+
+=== タイムラインセマフォとの同期
+
+XR ML の最大課題は同期。CPU が次フレームのジオメトリを準備している間 GPU を ML ジョブで忙しくしたい。**Vulkan タイムラインセマフォ** で OpenXR フレームサイクルと推論エンジンのギャップを橋渡し。
+
+OpenXR はコンポジション用に独自内部キューを使うため、最終レンダーフレームをコンポジタが使う前に ML 結果が完了している必要があります。
+
+[source,cpp]
+----
+// Managing Multiple Frames in Flight (XR Context)
+struct FrameResources {
+    vk::raii::Fence fence;
+    vk::raii::Semaphore mlFinishedSemaphore; // Timeline Semaphore
+    uint64_t mlValue;
+};
+
+void frameLoop() {
+    xrWaitFrame(session, &waitInfo, &frameState);
+    xrBeginFrame(session, &beginInfo);
+
+    // 1. Acquire the Passthrough Texture
+    XrSwapchainImageVulkanKHR xrImage;
+    xrAcquireSwapchainImage(passthroughSwapchain, &acquireInfo, (XrSwapchainImageBaseHeader*)&xrImage);
+
+    // 2. Submit ML Job to the COMPUTE Queue
+    // We signal a Timeline Semaphore when the ML result is ready.
+    uint64_t nextMlValue = ++globalMlCounter;
+
+    vk::TimelineSemaphoreSubmitInfo timelineInfo;
+    timelineInfo.setSignalSemaphoreValues(nextMlValue);
+
+    vk::SubmitInfo submitInfo;
+    submitInfo.setPNext(&timelineInfo);
+    submitInfo.setSignalSemaphores(*mlTimelineSemaphore);
+
+    computeQueue.submit(submitInfo);
+
+    // 3. Render Virtual Content (GRAPHICS Queue)
+    // We don't wait for the ML! We draw the virtual world immediately.
+    // However, we use the ML result from 2-3 frames ago.
+    uint64_t usableMlValue = std::max(0UL, nextMlValue - 2);
+    renderVirtualWorld(frameState.predictedDisplayTime, usableMlValue);
+
+    // 4. Compositor Submission
+    xrEndFrame(session, &frameEndInfo);
+}
+----
+
+この非同期投入により ML「思考時間」は隠蔽。ML 結果は **次**（またはその次）フレームで使われ、Vulkan 数学で動きを補償します。
+
+=== 非同期リソース所有権
+XR-Vulkan 統合の重要なニュアンス: スワップチェーンイメージを「所有」しない。OpenXR ランタイムが所有し、一時的に「貸与」。
+
+*   **取得**: `xrAcquireSwapchainImage` が `VkImage` ハンドルを提供。`xrWaitSwapchainImage` が成功するまでこのイメージは使えない。
+*   **ML 統合**: このイメージを ML コンピュートシェーダのソースに使うなら、`xrReleaseSwapchainImage` 前にシェーダ完了を保証。失敗すると XR コンポジタが部分処理テクスチャを表示し、ユーザー周辺視野で「スクリーンティアリング」。
+
+== ステレオAware前処理
+
+OpenXR はパススルーを **ステレオペア**（左右目）で提供。2 つの別 ML 推論として処理すると、電力とレイテンシが 2 倍。
+
+=== テクスチャ配列とバッチング
+プロの Vulkan XR 実装は **VkImage 配列**（レイヤードテクスチャ）を使用。ML 前処理シェーダを両レイヤを単一ディスパッチで処理するよう設定し、ONNX Runtime 向け「バッチ」テンソルを作成。
+
+[source,glsl]
+----
+#version 450
+// Preprocessing both eyes in one go
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 2) in;
+
+layout(set = 0, binding = 0) uniform sampler2DArray passthroughIn;
+layout(set = 0, binding = 1) writeonly buffer Output { float data[]; } outTensor;
+
+layout(push_constant) uniform Params {
+    uint targetWidth;
+    uint targetHeight;
+} pc;
+
+void main() {
+    uint eyeIdx = gl_GlobalInvocationID.z; // 0 = Left, 1 = Right
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pos.x >= pc.targetWidth || pos.y >= pc.targetHeight) return;
+
+    // 1. Hardware-Accelerated Sample
+    // uv coordinates are 0.0 to 1.0
+    vec2 uv = (vec2(pos) + 0.5) / vec2(pc.targetWidth, pc.targetHeight);
+
+    // Sample from the correct layer of the XR texture array
+    vec3 rgb = texture(passthroughIn, vec3(uv, eyeIdx)).rgb;
+
+    // 2. Normalization and Planar Transpose
+    // Place into the NCHW tensor at the correct batch offset
+    uint planeSize = pc.targetWidth * pc.targetHeight;
+    uint batchStride = eyeIdx * (3 * planeSize);
+    uint pixelIdx = pos.y * pc.targetWidth + pos.x;
+
+    // Batching logic: ImageNet Normalization
+    outTensor.data[batchStride + 0 * planeSize + pixelIdx] = (rgb.r - 0.485) / 0.229;
+    outTensor.data[batchStride + 1 * planeSize + pixelIdx] = (rgb.g - 0.456) / 0.224;
+    outTensor.data[batchStride + 2 * planeSize + pixelIdx] = (rgb.b - 0.406) / 0.225;
+}
+----
+
+このバッチングにより ONNX Runtime は **Subgroup Wavefront** をより効果的に使え、2 回の逐次モノ推論比で約 30% 高速化します。
+
+=== マルチビュー拡張
+一部ハードウェア（Meta Quest など）では `VK_KHR_multiview` が使える。フラグメントシェーダが `gl_ViewIndex` で両目同時レンダリング。レンダリングには優れているが、ML 前処理では上記 `sampler2DArray` アプローチが通常より移植性が高くテンソル作成に効率的。
+
+=== バッファトポロジ: レイヤード vs サイドバイサイド
+XR ランタイム（SteamVR vs Meta Quest）により、パススルーは 2 形式:
+
+1.  **レイヤード（推奨）**: `arrayLayers = 2` の `VkImage`。Vulkan で最も効率的——`sampler2DArray` またはマルチビュー拡張。
+2.  **サイドバイサイド（SBS）**: 左半分が左目の単一ワイドテクスチャ（例: 3840x1080）。
+
+SBS ターゲットでは前処理シェーダが UV 調整でイメージを「分割」:
+
+[source,glsl]
+----
+// SBS UV Logic
+float splitX = (eyeIdx == 0) ? uv.x * 0.5 : 0.5 + uv.x * 0.5;
+vec3 rgb = texture(passthroughSBS, vec2(splitX, uv.y)).rgb;
+----
+
+== タスク: ランタイムギャップの埋め（プライバシーマスキング）
+
+OpenXR ランタイムは「平面」を与えるが「文脈」は与えない。エンタープライズ XR の一般的要件は **プライバシーマスキング**——実世界のコンピュータ画面やホワイトボードを識別しユーザービューでぼかしてデータ漏洩を防止。
+
+=== 非同期ハンドオフ: パススルー取得
+XR ではパススルーイメージはシステムコンポジタが所有。数ミリ秒「借りる」。ML が UI をストールさせないよう **フェンスハンドシェイク** が必要。
+
+[source,cpp]
+----
+// Borrowing the texture for ML
+void processML() {
+    // 1. Wait for Compositor to release the image
+    xrWaitSwapchainImage(passthroughSwapchain, &waitInfo);
+
+    // 2. Transition layout for Compute
+    vk::ImageMemoryBarrier barrier{
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .image = passthroughImage,
+        // ...
+    };
+
+    // 3. Run ML Dispatch
+    // ...
+
+    // 4. Release back to Compositor
+    xrReleaseSwapchainImage(passthroughSwapchain, &releaseInfo);
+}
+----
+
+=== Vulkan によるセマンティックマスキング
+軽量セマンティックセグメンテーションモデル（例: MobileNetV2-UNet）を使用。出力は「プライバシーマスク」（1.0 = 機密、0.0 = 安全）。
+
+1.  **ML 推論**: パススルーフィード上で非同期実行、「Screen」ピクセルを識別。
+2.  **Vulkan 後処理**: マスクで可変レートブラーカーネルを駆動。
+
+[source,glsl]
+----
+// Optimized Variable-Rate Blur Kernel
+void main() {
+    float mask = texture(mlMaskSampler, uv).r;
+    vec3 color = texture(passthroughSampler, uv).rgb;
+
+    // Adaptive Blur: Only compute the expensive blur if needed
+    if (mask > 0.5) {
+        vec3 blurred = vec3(0.0);
+        float totalWeight = 0.0;
+        float sigma = 10.0 * mask; // Blur intensity scales with mask confidence
+
+        for(float x = -2.0; x <= 2.0; x += 1.0) {
+            for(float y = -2.0; y <= 2.0; y += 1.0) {
+                float weight = exp(-(x*x + y*y) / (2.0 * sigma * sigma));
+                blurred += texture(passthroughSampler, uv + vec2(x, y) * texelSize).rgb * weight;
+                totalWeight += weight;
+            }
+        }
+        color = blurred / totalWeight;
+    }
+    outColor = vec4(color, 1.0);
+}
+----
+
+== 「思考時間」の補償: ポーズ再投影
+
+ML に時間がかかる（例: 30ms）ため、生成した「プライバシーマスク」は技術的には 30ms 前のユーザーの頭の位置向け。直接適用するとユーザーが頭を回すとぼかしが「漂う」か「ゴースト」。
+
+=== ホモグラフィワープ
+Vulkan で ML 結果に link:https://en.wikipedia.org/wiki/Homography_(computer_vision)[**ホモグラフィワープ**] を実行。キャプチャ時の `XrPosef` latexmath:[P_{old}] と予測表示ポーズ latexmath:[P_{new}] を比較し、古いマスクを新ビューに合わせる変換行列 latexmath:[M] を計算。
+
+==== ワープの数学
+法線 latexmath:[\vec{n}]、距離 latexmath:[d] の平面に対する回転 latexmath:[R] と並進 latexmath:[\vec{t}] のホモグラフィ行列 latexmath:[H]:
+
+[latexmath]
+++++
+H = K \cdot (R + \frac{\vec{t} \cdot \vec{n}^T}{d}) \cdot K^{-1}
+++++
+
+単純回転運動（吐き気の最も一般的原因）では簡略化:
+[latexmath]
+++++
+H = K \cdot R_{rel} \cdot K^{-1}
+++++
+
+Vulkan フラグメントシェーダでこの行列を使い ML マスクを「振り返る」:
+
+[source,glsl]
+----
+layout(push_constant) uniform WarpData { mat3 homography; } warp;
+
+void main() {
+    // 1. Transform the current UV coordinate back to the 'ML space'
+    // using the homography matrix calculated from the pose difference.
+    vec3 mlSpacePos = warp.homography * vec3(uv, 1.0);
+    vec2 mlUV = mlSpacePos.xy / mlSpacePos.z;
+
+    // 2. Sample the mask using the corrected UV
+    float correctedMask = texture(mlMaskSampler, mlUV).r;
+
+    // 3. Reject samples outside the valid mask range (clamping)
+    if (mlUV.x < 0.0 || mlUV.x > 1.0 || mlUV.y < 0.0 || mlUV.y > 1.0) {
+        correctedMask = 0.0;
+    }
+
+    // ... use correctedMask for blurring ...
+}
+----
+
+この「Vulkan タイムワープ」が高レイテンシ ML をゼロレイテンシシーン理解のように感じさせる秘密。高速頭運動中もぼかしが実世界のコンピュータ画面にぴったり「張り付く」。
+
+== カスタム SLAM: GPU 加速特徴抽出
+
+ランタイムのトラッキングでは足りない場合——部屋から独立して動く特定工業マーカーや QR コードの追跡など。
+
+Vulkan は OpenXR 開発者が link:https://en.wikipedia.org/wiki/Oriented_FAST_and_rotated_BRIEF[**ORB 特徴抽出**] や link:https://en.wikipedia.org/wiki/Optical_flow[**オプティカルフロー**] を 90Hz で実行するのを助けます。ランタイムポーズをオブジェクト固有データで「拡張」するとき特に有用。
+
+1.  **高速コーナー検出**: コンピュートシェーダで link:https://en.wikipedia.org/wiki/Features_from_accelerated_segment_test[**FAST（Features from Accelerated Segment Test）**] を実装。各スレッドが候補点周囲 16 ピクセルの円を見る。
+2.  **ディスクリプタマッチング**: 特徴が見つかったら **Subgroup 行列数学**（高度なトピック章で議論）で既知オブジェクトライブラリとディスクリプタ比較。
+3.  **結果**: 特定オブジェクト向けカスタム `XrSpace` を取得、OpenXR 世界座標系と完全同期。
+
+[source,glsl]
+----
+// Simple FAST Corner Detector (GPU Optimized)
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    float center = texelFetch(passthrough, pos, 0).r;
+
+    // Check pixels in a circle (Bresenham circle)
+    // If N contiguous pixels are significantly brighter/darker, it's a corner.
+    uint mask = 0;
+    if (abs(texelFetch(passthrough, pos + ivec2(0, 3), 0).r - center) > threshold) mask |= (1 << 0);
+    if (abs(texelFetch(passthrough, pos + ivec2(3, 0), 0).r - center) > threshold) mask |= (1 << 1);
+    // ... continue for all 16 points ...
+
+    if (countSetBits(mask) >= 9) {
+        storeFeature(pos);
+    }
+}
+----
+
+== ヘッドセットのサーマル管理
+
+XR ヘッドセットはサーマル的に脆弱です。90 FPS で重い U-Net を動かすと数分でスロットルします。
+
+=== デューティサイクル戦略
+毎フレーム ML を実行する代わり、Vulkan で **推論デューティサイクル** を管理。
+
+*   **ロジック**: フレーム 1 で ML、フレーム 2-5 スキップ、フレーム 6 で ML。
+*   **スムージング**: ホモグラフィワープ（ポーズ再投影）でスキップフレームの ML マスクを「外挿」。
+*   **利点**: 15Hz ML 電力で 90Hz 視覚更新。
+
+== まとめ: Vulkan XR の利点
+
+OpenXR プロジェクトで Vulkan を直接活用すると 3 つの重要能力を得ます:
+
+*   **非同期 ML**: 90Hz コンポジタをストールせずコンピュートキューで推論。
+*   **レイテンシ補償**: ホモグラフィワープで「古い」ML 結果を「新しい」頭ポーズに合わせる。
+*   **ステレオ効率**: テクスチャ配列とバッチングで両目を単一 GPU パスで処理。
+
+この組み合わせにより、世界を「見せる」だけでなく、リアルタイムで深く「理解」し「変更」する XR アプリケーションを構築でき、標準ランタイムの基本機能をはるかに超えます。
+
+xref:ML_Inference/Embedded_Applications/05_complete_example.adoc[前へ: 完全な例] | xref:ML_Inference/Embedded_Applications/07_ml_compiler.adoc[次へ: 組み込みデバイスの ML コンパイラ]
