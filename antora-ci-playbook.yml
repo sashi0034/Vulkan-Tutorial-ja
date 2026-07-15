@@ -3,7 +3,7 @@
 # This Antora playbook is used by the CI to make sure the Antora build works
 site:
   title: Khronos Vulkan チュートリアル
-  url: https://sashi0034.github.io/Vulkan-Tutorial-Ja
+  url: https://sashi0034.github.io/Vulkan-Tutorial-ja
   start_page: tutorial::00_Introduction.adoc
 content:
   sources:

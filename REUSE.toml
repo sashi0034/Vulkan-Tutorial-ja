@@ -133,6 +133,20 @@ path = [
     "en/11_Compute_Shader.adoc",
     "en/90_FAQ.adoc",
     "en/95_Privacy_policy.adoc",
+    "ja/00_Introduction.adoc",
+    "ja/01_Overview.adoc",
+    "ja/02_Development_environment.adoc",
+    "ja/03_Drawing_a_triangle/**",
+    "ja/04_Vertex_buffers/**",
+    "ja/05_Uniform_buffers/**",
+    "ja/06_Texture_mapping/**",
+    "ja/07_Depth_buffering.adoc",
+    "ja/08_Loading_models.adoc",
+    "ja/09_Generating_Mipmaps.adoc",
+    "ja/10_Multisampling.adoc",
+    "ja/11_Compute_Shader.adoc",
+    "ja/90_FAQ.adoc",
+    "ja/95_Privacy_policy.adoc",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = [
@@ -153,12 +167,36 @@ path = [
     "en/17_Multithreading.adoc",
     "en/18_Ray_tracing.adoc",
     "en/conclusion.adoc",
+    "ja/Building_a_Simple_Engine/**",
+    "ja/courses/**",
+    "ja/12_Ecosystem_Utilities_and_Compatibility.adoc",
+    "ja/13_Vulkan_Profiles.adoc",
+    "ja/14_Android.adoc",
+    "ja/15_GLTF_KTX2_Migration.adoc",
+    "ja/16_Multiple_Objects.adoc",
+    "ja/17_Multithreading.adoc",
+    "ja/18_Ray_tracing.adoc",
+    "ja/conclusion.adoc",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = [
     "2023-2026 The Khronos Group, Inc.",
 ]
 
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+    "ja/Synchronization/**",
+    "ja/ML_Inference/**",
+    "ja/Advanced_glTF/**",
+    "ja/AI_Assisted_Vulkan/**",
+    "ja/Advanced_Vulkan_Compute/**",
+    "ja/OpenXR_Vulkan_Spatial_Computing/**",
+    "TRANSLATION_GLOSSARY.md",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "Holochip Corporation"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
